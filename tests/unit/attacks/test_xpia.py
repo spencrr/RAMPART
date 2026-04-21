@@ -177,7 +177,7 @@ class TestXPIACleanup:
 
         handle.__aenter__.assert_awaited_once()
         handle.__aexit__.assert_awaited_once()
-        handle.wait_until_ready.assert_awaited_once()
+        handle.wait_until_ready_async.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_multiple_handles_all_cleaned(self) -> None:
@@ -193,7 +193,7 @@ class TestXPIACleanup:
         for h in (h1, h2):
             h.__aenter__.assert_awaited_once()
             h.__aexit__.assert_awaited_once()
-            h.wait_until_ready.assert_awaited_once()
+            h.wait_until_ready_async.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_cleanup_on_evaluator_exception(self) -> None:

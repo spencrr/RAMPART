@@ -353,11 +353,11 @@ class TestOneDriveInjectionLifecycle:
 
 
 class TestOneDriveInjectionWaitUntilReady:
-    """Test _OneDriveInjection.wait_until_ready wiring."""
+    """Test _OneDriveInjection.wait_until_ready_async wiring."""
 
     @pytest.mark.asyncio
-    async def test_delegates_to_sleep_until_ready(self) -> None:
-        """Verifies correct arguments are passed to sleep_until_ready."""
+    async def test_delegates_to_sleep_until_ready_async(self) -> None:
+        """Verifies correct arguments are passed to sleep_until_ready_async."""
         surface = OneDriveSurface(
             graph_client=MagicMock(),
             drive_id="d",
@@ -367,9 +367,9 @@ class TestOneDriveInjectionWaitUntilReady:
         handle = surface.inject(payload=Payload(content="test"))
 
         with patch(
-            "rampart.surfaces.onedrive.sleep_until_ready",
+            "rampart.surfaces.onedrive.sleep_until_ready_async",
             new_callable=AsyncMock,
         ) as mock_sleep:
-            await handle.wait_until_ready()
+            await handle.wait_until_ready_async()
 
         mock_sleep.assert_awaited_once_with(delay=5.0)

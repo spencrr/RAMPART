@@ -83,7 +83,7 @@ class TestResultCollectionHandler:
                 result=result,
             )
 
-            await handler.on_event(event_data=event_data)
+            await handler.on_event_async(event_data=event_data)
 
             assert len(collector.results) == 1
             assert collector.results[0].summary == "captured"
@@ -98,7 +98,7 @@ class TestResultCollectionHandler:
             handler = ResultCollectionHandler()
             event_data = _make_event_data(event=ExecutionEvent.ON_PRE_EXECUTE)
 
-            await handler.on_event(event_data=event_data)
+            await handler.on_event_async(event_data=event_data)
 
             assert collector.results == []
         finally:
@@ -112,7 +112,7 @@ class TestResultCollectionHandler:
             handler = ResultCollectionHandler()
             event_data = _make_event_data(event=ExecutionEvent.ON_ERROR)
 
-            await handler.on_event(event_data=event_data)
+            await handler.on_event_async(event_data=event_data)
 
             assert collector.results == []
         finally:
@@ -127,7 +127,7 @@ class TestResultCollectionHandler:
             result=result,
         )
 
-        await handler.on_event(event_data=event_data)
+        await handler.on_event_async(event_data=event_data)
 
     @pytest.mark.asyncio
     async def test_noop_when_result_is_none_async(self) -> None:
@@ -140,7 +140,7 @@ class TestResultCollectionHandler:
                 result=None,
             )
 
-            await handler.on_event(event_data=event_data)
+            await handler.on_event_async(event_data=event_data)
 
             assert collector.results == []
         finally:

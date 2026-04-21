@@ -102,7 +102,7 @@ class _RecordingHandler(ExecutionEventHandler):
     def __init__(self) -> None:
         self.events: list[ExecutionEventData] = []
 
-    async def on_event(self, *, event_data: ExecutionEventData) -> None:
+    async def on_event_async(self, *, event_data: ExecutionEventData) -> None:
         """Record the event data."""
         self.events.append(event_data)
 
@@ -110,7 +110,7 @@ class _RecordingHandler(ExecutionEventHandler):
 class _BrokenHandler(ExecutionEventHandler):
     """Handler that always raises."""
 
-    async def on_event(self, *, event_data: ExecutionEventData) -> None:
+    async def on_event_async(self, *, event_data: ExecutionEventData) -> None:
         """Raise unconditionally to test handler safety."""
         raise ValueError("handler broke")
 
