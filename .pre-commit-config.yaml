@@ -14,3 +14,10 @@ repos:
       language: system
       types: [python]
       pass_filenames: false
+    - id: rampart-lint
+      name: rampart-lint (RAMPART001, RAMPART002)
+      entry: uv run python -m tools.rampart_lint check
+      language: system
+      types: [python]
+      files: ^rampart/
+      pass_filenames: true

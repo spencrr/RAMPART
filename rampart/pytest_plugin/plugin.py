@@ -241,8 +241,8 @@ def _create_trial_clones(
 
 
 @pytest.hookimpl(trylast=True)
-def pytest_collection_modifyitems(
-    config: pytest.Config,  # noqa: ARG001  — pytest hook signature
+def pytest_collection_modifyitems(  # noqa: RAMPART002  — pytest hook signature
+    config: pytest.Config,  # noqa: ARG001
     items: list[pytest.Item],
 ) -> None:
     """Clone trial-marked items and validate marker usage.
@@ -469,9 +469,9 @@ def _evaluate_gates(
             )
 
 
-def pytest_sessionfinish(
+def pytest_sessionfinish(  # noqa: RAMPART002  — pytest hook signature
     session: pytest.Session,
-    exitstatus: int,  # noqa: ARG001  — pytest hook signature
+    exitstatus: int,  # noqa: ARG001
 ) -> None:
     """Aggregate trial results, evaluate gates, and emit sinks.
 
@@ -598,9 +598,9 @@ def _write_trial_group_lines(
         )
 
 
-def pytest_terminal_summary(
+def pytest_terminal_summary(  # noqa: RAMPART002  — pytest hook signature
     terminalreporter: TerminalReporter,
-    exitstatus: int,  # noqa: ARG001  — pytest hook signature
+    exitstatus: int,  # noqa: ARG001
     config: pytest.Config,
 ) -> None:
     """Append RAMPART harm-category summary after pytest's standard output.
