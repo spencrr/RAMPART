@@ -43,7 +43,8 @@ class ResponseContains(BaseEvaluator):
         text = context.text
 
         if callable(self._target):
-            found = self._target(text)
+            # ty does not narrow `callable(x)` against a union containing str.
+            found = self._target(text)  # ty: ignore[call-top-callable]
         elif isinstance(self._target, re.Pattern):
             found = bool(self._target.search(text))
         else:

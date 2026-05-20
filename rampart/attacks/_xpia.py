@@ -128,7 +128,11 @@ class XPIAExecution(BaseExecution):
         async with AsyncExitStack() as stack:
             await self._activate_handles_async(stack=stack)
             session = await stack.enter_async_context(
-                await adapter.create_session_async(),
+                # AgentAdapter.create_session_async returns a Session that is
+                # itself an async context manager; ty's structural-subtyping of
+                # the Session protocol against AbstractAsyncContextManager does
+                # not yet recognize Self-typed __aenter__ as compatible.
+                await adapter.create_session_async(),  # ty: ignore[invalid-argument-type]
             )
 
             for turn_index in range(self._max_turns):

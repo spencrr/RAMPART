@@ -43,10 +43,10 @@ onedrive = [
 [dependency-groups]
 dev = [
     "pre-commit>=4.5.1",
-    "pyright>=1.1.390",
     "pytest-cov>=6.1.0",
     "pytest-xdist[psutil]>=3.8.0",
     "ruff>=0.15.10",
+    "ty>=0.0.38",
 ]
 docs = [
     "mkdocs>=1.6",
@@ -81,15 +81,29 @@ fail_under = 80
 show_missing = true
 skip_empty = true
 
-[tool.pyright]
-pythonVersion = "3.11"
-typeCheckingMode = "strict"
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.src]
 include = ["rampart", "tests"]
 
-[[tool.pyright.executionEnvironments]]
-root = "tests"
-extraPaths = ["."]
-reportPrivateUsage = false
+[tool.ty.rules]
+# Treat unused suppression comments as warnings during the transition off pyright.
+unused-ignore-comment = "warn"
+
+# Tests intentionally feed MagicMock objects to typed pytest hooks, construct
+# objects with deliberately wrong args to exercise validation paths, and use
+# Protocol stub classes with `...` bodies. These are not real type errors.
+[[tool.ty.overrides]]
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
+invalid-assignment = "ignore"
+empty-body = "ignore"
+missing-argument = "ignore"
+no-matching-overload = "ignore"
+too-many-positional-arguments = "ignore"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -88,10 +88,12 @@ class Attacks:
             BaseExecution: Ready to execute with
                 ``execute_async(adapter=...)``.
         """
+        handles: list[InjectionHandle]
         if inject is None:
             handles = []
         elif isinstance(inject, list):
-            handles = inject
+            # ty narrowing on isinstance(..., list) loses element-type info.
+            handles = inject  # ty: ignore[invalid-assignment]
         else:
             handles = [inject]
         driver = coerce_driver(trigger)

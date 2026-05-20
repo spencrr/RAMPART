@@ -24,5 +24,6 @@ def coerce_driver(
     if isinstance(value, Request):
         return StaticDriver(prompts=[value])
     if isinstance(value, list):
-        return StaticDriver(prompts=value)
+        # ty cannot narrow list[str] | list[Request] through isinstance(value, list).
+        return StaticDriver(prompts=value)  # ty: ignore[invalid-argument-type]
     return value
