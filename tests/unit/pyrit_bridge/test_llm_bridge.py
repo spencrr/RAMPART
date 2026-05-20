@@ -113,8 +113,8 @@ class TestMetadataForwarding:
         )
 
         kwargs = mock_cls.call_args.kwargs
-        assert kwargs["temperature"] == 0.7
-        assert kwargs["top_p"] == 0.9
+        assert kwargs["temperature"] == pytest.approx(0.7)  # pyright: ignore[reportUnknownMemberType]
+        assert kwargs["top_p"] == pytest.approx(0.9)  # pyright: ignore[reportUnknownMemberType]
 
     @patch("rampart.pyrit_bridge.llm_bridge.OpenAIChatTarget")
     def test_all_recognised_params_forwarded(self, mock_cls: MagicMock) -> None:
@@ -156,7 +156,7 @@ class TestMetadataForwarding:
 
         kwargs = mock_cls.call_args.kwargs
         assert "custom_key" not in kwargs
-        assert kwargs["temperature"] == 0.5
+        assert kwargs["temperature"] == pytest.approx(0.5)  # pyright: ignore[reportUnknownMemberType]
 
     @patch("rampart.pyrit_bridge.llm_bridge.OpenAIChatTarget")
     def test_empty_metadata_adds_no_extra_kwargs(self, mock_cls: MagicMock) -> None:

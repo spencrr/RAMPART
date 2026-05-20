@@ -108,7 +108,6 @@ select = ["ALL"]
 preview = true
 ignore = [ # TODO - remove all ignores as issues are addressed
     "DOC201", #  docstring-missing-returns
-    "RUF069", #  float-equality-comparison
     "DOC501", #  docstring-missing-exception
     "PLC1901", # compare-to-empty-string
     "PLR6301", # no-self-use
