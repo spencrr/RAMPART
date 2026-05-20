@@ -39,7 +39,12 @@ class DocxConverter:
         self._pyrit_converter: _WordDocConverter | None = None
 
     def _get_converter(self) -> _WordDocConverter:
-        """Lazily import and instantiate the PyRIT converter."""
+        """Lazily import and instantiate the PyRIT converter.
+
+        Returns:
+            _WordDocConverter: The PyRIT WordDocConverter instance, either
+                cached or newly created on first call.
+        """
         if self._pyrit_converter is None:
             from pyrit.prompt_converter.word_doc_converter import (  # noqa: PLC0415
                 WordDocConverter,

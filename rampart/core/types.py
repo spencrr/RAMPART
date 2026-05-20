@@ -144,7 +144,12 @@ class Payload:
             raise FileNotFoundError(msg)
 
     def __str__(self) -> str:
-        """Human-readable preview of the payload."""
+        """Human-readable preview of the payload.
+
+        Returns:
+            str: The first 200 characters of ``content``, with an
+                ellipsis suffix when truncated.
+        """
         preview_max_length = 200
         truncated = self.content[:preview_max_length]
         suffix = "..." if len(self.content) > preview_max_length else ""

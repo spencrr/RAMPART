@@ -159,11 +159,22 @@ class PayloadStore:
         return payloads
 
     def exists(self, name: str) -> bool:
-        """Check whether a collection exists on disk."""
+        """Check whether a collection exists on disk.
+
+        Returns:
+            bool: True if the collection directory and its
+                ``payloads.jsonl`` file both exist.
+        """
         return self._collection_path(name).exists()
 
     def list_collections(self) -> list[str]:
-        """List all collection names on disk."""
+        """List all collection names on disk.
+
+        Returns:
+            list[str]: Sorted collection names (directories under the
+                store root that contain a ``payloads.jsonl``). Empty
+                list if the root does not exist.
+        """
         if not self._root.exists():
             return []
         return sorted(

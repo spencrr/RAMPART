@@ -123,7 +123,12 @@ class _DefaultHandlerRegistry:
         self.factory: ExecutionHandlerFactory | None = None
 
     def __call__(self) -> list[ExecutionEventHandler]:
-        """Invoke the stored factory, or return an empty list if unset."""
+        """Invoke the stored factory, or return an empty list if unset.
+
+        Returns:
+            list[ExecutionEventHandler]: A fresh list from the stored
+                factory, or an empty list when no factory is registered.
+        """
         if self.factory is None:
             return []
         return self.factory()

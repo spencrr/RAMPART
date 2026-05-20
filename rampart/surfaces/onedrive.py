@@ -99,11 +99,14 @@ class OneDriveSurface:
         return _OneDriveInjection(surface=self, payload=payload)
 
     async def upload_async(self, *, payload: Payload) -> str:
-        """Upload payload content to OneDrive. Returns the item ID.
+        """Upload payload content to OneDrive.
 
         Uses the small-file upload endpoint
         (``PUT .../root:/{path}:/content``), which supports files
         up to 4 MiB.
+
+        Returns:
+            str: The Graph ``DriveItem`` id of the uploaded file.
 
         Raises:
             ValueError: If a binary payload has no artifact path, or
@@ -201,6 +204,10 @@ class _OneDriveInjection:
 
     async def __aenter__(self) -> Self:
         """Upload payload to OneDrive.
+
+        Returns:
+            Self: This injection handle, with ``_item_id`` populated
+                from the upload, ready for use inside ``async with``.
 
         Raises:
             InfrastructureError: If the Graph API upload fails for any
