@@ -106,37 +106,31 @@ filterwarnings = [
 [tool.ruff.lint]
 select = ["ALL"]
 preview = true
-ignore = [ # TODO - remove all ignores as issues are addressed
-]
 
-# Intentionally disabled (not technical debt):
-#   DOC502 (docstring-extraneous-exception) forbids documenting
-#   exceptions that propagate from a delegated callee. Google-style
-#   docstrings (and Sphinx/numpydoc convention) deliberately document
-#   such exceptions because they are part of the caller-visible
-#   contract. Enforcing DOC502 would either degrade the docs or force
-#   try/except boilerplate that hides the underlying error.
-extend-ignore = ["DOC502"]
+extend-ignore = [
+    "DOC502", # Allow extraneous exceptions in docstrings to deliberately document the caller-visible contract, even if they propagate from a delegated callee.
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = [
-    "S101",                                           # assert is pytest's API
-    "D100", "D101", "D102", "D104", "D107", "DOC201", "DOC501", # no docstrings needed
-    "ANN001", "ANN201", "ANN202", "ANN401",           # no type annotations needed
-    "PLR2004",                                        # magic values in assertions are fine
-    "PLC1901",                                        # explicit `== ""` is intentional in assertions
-    "ARG001", "ARG002",                               # unused args (fixtures, stubs)
-    "PLC0415",                                        # imports inside functions for isolation
-    "SLF001",                                         # testing private members is valid
-    "PLC2701",                                        # importing private names is fine
-    "TRY003", "EM101", "EM102",                       # exception message style
-    "BLE001",                                         # catching Exception in tests
-    "TRY301",                                         # raise in try blocks
-    "S108",                                           # /tmp usage
-    "PT017", "PT018",                                 # assertion style
-    "ASYNC240",                                       # pathlib in async tests
-    "PERF401", "RUF015", "PTH123",                    # micro-optimizations / style
-    "PLR6301",                                        # allow pytest fixtures in tests
+    "S101",                                    # assert is pytest's API
+    "D100", "D101", "D102", "D104", "D107",    # no docstrings needed
+    "DOC201", "DOC501",                        # docstring style doesn't add value for tests
+    "ANN001", "ANN201", "ANN202", "ANN401",    # no type annotations needed
+    "PLR2004",                                 # magic values in assertions are fine
+    "PLC1901",                                 # explicit `== ""` is intentional in assertions
+    "ARG001", "ARG002",                        # unused args (fixtures, stubs)
+    "PLC0415",                                 # imports inside functions for isolation
+    "SLF001",                                  # testing private members is valid
+    "PLC2701",                                 # importing private names is fine
+    "TRY003", "EM101", "EM102",                # exception message style
+    "BLE001",                                  # catching Exception in tests
+    "TRY301",                                  # raise in try blocks
+    "S108",                                    # /tmp usage
+    "PT017", "PT018",                          # assertion style
+    "ASYNC240",                                # pathlib in async tests
+    "PERF401", "RUF015", "PTH123",             # micro-optimizations / style
+    "PLR6301",                                 # allow pytest fixtures in tests
 ]
 
 [tool.ruff.lint.flake8-copyright]

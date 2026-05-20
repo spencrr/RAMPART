@@ -29,7 +29,7 @@ caching is config-dependent.
         manifest=copilot.manifest,
     )
 
-    # Multi-modal: chain converters (translate → render to PDF)
+    # Multi-modal: chain converters (translate -> render to PDF)
     payloads = await Payloads.generate_async(
         template=template,
         llm=adversarial_llm,
