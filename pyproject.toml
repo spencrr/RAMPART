@@ -110,7 +110,6 @@ ignore = [ # TODO - remove all ignores as issues are addressed
     "DOC201", #  docstring-missing-returns
     "DOC501", #  docstring-missing-exception
     "PLR6301", # no-self-use
-    "RUF067", #  non-empty-init-module
     "DOC502", #  docstring-extraneous-exception
 ]
 
