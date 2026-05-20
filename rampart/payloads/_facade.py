@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import logging
 import uuid
 from typing import TYPE_CHECKING
 
@@ -18,8 +17,6 @@ if TYPE_CHECKING:
     from rampart.core.manifest import AppManifest
     from rampart.core.persona import Persona
     from rampart.payloads.template import PayloadTemplate
-
-logger = logging.getLogger(__name__)
 
 
 class Payloads:
