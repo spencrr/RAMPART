@@ -375,7 +375,7 @@ class TestEvaluateTurnAsync:
 
         captured_context = None
 
-        async def capture_eval(*, context: EvalContext) -> EvalResult:
+        def capture_eval(*, context: EvalContext) -> EvalResult:
             nonlocal captured_context
             captured_context = context
             return EvalResult(outcome=EvalOutcome.NOT_DETECTED)

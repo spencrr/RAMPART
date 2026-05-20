@@ -102,7 +102,6 @@ ignore = [ # TODO - remove all ignores as issues are addressed
     "PLC1901", # compare-to-empty-string
     "PLR6301", # no-self-use
     "RUF067", #  non-empty-init-module
-    "RUF029", #  unused-async
     "DOC502", #  docstring-extraneous-exception
     "FURB101", # read-whole-file
 ]
