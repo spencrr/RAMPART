@@ -242,8 +242,8 @@ class PayloadStore:
                 )
                 f.write(json.dumps(record) + "\n")
 
+    @staticmethod
     def _write_manifest(
-        self,
         directory: Path,
         *,
         collection: str,
