@@ -97,7 +97,11 @@ def create_prompt_target(config: LLMConfig) -> PromptChatTarget:
 
 
 def _validate(config: LLMConfig) -> None:
-    """Raise early with clear messages for missing required fields."""
+    """Raise early with clear messages for missing required fields.
+
+    Raises:
+        ValueError: If ``config.model`` or ``config.endpoint`` is empty.
+    """
     if not config.model:
         msg = "LLMConfig.model is required (e.g. 'gpt-4o')."
         raise ValueError(msg)

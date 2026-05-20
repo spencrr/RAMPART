@@ -159,6 +159,10 @@ class LLMDriver:
         Defers all PyRIT interaction to the first ``next_prompt_async``
         call, which is always async and always happens after
         ``initialize_pyrit_async`` has been called in test setup.
+
+        Raises:
+            DriverError: If neither an LLM config nor a pre-built target
+                was provided at construction time.
         """
         if self._initialized:
             return
@@ -244,6 +248,10 @@ class LLMDriver:
         completed agent-side turn. Divergence means the driver is being
         asked to continue a conversation it did not author — either it was
         reused across tests, or resumed from a history it did not replay.
+
+        Raises:
+            DriverError: If the driver-side user-turn count does not match
+                the agent-side history length.
         """
         memory = CentralMemory.get_memory_instance()
         messages = memory.get_conversation(
@@ -310,7 +318,12 @@ class LLMDriver:
         return "\n".join(parts)
 
     async def _send_async(self, user_message: str) -> str:
-        """Send a user message on the driver-side conversation via PyRIT."""
+        """Send a user message on the driver-side conversation via PyRIT.
+
+        Raises:
+            DriverError: If the driver has not been initialized via
+                ``_ensure_initialized`` before this call.
+        """
         if self._normalizer is None or self._target is None:
             msg = (
                 "LLMDriver: driver not initialized — call "

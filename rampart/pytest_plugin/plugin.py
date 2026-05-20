@@ -202,6 +202,10 @@ def _create_trial_clones(
 
     Returns:
         list[pytest.Item]: The cloned trial items with trial metadata.
+
+    Raises:
+        pytest.UsageError: If the original item has no parent (cannot be
+            cloned in isolation).
     """
     original_name: str = getattr(item, "originalname", item.name)
     display_name = item.name

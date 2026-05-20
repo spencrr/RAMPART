@@ -118,7 +118,14 @@ class Payload:
     metadata: dict[str, Any] = field(default_factory=dict[str, Any])
 
     def __post_init__(self) -> None:
-        """Validate content-format-artifact consistency."""
+        """Validate content-format-artifact consistency.
+
+        Raises:
+            TypeError: If a binary format is missing an ``artifact`` path,
+                or a text format was given an ``artifact``.
+            FileNotFoundError: If ``artifact`` is set but the file does
+                not exist on disk.
+        """
         if self.format.is_binary and self.artifact is None:
             msg = (
                 f"Binary format {self.format.value} requires an "
@@ -218,7 +225,11 @@ class Request:
     attachments: list[Payload] = field(default_factory=list[Payload])
 
     def __post_init__(self) -> None:
-        """Validate that the request carries some content."""
+        """Validate that the request carries some content.
+
+        Raises:
+            ValueError: If both ``prompt`` and ``attachments`` are empty.
+        """
         if self.prompt is None and not self.attachments:
             msg = "Request must include at least a prompt or attachments."
             raise ValueError(msg)
@@ -312,7 +323,11 @@ class EvalContext:
 
     @property
     def current_turn(self) -> Turn:
-        """The most recent turn. Raises ValueError if no turns exist."""
+        """The most recent turn.
+
+        Raises:
+            ValueError: If no turns exist in this context.
+        """
         if not self.turns:
             msg = "No turns in context."
             raise ValueError(msg)
