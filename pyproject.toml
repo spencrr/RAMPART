@@ -110,8 +110,16 @@ ignore = [ # TODO - remove all ignores as issues are addressed
     "DOC201", #  docstring-missing-returns
     "DOC501", #  docstring-missing-exception
     "PLR6301", # no-self-use
-    "DOC502", #  docstring-extraneous-exception
 ]
+
+# Intentionally disabled (not technical debt):
+#   DOC502 (docstring-extraneous-exception) forbids documenting
+#   exceptions that propagate from a delegated callee. Google-style
+#   docstrings (and Sphinx/numpydoc convention) deliberately document
+#   such exceptions because they are part of the caller-visible
+#   contract. Enforcing DOC502 would either degrade the docs or force
+#   try/except boilerplate that hides the underlying error.
+extend-ignore = ["DOC502"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = [
