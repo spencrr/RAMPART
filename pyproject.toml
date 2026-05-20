@@ -113,7 +113,6 @@ ignore = [ # TODO - remove all ignores as issues are addressed
     "PLR6301", # no-self-use
     "RUF067", #  non-empty-init-module
     "DOC502", #  docstring-extraneous-exception
-    "FURB101", # read-whole-file
 ]
 
 [tool.ruff.lint.per-file-ignores]
