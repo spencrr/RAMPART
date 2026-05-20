@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -253,8 +254,8 @@ def _module_imports_pyrit(module_name: str) -> list[str]:
         f"Cannot locate source for {module_name}"
     )
 
-    with open(spec.origin, encoding="utf-8") as f:
-        tree = ast.parse(f.read(), filename=spec.origin)
+    source = Path(spec.origin).read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=spec.origin)
 
     violations: list[str] = []
     for node in ast.walk(tree):
