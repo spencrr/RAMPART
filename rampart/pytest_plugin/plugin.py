@@ -117,14 +117,10 @@ def _resolve_trial_n(marker: pytest.Mark) -> int:
 
     if not isinstance(raw, int) or isinstance(raw, bool):
         msg = f"trial(n=) must be an integer, got {type(raw).__name__}: {raw!r}"
-        raise pytest.UsageError(
-            msg,
-        )
+        raise pytest.UsageError(msg)
     if raw < 1:
         msg = f"trial(n=) must be >= 1, got {raw}"
-        raise pytest.UsageError(
-            msg,
-        )
+        raise pytest.UsageError(msg)
     return raw
 
 
@@ -208,9 +204,7 @@ def _create_trial_clones(
     fixtureinfo = getattr(item, "_fixtureinfo", None)
     if parent is None:
         msg = f"Cannot clone trial item with no parent: {item.nodeid}"
-        raise pytest.UsageError(
-            msg,
-        )
+        raise pytest.UsageError(msg)
     clones: list[pytest.Item] = []
 
     for i in range(count):

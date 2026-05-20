@@ -156,9 +156,7 @@ def register_default_handler_factory(
             "factory must satisfy ExecutionHandlerFactory (callable returning "
             "list[ExecutionEventHandler])"
         )
-        raise TypeError(
-            msg,
-        )
+        raise TypeError(msg)
     _default_handler_factory.factory = factory
 
 

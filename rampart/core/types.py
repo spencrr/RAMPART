@@ -125,22 +125,16 @@ class Payload:
                 f"artifact path. Provide artifact=Path(...) or "
                 f"use a converter to render the payload."
             )
-            raise TypeError(
-                msg,
-            )
+            raise TypeError(msg)
         if self.format.is_text and self.artifact is not None:
             msg = (
                 f"Text format {self.format.value} delivers content "
                 f"directly — artifact must be None."
             )
-            raise TypeError(
-                msg,
-            )
+            raise TypeError(msg)
         if self.artifact is not None and not self.artifact.exists():
             msg = f"Artifact file does not exist: {self.artifact}"
-            raise FileNotFoundError(
-                msg,
-            )
+            raise FileNotFoundError(msg)
 
     def __str__(self) -> str:
         """Human-readable preview of the payload."""
@@ -227,9 +221,7 @@ class Request:
         """Validate that the request carries some content."""
         if self.prompt is None and not self.attachments:
             msg = "Request must include at least a prompt or attachments."
-            raise ValueError(
-                msg,
-            )
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, kw_only=True)
