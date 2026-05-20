@@ -83,7 +83,7 @@ class ResultCollectionHandler(ExecutionEventHandler):
     collector is active (safe to use outside pytest).
     """
 
-    async def on_event(self, *, event_data: ExecutionEventData) -> None:
+    async def on_event(self, *, event_data: ExecutionEventData) -> None:  # noqa: PLR6301 -- ABC override; signature fixed by ExecutionEventHandler
         """Record result on post-execute. Ignore all other events.
 
         Args:

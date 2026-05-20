@@ -225,8 +225,8 @@ class XPIAExecution(BaseExecution):
             for h in self._handles
         ]
 
+    @staticmethod
     def _adjust_for_observability(
-        self,
         *,
         adapter: AgentAdapter,
         turns: list[Turn],

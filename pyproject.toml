@@ -107,7 +107,6 @@ filterwarnings = [
 select = ["ALL"]
 preview = true
 ignore = [ # TODO - remove all ignores as issues are addressed
-    "PLR6301", # no-self-use
 ]
 
 # Intentionally disabled (not technical debt):

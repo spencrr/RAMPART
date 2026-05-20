@@ -305,7 +305,8 @@ class LLMDriver:
             injections=injections,
         )
 
-    def _build_user_message(self, *, history: list[Turn]) -> str:
+    @staticmethod
+    def _build_user_message(*, history: list[Turn]) -> str:
         """Build the user message for the driver-side conversation.
 
         Only sends newly-available information from the agent-side
