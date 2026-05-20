@@ -145,6 +145,10 @@ class LLMDriver:
             persona: System-prompt identity.
             objective: Optional per-test goal.
             injections: Optional injection metadata for the system prompt.
+
+        Returns:
+            LLMDriver: A new instance bound to ``target`` with the
+                given persona, objective, and injections.
         """
         return cls(
             target=target,
@@ -281,6 +285,10 @@ class LLMDriver:
 
         Injection metadata (id, format, description) is passed to the
         template. Raw payload content is never included.
+
+        Returns:
+            str: The rendered system prompt with persona, objective,
+                and injection metadata substituted.
         """
         injections = [
             {
@@ -303,6 +311,12 @@ class LLMDriver:
         Only sends newly-available information from the agent-side
         conversation — PyRIT maintains the full driver-side conversation
         via CentralMemory.
+
+        Returns:
+            str: On the first turn (empty history) the bootstrap prompt
+                ``"Begin. Send the first user prompt."``; otherwise the
+                latest agent response and (if present) the evaluator
+                outcome and rationale, joined by newlines.
         """
         if not history:
             return "Begin. Send the first user prompt."
@@ -319,6 +333,9 @@ class LLMDriver:
 
     async def _send_async(self, user_message: str) -> str:
         """Send a user message on the driver-side conversation via PyRIT.
+
+        Returns:
+            str: The driving LLM's plain-text response.
 
         Raises:
             DriverError: If the driver has not been initialized via
