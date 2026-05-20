@@ -67,9 +67,7 @@ class DocxConverter:
         """
         if not payload.format.is_text:
             msg = f"DocxConverter requires a text payload, got {payload.format.value}."
-            raise ValueError(
-                msg,
-            )
+            raise ValueError(msg)
 
         result = await self._get_converter().convert_async(
             prompt=payload.content,

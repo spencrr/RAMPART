@@ -100,14 +100,10 @@ def _validate(config: LLMConfig) -> None:
     """Raise early with clear messages for missing required fields."""
     if not config.model:
         msg = "LLMConfig.model is required (e.g. 'gpt-4o')."
-        raise ValueError(
-            msg,
-        )
+        raise ValueError(msg)
     if not config.endpoint:
         msg = "LLMConfig.endpoint is required (e.g. 'https://api.openai.com/v1')."
-        raise ValueError(
-            msg,
-        )
+        raise ValueError(msg)
 
 
 def _extract_model_params(metadata: dict[str, Any]) -> dict[str, Any]:

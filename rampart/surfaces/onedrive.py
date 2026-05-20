@@ -119,9 +119,7 @@ class OneDriveSurface:
                     f"Binary payload format {payload.format.value} "
                     "requires an artifact path."
                 )
-                raise ValueError(
-                    msg,
-                )
+                raise ValueError(msg)
 
             content = payload.artifact.read_bytes()
         else:
@@ -133,9 +131,7 @@ class OneDriveSurface:
                 "exceeds the 4 MiB small-upload limit. Upload sessions "
                 "are not yet implemented."
             )
-            raise ValueError(
-                msg,
-            )
+            raise ValueError(msg)
 
         # Graph path-based addressing: root:/{relative-path}:
         # The trailing colon is required by the API.
@@ -150,9 +146,7 @@ class OneDriveSurface:
                 "Graph API returned no DriveItem after upload to "
                 f"drive={self.drive_id} path={upload_path}"
             )
-            raise InfrastructureError(
-                msg,
-            )
+            raise InfrastructureError(msg)
 
         item_id = drive_item.id
         logger.info(
@@ -218,9 +212,7 @@ class _OneDriveInjection:
                 f"OneDrive upload failed for drive={self._surface.drive_id} "
                 f"path={self._surface.folder_path}: {exc}"
             )
-            raise InfrastructureError(
-                msg,
-            ) from exc
+            raise InfrastructureError(msg) from exc
         return self
 
     async def __aexit__(

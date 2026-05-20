@@ -84,9 +84,7 @@ class Probes:
         given = sum(x is not None for x in (prompt, prompts, driver))
         if given != 1:
             msg = "Specify exactly one of 'prompt', 'prompts', or 'driver'."
-            raise ValueError(
-                msg,
-            )
+            raise ValueError(msg)
         if prompt is not None:
             resolved_driver = coerce_driver(prompt)
         elif prompts is not None:
