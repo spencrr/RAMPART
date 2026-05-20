@@ -177,7 +177,7 @@ def _copy_markers_to_clone(*, source: pytest.Item, clone: pytest.Item) -> None:
         if marker.name == "trial":
             continue
         clone.add_marker(
-            pytest.mark.__getattr__(marker.name)(*marker.args, **marker.kwargs),
+            getattr(pytest.mark, marker.name)(*marker.args, **marker.kwargs),
         )
 
 
@@ -299,7 +299,7 @@ def _absorb_results(
     """
     try:
         rampart_session.absorb(node=node, collector=collector)
-    except Exception:  # noqa: BLE001  — plugin must not break test runs
+    except Exception:
         logger.warning(
             "Failed to absorb results for %s — results may be incomplete.",
             node.nodeid,
@@ -511,7 +511,7 @@ async def _emit_sinks_async(*, rampart_session: RampartSession) -> None:
     for sink in rampart_session.sinks:
         try:
             await sink.emit_async(report=report)
-        except Exception:  # noqa: BLE001  — sink errors must not break teardown
+        except Exception:
             logger.warning(
                 "Sink %s.emit_async failed — report may not be persisted.",
                 type(sink).__name__,

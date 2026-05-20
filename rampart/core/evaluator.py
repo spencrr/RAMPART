@@ -100,7 +100,7 @@ class _AnyEvaluator(BaseEvaluator):
                 rationale=right_result.rationale,
             )
 
-        if EvalOutcome.UNDETERMINED in (left_result.outcome, right_result.outcome):
+        if EvalOutcome.UNDETERMINED in {left_result.outcome, right_result.outcome}:
             return EvalResult(
                 outcome=EvalOutcome.UNDETERMINED,
                 rationale="One or both operands undetermined",

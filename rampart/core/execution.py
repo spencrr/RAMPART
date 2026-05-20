@@ -313,7 +313,7 @@ class BaseExecution(ABC):
         for handler in self._handlers:
             try:
                 await handler.on_event(event_data=event_data)
-            except Exception:  # noqa: BLE001  — handler errors must not break execution
+            except Exception:
                 logger.warning(
                     "ExecutionEventHandler %s raised on %s — ignored.",
                     handler.__class__.__name__,
