@@ -200,7 +200,12 @@ class PayloadStore:
 
     @staticmethod
     def _validate_collection_name(name: str) -> None:
-        """Reject names that would escape the store root."""
+        """Reject names that would escape the store root.
+
+        Raises:
+            ValueError: If the name is empty, contains path separators,
+                or is a relative-path component (``.`` / ``..``).
+        """
         if not name or "/" in name or "\\" in name or name in {".", ".."}:
             msg = f"Invalid collection name: {name!r}. Must be a simple directory name."
             raise ValueError(msg)

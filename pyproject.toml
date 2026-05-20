@@ -108,7 +108,6 @@ select = ["ALL"]
 preview = true
 ignore = [ # TODO - remove all ignores as issues are addressed
     "DOC201", #  docstring-missing-returns
-    "DOC501", #  docstring-missing-exception
     "PLR6301", # no-self-use
 ]
 
@@ -124,7 +123,7 @@ extend-ignore = ["DOC502"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = [
     "S101",                                           # assert is pytest's API
-    "D100", "D101", "D102", "D104", "D107", "DOC201", # no docstrings needed
+    "D100", "D101", "D102", "D104", "D107", "DOC201", "DOC501", # no docstrings needed
     "ANN001", "ANN201", "ANN202", "ANN401",           # no type annotations needed
     "PLR2004",                                        # magic values in assertions are fine
     "PLC1901",                                        # explicit `== ""` is intentional in assertions

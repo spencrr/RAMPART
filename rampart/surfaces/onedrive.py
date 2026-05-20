@@ -200,7 +200,12 @@ class _OneDriveInjection:
         await sleep_until_ready(delay=self._surface.indexing_delay)
 
     async def __aenter__(self) -> Self:
-        """Upload payload to OneDrive. Raises InfrastructureError on failure."""
+        """Upload payload to OneDrive.
+
+        Raises:
+            InfrastructureError: If the Graph API upload fails for any
+                reason (wraps the underlying exception).
+        """
         try:
             self._item_id = await self._surface.upload_async(
                 payload=self._payload,
