@@ -233,7 +233,7 @@ class _OneDriveInjection:
         if self._item_id is not None:
             try:
                 await self._surface.delete_async(item_id=self._item_id)
-            except Exception:  # noqa: BLE001  — cleanup must not raise
+            except Exception:
                 logger.warning(
                     "OneDrive cleanup failed for item %s in drive=%s",
                     self._item_id,

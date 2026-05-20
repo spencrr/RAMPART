@@ -61,11 +61,11 @@ class PayloadFormat(Enum):
     @property
     def is_text(self) -> bool:
         """True if this format carries content as str."""
-        return self in (
+        return self in {
             PayloadFormat.TEXT,
             PayloadFormat.HTML,
             PayloadFormat.MARKDOWN,
-        )
+        }
 
     @property
     def is_binary(self) -> bool:
@@ -144,9 +144,9 @@ class Payload:
 
     def __str__(self) -> str:
         """Human-readable preview of the payload."""
-        _preview_max_length = 200
-        truncated = self.content[:_preview_max_length]
-        suffix = "..." if len(self.content) > _preview_max_length else ""
+        preview_max_length = 200
+        truncated = self.content[:preview_max_length]
+        suffix = "..." if len(self.content) > preview_max_length else ""
         return truncated + suffix
 
 

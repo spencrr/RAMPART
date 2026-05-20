@@ -253,7 +253,7 @@ def _module_imports_pyrit(module_name: str) -> list[str]:
         f"Cannot locate source for {module_name}"
     )
 
-    with open(spec.origin) as f:
+    with open(spec.origin, encoding="utf-8") as f:
         tree = ast.parse(f.read(), filename=spec.origin)
 
     violations: list[str] = []

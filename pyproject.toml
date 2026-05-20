@@ -95,23 +95,37 @@ filterwarnings = [
 
 [tool.ruff.lint]
 select = ["ALL"]
+preview = true
+ignore = [ # TODO - remove all ignores as issues are addressed
+    "DOC201", #  docstring-missing-returns
+    "RUF069", #  float-equality-comparison
+    "DOC501", #  docstring-missing-exception
+    "PLC1901", # compare-to-empty-string
+    "PLR6301", # no-self-use
+    "RUF067", #  non-empty-init-module
+    "RUF029", #  unused-async
+    "DOC502", #  docstring-extraneous-exception
+    "FURB101", # read-whole-file
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = [
-    "S101",                                    # assert is pytest's API
-    "D100", "D101", "D102", "D104", "D107",    # no docstrings needed
-    "ANN001", "ANN201", "ANN202", "ANN401",    # no type annotations needed
-    "PLR2004",                                 # magic values in assertions are fine
-    "ARG001", "ARG002",                        # unused args (fixtures, stubs)
-    "PLC0415",                                 # imports inside functions for isolation
-    "SLF001",                                  # testing private members is valid
-    "TRY003", "EM101", "EM102",                # exception message style
-    "BLE001",                                  # catching Exception in tests
-    "TRY301",                                  # raise in try blocks
-    "S108",                                    # /tmp usage
-    "PT017", "PT018",                          # assertion style
-    "ASYNC240",                                # pathlib in async tests
-    "PERF401", "RUF015", "PTH123",             # micro-optimizations / style
+    "S101",                                           # assert is pytest's API
+    "D100", "D101", "D102", "D104", "D107", "DOC201", # no docstrings needed
+    "ANN001", "ANN201", "ANN202", "ANN401",           # no type annotations needed
+    "PLR2004",                                        # magic values in assertions are fine
+    "ARG001", "ARG002",                               # unused args (fixtures, stubs)
+    "PLC0415",                                        # imports inside functions for isolation
+    "SLF001",                                         # testing private members is valid
+    "PLC2701",                                        # importing private names is fine
+    "TRY003", "EM101", "EM102",                       # exception message style
+    "BLE001",                                         # catching Exception in tests
+    "TRY301",                                         # raise in try blocks
+    "S108",                                           # /tmp usage
+    "PT017", "PT018",                                 # assertion style
+    "ASYNC240",                                       # pathlib in async tests
+    "PERF401", "RUF015", "PTH123",                    # micro-optimizations / style
+    "PLR6301",                                        # allow pytest fixtures in tests
 ]
 
 [tool.ruff.lint.flake8-copyright]
