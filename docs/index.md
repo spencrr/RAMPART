@@ -10,16 +10,6 @@ description: RAMPART is a pytest-native safety testing framework for agentic AI 
 
 RAMPART is a pytest-native safety testing framework for agentic AI applications. You write tests that attack or probe your agent, and RAMPART orchestrates the interaction, evaluates the outcome, and reports the results.
 
-```python
-result = await Attacks.xpia(
-    trigger="Summarize the Q3 reports",
-    evaluator=ToolCalled("send_email"),
-    inject=handle,
-).execute_async(adapter=my_agent)
-
-assert result, result.summary
-```
-
 ---
 
 ## Quick Navigation
