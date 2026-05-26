@@ -67,7 +67,10 @@ rampart = "rampart.pytest_plugin.plugin"
 exclude = ["site*", "docs*", "tests*", "scripts*"]
 
 [tool.setuptools.package-data]
-rampart = ["drivers/prompts/*.yaml"]
+rampart = [
+    "drivers/prompts/*.yaml",
+    "evaluators/prompts/*.yaml",
+]
 
 [tool.coverage.run]
 source = ["rampart"]
@@ -90,6 +93,7 @@ reportPrivateUsage = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
 markers = [
     "harm(*categories): categorize test by harm type",
     "trial(n=, threshold=): statistical repetition of a test",
