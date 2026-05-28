@@ -132,6 +132,7 @@ extend-ignore = [
     "ASYNC240",                                # pathlib in async tests
     "PERF401", "RUF015", "PTH123",             # micro-optimizations / style
     "PLR6301",                                 # allow pytest fixtures in tests
+    "PLW0717",                                 # try clause contains >5 statements
 ]
 
 [tool.ruff.lint.flake8-copyright]
