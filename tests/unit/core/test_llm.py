@@ -38,15 +38,15 @@ class TestLLMConfigConstruction:
 
     def test_keyword_only(self):
         with pytest.raises(TypeError):
-            LLMConfig("gpt-4o", "https://api.example.com")
+            LLMConfig("gpt-4o", "https://api.example.com")  # ty: ignore[too-many-positional-arguments, missing-argument]
 
     def test_requires_model(self):
         with pytest.raises(TypeError):
-            LLMConfig(endpoint="https://api.example.com")
+            LLMConfig(endpoint="https://api.example.com")  # ty: ignore[missing-argument]
 
     def test_requires_endpoint(self):
         with pytest.raises(TypeError):
-            LLMConfig(model="gpt-4o")
+            LLMConfig(model="gpt-4o")  # ty: ignore[missing-argument]
 
 
 class TestLLMConfigImmutability:
@@ -55,7 +55,7 @@ class TestLLMConfigImmutability:
     def test_cannot_set_field(self):
         cfg = LLMConfig(model="gpt-4o", endpoint="https://api.example.com")
         with pytest.raises(AttributeError):
-            cfg.model = "gpt-4"
+            cfg.model = "gpt-4"  # ty: ignore[invalid-assignment]
 
     def test_cannot_delete_field(self):
         cfg = LLMConfig(model="gpt-4o", endpoint="https://api.example.com")

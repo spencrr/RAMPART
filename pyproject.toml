@@ -22,7 +22,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
     "Topic :: Software Development :: Testing",
 ]
@@ -81,30 +80,6 @@ fail_under = 80
 show_missing = true
 skip_empty = true
 
-[tool.ty.environment]
-python-version = "3.11"
-
-[tool.ty.src]
-include = ["rampart", "tests"]
-
-[tool.ty.rules]
-# Treat unused suppression comments as warnings during the transition off pyright.
-unused-ignore-comment = "warn"
-
-# Tests intentionally feed MagicMock objects to typed pytest hooks, construct
-# objects with deliberately wrong args to exercise validation paths, and use
-# Protocol stub classes with `...` bodies. These are not real type errors.
-[[tool.ty.overrides]]
-include = ["tests/**"]
-
-[tool.ty.overrides.rules]
-invalid-argument-type = "ignore"
-invalid-assignment = "ignore"
-empty-body = "ignore"
-missing-argument = "ignore"
-no-matching-overload = "ignore"
-too-many-positional-arguments = "ignore"
-
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
@@ -149,6 +124,18 @@ convention = "google"
 
 [tool.ruff.lint.pylint]
 max-args = 10
+
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.src]
+include = ["rampart", "tests"]
+
+[[tool.ty.overrides]]
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
 
 [tool.uv.sources]
 pyrit = { git = "https://github.com/microsoft/PyRIT", rev = "6dc8b94139757390286bbce7d53c1f7e58e66e29" } # v0.13.0

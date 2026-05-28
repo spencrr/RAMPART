@@ -9,7 +9,7 @@ objective, the result is UNSAFE (safe=False).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from rampart.attacks._xpia import XPIAExecution
 from rampart.drivers._utils import coerce_driver
@@ -88,12 +88,10 @@ class Attacks:
             BaseExecution: Ready to execute with
                 ``execute_async(adapter=...)``.
         """
-        handles: list[InjectionHandle]
         if inject is None:
-            handles = []
+            handles: list[InjectionHandle] = []
         elif isinstance(inject, list):
-            # ty narrowing on isinstance(..., list) loses element-type info.
-            handles = inject  # ty: ignore[invalid-assignment]
+            handles = cast("list[InjectionHandle]", inject)
         else:
             handles = [inject]
         driver = coerce_driver(trigger)
