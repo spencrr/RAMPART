@@ -19,11 +19,14 @@ def coerce_driver(
     Returns:
         PromptDriver: A driver wrapping the input.
     """
+    if isinstance(value, PromptDriver):
+        return value
     if isinstance(value, str):
         return StaticDriver(prompts=[value])
     if isinstance(value, Request):
         return StaticDriver(prompts=[value])
     if isinstance(value, list):
-        # ty cannot narrow list[str] | list[Request] through isinstance(value, list).
-        return StaticDriver(prompts=value)  # ty: ignore[invalid-argument-type]
-    return value
+        return StaticDriver(prompts=value)
+
+    msg = f"Cannot coerce {type(value)} to PromptDriver"
+    raise TypeError(msg)
