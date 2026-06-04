@@ -8,7 +8,9 @@ builds the final TestRunReport.
 
 Note: The architecture places RampartSession in plugin.py. This
 implementation extracts it to a dedicated module for file size
-management. This is a documented deviation from the architecture.
+management and to share state with the xdist support module
+(``_xdist.py``). This is a documented deviation from the
+architecture.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import copy
 import logging
 from collections import Counter
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rampart.core.result import Result, SafetyStatus
 from rampart.reporting.sink import ReportSink, TestRunReport
@@ -88,11 +90,32 @@ class RampartSession:
         self._sinks: list[ReportSink] = sinks or []
         self._duration_seconds: float = 0.0
         self._cached_report: TestRunReport | None = None
+        self._emitted: bool = False
+        self._incomplete: bool = False
+        self._incomplete_reasons: list[str] = []
+        self._report_metadata: dict[str, object] = {}
 
     @property
     def sinks(self) -> list[ReportSink]:
         """Configured report sinks."""
         return list(self._sinks)
+
+    @property
+    def results_by_nodeid(self) -> dict[str, list[Result]]:
+        """Read-only view of results grouped by pytest node ID."""
+        return {
+            nodeid: list(results) for nodeid, results in self._results_by_nodeid.items()
+        }
+
+    @property
+    def is_emitted(self) -> bool:
+        """True once report emission has been attempted (idempotency guard)."""
+        return self._emitted
+
+    @property
+    def is_incomplete(self) -> bool:
+        """True if any worker failed to deliver complete results."""
+        return self._incomplete
 
     def add_sinks(self, *, sinks: list[ReportSink]) -> None:
         """Register additional sinks for report emission.
@@ -234,25 +257,87 @@ class RampartSession:
         """Trial group aggregates, keyed by base node ID."""
         return dict(self._trial_groups)
 
+    def merge_worker_results(
+        self,
+        *,
+        results_by_nodeid: dict[str, list[Result]],
+    ) -> None:
+        """Merge an xdist worker's results into this session.
+
+        Extends both the flat ``_results`` list and the
+        ``_results_by_nodeid`` mapping. Invalidates any cached report
+        so the next ``build_report()`` reflects the merged data.
+
+        Args:
+            results_by_nodeid (dict[str, list[Result]]): Worker results
+                grouped by pytest node ID.
+        """
+        for nodeid, results in results_by_nodeid.items():
+            self._results.extend(results)
+            self._results_by_nodeid.setdefault(nodeid, []).extend(results)
+        self._cached_report = None
+
+    def mark_emitted(self) -> None:
+        """Mark the session as having attempted report emission."""
+        self._emitted = True
+
+    def mark_incomplete(self, *, reason: str) -> None:
+        """Record that a worker failed to deliver complete results.
+
+        Args:
+            reason (str): A short human-readable explanation surfaced
+                in the report metadata.
+        """
+        self._incomplete = True
+        self._incomplete_reasons.append(reason)
+        self._cached_report = None
+
+    def set_report_metadata(self, *, metadata: dict[str, object]) -> None:
+        """Attach run-level metadata that will appear on ``TestRunReport``.
+
+        Used by the plugin to surface xdist run-mode information
+        (active, worker count, dist mode). Subsequent calls merge into
+        existing metadata.
+
+        Args:
+            metadata (dict[str, object]): Key/value pairs to attach.
+        """
+        self._report_metadata.update(metadata)
+        self._cached_report = None
+
     def build_report(self) -> TestRunReport:
         """Build a TestRunReport from all collected results.
 
         The report is cached and reused on subsequent calls. The
-        cache is invalidated when new results are absorbed.
+        cache is invalidated when new results are absorbed or merged
+        or when metadata is updated.
+
+        Results are sorted by their pytest node ID (from
+        ``metadata['test_name']`` when available) for deterministic
+        ordering across xdist worker completion orders.
 
         Returns:
             TestRunReport: Aggregated test run results.
         """
         if self._cached_report is not None:
             return self._cached_report
-        counts = Counter(r.status for r in self._results)
+        sorted_results = sorted(
+            self._results,
+            key=lambda r: str(r.metadata.get("test_name", "")),
+        )
+        counts = Counter(r.status for r in sorted_results)
+        metadata: dict[str, Any] = dict(self._report_metadata)
+        if self._incomplete:
+            metadata["incomplete"] = True
+            metadata["incomplete_reasons"] = list(self._incomplete_reasons)
         self._cached_report = TestRunReport(
-            results=list(self._results),
-            total_runs=len(self._results),
+            results=sorted_results,
+            total_runs=len(sorted_results),
             passed=counts[SafetyStatus.SAFE],
             failed=counts[SafetyStatus.UNSAFE],
             undetermined=counts[SafetyStatus.UNDETERMINED],
             errors=counts[SafetyStatus.ERROR],
             duration_seconds=self._duration_seconds,
+            metadata=metadata,
         )
         return self._cached_report

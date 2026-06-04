@@ -44,6 +44,18 @@ from rampart.pytest_plugin._collection import (
     deactivate_collector,
 )
 from rampart.pytest_plugin._session import RampartSession
+from rampart.pytest_plugin._xdist import (
+    DEFAULT_SIZE_LIMIT_BYTES,
+    SIZE_LIMIT_OPTION,
+    SizeLimitError,
+    discover_sinks_from_conftest,
+    finalize_worker,
+    get_dist_mode,
+    get_worker_count,
+    handle_testnodedown,
+    is_xdist_controller,
+    is_xdist_worker,
+)
 from rampart.reporting.sink import ReportSink
 
 if TYPE_CHECKING:
@@ -54,10 +66,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "pytest_addoption",
     "pytest_collection_modifyitems",
     "pytest_configure",
     "pytest_sessionfinish",
     "pytest_terminal_summary",
+    "pytest_testnodedown",
     "pytest_unconfigure",
 ]
 
@@ -126,6 +140,33 @@ def _resolve_trial_n(marker: pytest.Mark) -> int:
             msg,
         )
     return raw
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register RAMPART CLI and ini options.
+
+    Args:
+        parser (pytest.Parser): The pytest argument parser.
+    """
+    group = parser.getgroup("rampart")
+    group.addoption(
+        f"--{SIZE_LIMIT_OPTION.replace('_', '-')}",
+        dest=SIZE_LIMIT_OPTION,
+        type=int,
+        default=None,
+        help=(
+            "Maximum size in bytes of a worker's serialized result payload "
+            f"under pytest-xdist (default: {DEFAULT_SIZE_LIMIT_BYTES})."
+        ),
+    )
+    parser.addini(
+        SIZE_LIMIT_OPTION,
+        help=(
+            "Maximum size in bytes of a worker's serialized result payload "
+            f"under pytest-xdist (default: {DEFAULT_SIZE_LIMIT_BYTES})."
+        ),
+        default=None,
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -242,7 +283,7 @@ def _create_trial_clones(
 
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(
-    config: pytest.Config,  # noqa: ARG001  — pytest hook signature
+    config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
     """Clone trial-marked items and validate marker usage.
@@ -266,12 +307,14 @@ def pytest_collection_modifyitems(
             item has no parent.
     """
     expanded: list[pytest.Item] = []
+    saw_trial = False
     for item in items:
         trial_marker = item.get_closest_marker("trial")
         if trial_marker is None:
             expanded.append(item)
             continue
 
+        saw_trial = True
         n = _resolve_trial_n(trial_marker)
 
         expanded.extend(
@@ -279,6 +322,18 @@ def pytest_collection_modifyitems(
         )
 
     items[:] = expanded
+
+    if saw_trial and is_xdist_controller(config=config):
+        dist_mode = get_dist_mode(config=config)
+        if dist_mode != "loadgroup":
+            logger.warning(
+                "RAMPART @trial markers present with --dist=%s. Trial "
+                "clones may be split across workers. Aggregation remains "
+                "correct (controller merges all results), but using "
+                "--dist=loadgroup keeps trial clones co-located on one "
+                "worker for better locality.",
+                dist_mode,
+            )
 
 
 def _absorb_results(
@@ -366,8 +421,15 @@ def _rampart_sink_bootstrap(  # pyright: ignore[reportUnusedFunction]  # pytest 
         return [JsonFileReportSink(output_dir=Path(".report"))]
     ```
 
+    Under pytest-xdist, this fixture is a no-op on worker processes
+    (workers skip sink emission entirely); sink discovery on the
+    controller is handled by ``_xdist.discover_sinks_from_conftest``.
+
     No test author ever imports or references this fixture.
     """
+    if is_xdist_worker(config=request.config):
+        return
+
     rampart_session = request.config.stash.get(_rampart_key, None)
     if rampart_session is None:
         return
@@ -477,6 +539,16 @@ def pytest_sessionfinish(
 ) -> None:
     """Aggregate trial results, evaluate gates, and emit sinks.
 
+    Dispatches between three modes:
+
+    - xdist worker: serialize results to ``config.workeroutput`` and
+      skip sink emission (the controller emits the unified report).
+    - xdist controller: trials already aggregated against the merged
+      ``_results_by_nodeid``; discover sinks from conftest, evaluate
+      gates, and emit.
+    - non-xdist: original single-process pipeline (aggregate, gate,
+      emit) unchanged.
+
     Args:
         session (pytest.Session): The pytest session.
         exitstatus (int): The session exit status.
@@ -489,9 +561,63 @@ def pytest_sessionfinish(
     if start_time is not None:
         rampart_session.set_duration(duration_seconds=time.monotonic() - start_time)
 
+    if is_xdist_worker(config=session.config):
+        try:
+            finalize_worker(config=session.config, session=rampart_session)
+        except SizeLimitError as exc:
+            logger.warning("%s", exc)
+        return
+
+    if is_xdist_controller(config=session.config):
+        _aggregate_trial_results(session=session, rampart_session=rampart_session)
+        _evaluate_gates(rampart_session=rampart_session)
+        _record_xdist_metadata(session=session, rampart_session=rampart_session)
+        controller_sinks = discover_sinks_from_conftest(config=session.config)
+        if controller_sinks:
+            rampart_session.add_sinks(sinks=controller_sinks)
+        _emit_sinks(rampart_session=rampart_session)
+        return
+
     _aggregate_trial_results(session=session, rampart_session=rampart_session)
     _evaluate_gates(rampart_session=rampart_session)
     _emit_sinks(rampart_session=rampart_session)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: object, error: object) -> None:
+    """Merge a finished xdist worker's results into the controller session.
+
+    Thin delegate to ``_xdist.handle_testnodedown`` so plugin.py stays
+    focused on hook registration. Registered as ``optionalhook`` so
+    pytest does not warn when pytest-xdist is not installed.
+
+    Args:
+        node: The xdist worker node that has finished.
+        error: The shutdown error reported by xdist, or None on
+            clean exit.
+    """
+    config = getattr(node, "config", None)
+    if config is None:
+        return
+    rampart_session = config.stash.get(_rampart_key, None)
+    if rampart_session is None:
+        return
+    handle_testnodedown(session=rampart_session, node=node, error=error)
+
+
+def _record_xdist_metadata(
+    *,
+    session: pytest.Session,
+    rampart_session: RampartSession,
+) -> None:
+    """Attach xdist run-mode metadata to the upcoming report."""
+    rampart_session.set_report_metadata(
+        metadata={
+            "xdist_active": True,
+            "worker_count": get_worker_count(config=session.config),
+            "dist_mode": get_dist_mode(config=session.config),
+        },
+    )
 
 
 async def _emit_sinks_async(*, rampart_session: RampartSession) -> None:
@@ -529,12 +655,19 @@ def _emit_sinks(*, rampart_session: RampartSession) -> None:
     When an event loop is already running (e.g. pytest-asyncio),
     falls back to scheduling on the existing loop.
 
+    Idempotent — subsequent invocations are no-ops, guarding against
+    re-emission in nested hook scenarios.
+
     Args:
         rampart_session (RampartSession): The RAMPART session state.
     """
+    if rampart_session.is_emitted:
+        return
     if not rampart_session.sinks:
+        rampart_session.mark_emitted()
         return
 
+    rampart_session.mark_emitted()
     coro = _emit_sinks_async(rampart_session=rampart_session)
     try:
         loop = asyncio.get_running_loop()

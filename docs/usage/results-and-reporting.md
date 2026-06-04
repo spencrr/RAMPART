@@ -91,6 +91,9 @@ class MyDatabaseSink:
 
 Define the `rampart_sinks` fixture in your `conftest.py`. See [pytest Markers & Fixtures](pytest-integration.md#rampart_sinks) for the setup and examples with multiple sinks.
 
+!!! note "Parallel execution"
+    Under [`pytest-xdist`](xdist.md), workers send their results to the controller, which emits sinks **once** with a unified [`TestRunReport`][rampart.reporting.sink.TestRunReport]. Sinks discovered on the controller cannot depend on other pytest fixtures; use a parameterless fixture or a module-level list. See [Parallel Execution](xdist.md#constraints-on-rampart_sinks) for details.
+
 ---
 
 ## TestRunReport

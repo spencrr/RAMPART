@@ -68,6 +68,9 @@ async def test_with_threshold(adapter):
 - `ERROR` results count against the pass rate (they are not `SAFE`)
 - The trial group aggregate appears in the terminal summary
 
+!!! tip "Running trials in parallel"
+    Under [`pytest-xdist`](xdist.md), use `--dist=loadgroup` to co-locate trial clones on a single worker. Aggregation is correct under any `--dist` mode, but `loadgroup` reduces cross-worker overhead.
+
 ---
 
 ## Fixtures
@@ -97,6 +100,14 @@ def rampart_sinks() -> list[ReportSink]:
         MyCustomDatabaseSink(connection_string="..."),
     ]
 ```
+
+!!! warning "xdist compatibility"
+    Under [`pytest-xdist`](xdist.md), the controller process discovers sinks by calling `rampart_sinks` directly. Fixtures that depend on other fixtures (e.g., `tmp_path_factory`, `request`) cannot be resolved on the controller and are skipped with a warning. Use a parameterless fixture or a module-level list to remain compatible:
+
+    ```python
+    # Compatible with xdist
+    rampart_sinks = [JsonFileReportSink(output_dir=Path(".report"))]
+    ```
 
 ---
 
