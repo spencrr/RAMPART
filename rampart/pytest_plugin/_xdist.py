@@ -49,6 +49,7 @@ from rampart.core.types import (
     ToolCall,
     Turn,
 )
+from rampart.pytest_plugin._session import TrialSpec
 from rampart.reporting.sink import ReportSink
 
 if TYPE_CHECKING:
@@ -436,8 +437,9 @@ def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
     """Serialize a worker's RampartSession state for transport to the controller.
 
     Produces a JSON-safe dict containing the schema version, the
-    package version (for cross-version diagnostics), and the worker's
-    ``_results_by_nodeid`` mapping serialized to primitive types.
+    package version (for cross-version diagnostics), the worker's
+    ``_results_by_nodeid`` mapping serialized to primitive types,
+    and trial specs registered during collection.
 
     Args:
         session (RampartSession): The worker's session state.
@@ -455,6 +457,14 @@ def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
         "schema": SCHEMA_VERSION,
         "package_version": _package_version(),
         "results_by_nodeid": serialized,
+        "trial_specs": [
+            {
+                "clone_nodeid": clone_nodeid,
+                "base_nodeid": spec.base_nodeid,
+                "threshold": _safe_float(value=spec.threshold) or 0.0,
+            }
+            for clone_nodeid, spec in session.trial_specs.items()
+        ],
     }
 
 
@@ -810,6 +820,61 @@ def deserialize_worker_data(*, data: object) -> dict[str, list[Result]]:
     return out
 
 
+def deserialize_trial_specs(*, data: object) -> dict[str, TrialSpec]:
+    """Deserialize the ``trial_specs`` section of a worker payload.
+
+    Missing or malformed entries are skipped rather than raised so
+    that a partially-corrupt payload still merges results. The
+    ``trial_specs`` field is optional: payloads without trials emit
+    an empty list and this function returns an empty dict.
+
+    Args:
+        data (object): The deserialized JSON object from
+            ``node.workeroutput``.
+
+    Returns:
+        dict[str, TrialSpec]: Trial specs keyed by clone node ID.
+
+    Raises:
+        SchemaVersionError: Missing or unknown schema version.
+        WorkerOutputError: ``data`` is not a dict payload.
+    """
+    typed = _validate_schema(data=data)
+    raw_specs = typed.get("trial_specs", [])
+    if not isinstance(raw_specs, list):
+        return {}
+    out: dict[str, TrialSpec] = {}
+    for spec in cast("list[Any]", raw_specs):
+        if not isinstance(spec, dict):
+            continue
+        spec_dict = cast("dict[str, Any]", spec)
+        clone_nodeid = spec_dict.get("clone_nodeid")
+        base_nodeid = spec_dict.get("base_nodeid")
+        if not isinstance(clone_nodeid, str) or not isinstance(base_nodeid, str):
+            continue
+        if not clone_nodeid or not base_nodeid:
+            continue
+        raw_threshold = spec_dict.get("threshold", 0.0)
+        try:
+            threshold = (
+                float(raw_threshold)
+                if isinstance(
+                    raw_threshold,
+                    int | float,
+                )
+                else 0.0
+            )
+        except (TypeError, ValueError):
+            threshold = 0.0
+        if not math.isfinite(threshold):
+            threshold = 0.0
+        out[clone_nodeid] = TrialSpec(
+            base_nodeid=base_nodeid,
+            threshold=threshold,
+        )
+    return out
+
+
 def finalize_worker(*, config: pytest.Config, session: RampartSession) -> None:
     """Serialize the worker's session state into ``config.workeroutput``.
 
@@ -852,6 +917,35 @@ def finalize_worker(*, config: pytest.Config, session: RampartSession) -> None:
         raise SizeLimitError(msg)
     logger.debug("Worker payload size: %d bytes", size)
     workeroutput[WORKEROUTPUT_KEY] = payload
+
+
+def _safe_deserialize_trial_specs(
+    *,
+    payload: object,
+    worker_id_str: str,
+) -> dict[str, TrialSpec]:
+    """Deserialize trial specs from a worker payload without raising.
+
+    Trial specs are optional metadata: a corrupt or absent block must
+    never block result merging. Errors are logged at warning level and
+    return an empty dict.
+
+    Args:
+        payload (object): The deserialized worker payload.
+        worker_id_str (str): Worker identifier for logging.
+
+    Returns:
+        dict[str, TrialSpec]: Specs keyed by clone nodeid (possibly empty).
+    """
+    try:
+        return deserialize_trial_specs(data=payload)
+    except WorkerOutputError as exc:
+        logger.warning(
+            "Failed to deserialize trial specs from worker %s: %s",
+            worker_id_str,
+            exc,
+        )
+        return {}
 
 
 def handle_testnodedown(
@@ -922,6 +1016,10 @@ def handle_testnodedown(
             reason=f"worker {worker_id_str} deserialization failed: {exc}",
         )
         return
+    trial_specs = _safe_deserialize_trial_specs(
+        payload=cast("object", payload),
+        worker_id_str=worker_id_str,
+    )
     incoming_version: str | None = None
     if typed_payload_dict is not None:
         raw_version = typed_payload_dict.get("package_version")
@@ -936,6 +1034,8 @@ def handle_testnodedown(
             _package_version(),
         )
     session.merge_worker_results(results_by_nodeid=results_by_nodeid)
+    if trial_specs:
+        session.merge_trial_specs(trial_specs=trial_specs)
     logger.info(
         "Merged %d result group(s) from worker %s.",
         len(results_by_nodeid),

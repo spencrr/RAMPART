@@ -31,7 +31,7 @@ from rampart.core.types import (
     ToolCall,
     Turn,
 )
-from rampart.pytest_plugin._session import RampartSession
+from rampart.pytest_plugin._session import RampartSession, TrialSpec
 from rampart.pytest_plugin._xdist import (
     DEFAULT_SIZE_LIMIT_BYTES,
     MAX_METADATA_DEPTH,
@@ -43,6 +43,7 @@ from rampart.pytest_plugin._xdist import (
     WorkerOutputError,
     _sanitize,
     _strip_ansi,
+    deserialize_trial_specs,
     deserialize_worker_data,
     discover_sinks_from_conftest,
     finalize_worker,
@@ -673,6 +674,115 @@ class TestHandleTestnodedown:
         assert session.is_incomplete is False
         assert len(session._results) == 1
         assert session._results[0].summary == "from-worker"
+
+    def test_merges_trial_specs_on_success(self) -> None:
+        session = RampartSession()
+        worker_session = RampartSession()
+        worker_session.register_trial_spec(
+            clone_nodeid="test.py::test_x[trial-0]",
+            base_nodeid="test.py::test_x",
+            threshold=0.8,
+        )
+        worker_session.register_trial_spec(
+            clone_nodeid="test.py::test_x[trial-1]",
+            base_nodeid="test.py::test_x",
+            threshold=0.8,
+        )
+        payload = serialize_worker_data(session=worker_session)
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        handle_testnodedown(session=session, node=node, error=None)
+        assert session.is_incomplete is False
+        assert set(session.trial_specs) == {
+            "test.py::test_x[trial-0]",
+            "test.py::test_x[trial-1]",
+        }
+        assert (
+            session.trial_specs["test.py::test_x[trial-0]"].base_nodeid
+            == "test.py::test_x"
+        )
+        assert session.trial_specs["test.py::test_x[trial-0]"].threshold == 0.8
+
+
+class TestTrialSpecs:
+    def test_serialize_round_trip(self) -> None:
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="t.py::a[trial-0]",
+            base_nodeid="t.py::a",
+            threshold=0.75,
+        )
+        session.register_trial_spec(
+            clone_nodeid="t.py::a[trial-1]",
+            base_nodeid="t.py::a",
+            threshold=0.75,
+        )
+        payload = serialize_worker_data(session=session)
+
+        # Payload must survive a JSON round-trip (xdist transports JSON).
+        decoded = json.loads(json.dumps(payload))
+        specs = deserialize_trial_specs(data=decoded)
+
+        assert specs == {
+            "t.py::a[trial-0]": TrialSpec(base_nodeid="t.py::a", threshold=0.75),
+            "t.py::a[trial-1]": TrialSpec(base_nodeid="t.py::a", threshold=0.75),
+        }
+
+    def test_payload_without_trials_returns_empty_dict(self) -> None:
+        session = RampartSession()
+        payload = serialize_worker_data(session=session)
+        assert deserialize_trial_specs(data=payload) == {}
+
+    def test_skips_malformed_entries(self) -> None:
+        data: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "results_by_nodeid": {},
+            "trial_specs": [
+                {"clone_nodeid": "ok", "base_nodeid": "b", "threshold": 0.5},
+                "not-a-dict",
+                {"clone_nodeid": "", "base_nodeid": "b", "threshold": 0.5},
+                {"clone_nodeid": "x", "base_nodeid": 123, "threshold": 0.5},
+                {"clone_nodeid": "y", "base_nodeid": "b"},
+            ],
+        }
+        specs = deserialize_trial_specs(data=data)
+        assert set(specs) == {"ok", "y"}
+        assert specs["y"].threshold == 0.0
+
+    def test_clamps_non_finite_threshold(self) -> None:
+        data: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "results_by_nodeid": {},
+            "trial_specs": [
+                {"clone_nodeid": "a", "base_nodeid": "b", "threshold": float("inf")},
+                {"clone_nodeid": "c", "base_nodeid": "d", "threshold": float("nan")},
+            ],
+        }
+        specs = deserialize_trial_specs(data=data)
+        assert specs["a"].threshold == 0.0
+        assert specs["c"].threshold == 0.0
+
+    def test_merge_is_idempotent(self) -> None:
+        session = RampartSession()
+        spec = TrialSpec(base_nodeid="b", threshold=0.5)
+        session.merge_trial_specs(trial_specs={"k": spec})
+        session.merge_trial_specs(trial_specs={"k": spec})
+        assert session.trial_specs == {"k": spec}
+
+    def test_merge_first_writer_wins(self) -> None:
+        session = RampartSession()
+        original = TrialSpec(base_nodeid="b1", threshold=0.5)
+        replacement = TrialSpec(base_nodeid="b2", threshold=0.9)
+        session.merge_trial_specs(trial_specs={"k": original})
+        session.merge_trial_specs(trial_specs={"k": replacement})
+        # Defensive: the first registered spec wins so a worker can't
+        # silently override what the controller already saw at collection.
+        assert session.trial_specs["k"] == original
+
+    def test_invalid_payload_raises(self) -> None:
+        with pytest.raises(WorkerOutputError):
+            deserialize_trial_specs(data="not a dict")
 
 
 class TestFinalizeWorker:

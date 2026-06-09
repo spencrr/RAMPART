@@ -25,13 +25,31 @@ from rampart.core.result import Result, SafetyStatus
 from rampart.reporting.sink import ReportSink, TestRunReport
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     import pytest
 
     from rampart.pytest_plugin._collection import ResultCollector
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TrialSpec:
+    """Trial-clone metadata captured at collection time.
+
+    Carries the data needed to aggregate a trial group without
+    depending on ``pytest.Item`` attributes — so aggregation works
+    on the xdist controller, where the cloned items themselves
+    may not be reachable at session finish.
+
+    Attributes:
+        base_nodeid (str): The original test's pytest node ID.
+        threshold (float): Minimum pass rate required for the group.
+    """
+
+    base_nodeid: str
+    threshold: float
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -87,6 +105,7 @@ class RampartSession:
         self._results: list[Result] = []
         self._results_by_nodeid: dict[str, list[Result]] = {}
         self._trial_groups: dict[str, TrialGroupResult] = {}
+        self._trial_specs: dict[str, TrialSpec] = {}
         self._sinks: list[ReportSink] = sinks or []
         self._duration_seconds: float = 0.0
         self._cached_report: TestRunReport | None = None
@@ -190,7 +209,7 @@ class RampartSession:
         self,
         *,
         base_nodeid: str,
-        trial_items: Sequence[pytest.Item],
+        clone_nodeids: Sequence[str],
         threshold: float,
     ) -> None:
         """Record aggregate statistics for a trial group.
@@ -200,26 +219,27 @@ class RampartSession:
         - threshold is the minimum pass rate (SAFE / total).
           e.g. 0.8 means at least 80% of runs must be SAFE.
         - ERROR results count against the pass rate (they're not SAFE).
-        - Items with zero results (skipped or crashed before producing
+        - Clones with zero results (skipped or crashed before producing
           a Result) are tracked as ``no_result`` and count against
           the pass rate.
 
         Args:
             base_nodeid (str): The original test's node ID.
-            trial_items (Sequence[pytest.Item]): All trial clone items.
+            clone_nodeids (Sequence[str]): Pytest node IDs of all clones
+                in this trial group.
             threshold (float): Minimum pass rate required.
         """
-        if not trial_items:
+        if not clone_nodeids:
             return
 
-        total = len(trial_items)
+        total = len(clone_nodeids)
         unsafe_count = 0
         error_count = 0
         safe_count = 0
         no_result_count = 0
 
-        for item in trial_items:
-            node_results = self._results_by_nodeid.get(item.nodeid, [])
+        for nodeid in clone_nodeids:
+            node_results = self._results_by_nodeid.get(nodeid, [])
             if not node_results:
                 no_result_count += 1
                 continue
@@ -247,6 +267,54 @@ class RampartSession:
             passed=passed,
         )
 
+    def register_trial_spec(
+        self,
+        *,
+        clone_nodeid: str,
+        base_nodeid: str,
+        threshold: float,
+    ) -> None:
+        """Record trial metadata for a cloned item at collection time.
+
+        Called from ``pytest_collection_modifyitems`` whenever a
+        ``@pytest.mark.trial`` test is expanded into clones. Stores
+        the data needed for session-end aggregation in a form that
+        survives the xdist worker→controller boundary.
+
+        Identical re-registration (same key, same spec) is a no-op so
+        that repeated collection passes (e.g., in workers and the
+        controller) converge safely.
+
+        Args:
+            clone_nodeid (str): Node ID of the cloned item.
+            base_nodeid (str): Node ID of the original (uncloned) item.
+            threshold (float): Pass-rate threshold from the trial marker.
+        """
+        self._trial_specs[clone_nodeid] = TrialSpec(
+            base_nodeid=base_nodeid,
+            threshold=threshold,
+        )
+
+    def merge_trial_specs(
+        self,
+        *,
+        trial_specs: Mapping[str, TrialSpec],
+    ) -> None:
+        """Merge trial specs received from an xdist worker payload.
+
+        Idempotent: re-merging identical specs is a no-op. Spec values
+        from workers should match the controller's own collection
+        because the same plugin code runs in every process; we merge
+        defensively so the controller can aggregate correctly even
+        when its own collection state is unavailable.
+
+        Args:
+            trial_specs (Mapping[str, TrialSpec]): Specs keyed by
+                clone node ID.
+        """
+        for clone_nodeid, spec in trial_specs.items():
+            self._trial_specs.setdefault(clone_nodeid, spec)
+
     @property
     def has_results(self) -> bool:
         """True if any results have been collected."""
@@ -256,6 +324,11 @@ class RampartSession:
     def trial_groups(self) -> dict[str, TrialGroupResult]:
         """Trial group aggregates, keyed by base node ID."""
         return dict(self._trial_groups)
+
+    @property
+    def trial_specs(self) -> dict[str, TrialSpec]:
+        """Read-only view of registered trial specs, keyed by clone node ID."""
+        return dict(self._trial_specs)
 
     def merge_worker_results(
         self,

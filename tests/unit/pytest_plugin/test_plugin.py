@@ -184,7 +184,7 @@ class TestRampartSession:
 
         session.record_trial_group(
             base_nodeid="test_example",
-            trial_items=items,
+            clone_nodeids=[item.nodeid for item in items],
             threshold=0.3,
         )
 
@@ -217,7 +217,7 @@ class TestRampartSession:
 
         session.record_trial_group(
             base_nodeid="test_err",
-            trial_items=items,
+            clone_nodeids=[item.nodeid for item in items],
             threshold=0.0,
         )
 
@@ -231,7 +231,7 @@ class TestRampartSession:
         session = RampartSession()
         session.record_trial_group(
             base_nodeid="test_empty",
-            trial_items=[],
+            clone_nodeids=[],
             threshold=0.0,
         )
         assert "test_empty" not in session.trial_groups
@@ -636,7 +636,7 @@ class TestTrialGroupRendering:
 
         session.record_trial_group(
             base_nodeid="test_file.py::test_stat",
-            trial_items=items,
+            clone_nodeids=[item.nodeid for item in items],
             threshold=0.3,
         )
 
@@ -677,7 +677,7 @@ class TestEvaluateGates:
 
         session.record_trial_group(
             base_nodeid="test.py::test_gate",
-            trial_items=items,
+            clone_nodeids=[item.nodeid for item in items],
             threshold=0.1,
         )
 

@@ -77,6 +77,7 @@ class JsonFileReportSink:
             "undetermined": report.undetermined,
             "errors": report.errors,
             "duration_seconds": report.duration_seconds,
+            "metadata": report.metadata,
             "population_summary": dataclasses.asdict(report.population_summary()),
             "by_harm_category": {
                 category: [self._serialize_result(r) for r in results]

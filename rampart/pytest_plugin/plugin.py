@@ -142,6 +142,24 @@ def _resolve_trial_n(marker: pytest.Mark) -> int:
     return raw
 
 
+def _resolve_trial_threshold(marker: pytest.Mark) -> float:
+    """Extract the threshold from a trial marker.
+
+    Returns 0.0 when no threshold is provided (the historical default).
+
+    Args:
+        marker (pytest.Mark): The trial marker.
+
+    Returns:
+        float: The pass-rate threshold in [0.0, 1.0].
+    """
+    raw: Any = marker.kwargs.get("threshold", 0.0)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Register RAMPART CLI and ini options.
 
@@ -308,6 +326,7 @@ def pytest_collection_modifyitems(
     """
     expanded: list[pytest.Item] = []
     saw_trial = False
+    rampart_session = config.stash.get(_rampart_key, None)
     for item in items:
         trial_marker = item.get_closest_marker("trial")
         if trial_marker is None:
@@ -316,10 +335,23 @@ def pytest_collection_modifyitems(
 
         saw_trial = True
         n = _resolve_trial_n(trial_marker)
-
-        expanded.extend(
-            _create_trial_clones(item=item, trial_marker=trial_marker, count=n),
+        threshold = _resolve_trial_threshold(trial_marker)
+        clones = _create_trial_clones(
+            item=item,
+            trial_marker=trial_marker,
+            count=n,
         )
+
+        if rampart_session is not None:
+            base_nodeid = item.nodeid
+            for clone in clones:
+                rampart_session.register_trial_spec(
+                    clone_nodeid=clone.nodeid,
+                    base_nodeid=base_nodeid,
+                    threshold=threshold,
+                )
+
+        expanded.extend(clones)
 
     items[:] = expanded
 
@@ -466,30 +498,33 @@ def _rampart_sink_bootstrap(  # pyright: ignore[reportUnusedFunction]  # pytest 
 
 def _aggregate_trial_results(
     *,
-    session: pytest.Session,
+    session: pytest.Session,  # noqa: ARG001  — kept for hook signature symmetry
     rampart_session: RampartSession,
 ) -> None:
-    """Group trial item reports by base node ID and compute per-group rates.
+    """Group trial specs by base node ID and compute per-group rates.
 
-    A trial group is identified by ``_rampart_trial_base`` on the item.
-    The aggregate is stored on RampartSession for terminal summary output.
+    Trial specs are recorded during ``pytest_collection_modifyitems``
+    on every process and shipped through the xdist worker payload so
+    aggregation does not depend on ``session.items`` — which is not
+    reliably populated with trial clones on the xdist controller at
+    session-finish time.
 
     Args:
-        session (pytest.Session): The pytest session.
+        session (pytest.Session): The pytest session (unused).
         rampart_session (RampartSession): The RAMPART session state.
     """
-    groups: dict[str, list[pytest.Item]] = {}
-    for item in session.items:
-        base: str | None = getattr(item, "_rampart_trial_base", None)
-        if base is not None:
-            groups.setdefault(base, []).append(item)
+    groups: dict[str, list[tuple[str, float]]] = {}
+    for clone_nodeid, spec in rampart_session.trial_specs.items():
+        groups.setdefault(spec.base_nodeid, []).append(
+            (clone_nodeid, spec.threshold),
+        )
 
-    for base_nodeid, trial_items in groups.items():
-        marker = trial_items[0].get_closest_marker("trial")
-        threshold = marker.kwargs.get("threshold", 0.0) if marker else 0.0
+    for base_nodeid, clones in groups.items():
+        # All clones of the same base share the same threshold; pick any.
+        threshold = clones[0][1]
         rampart_session.record_trial_group(
             base_nodeid=base_nodeid,
-            trial_items=trial_items,
+            clone_nodeids=[c[0] for c in clones],
             threshold=threshold,
         )
 
