@@ -5,12 +5,6 @@
 
 Accumulates Result objects, computes trial group aggregates, and
 builds the final TestRunReport.
-
-Note: The architecture places RampartSession in plugin.py. This
-implementation extracts it to a dedicated module for file size
-management and to share state with the xdist support module
-(``_xdist.py``). This is a documented deviation from the
-architecture.
 """
 
 from __future__ import annotations
@@ -32,6 +26,23 @@ if TYPE_CHECKING:
     from rampart.pytest_plugin._collection import ResultCollector
 
 logger = logging.getLogger(__name__)
+
+
+def _result_sort_key(result: Result) -> tuple[str, int, str]:
+    """Return a total-ordering key for a result.
+
+    Orders by full node ID, then the result's index within its test,
+    then the originating xdist worker. The worker tie-breaker keeps the
+    order total when the same node ID arrives from multiple workers
+    (e.g. ``--dist=each``); it is absent — and therefore constant —
+    outside xdist, so single-process ordering is unchanged.
+    """
+    metadata = result.metadata
+    nodeid = str(metadata.get("nodeid", metadata.get("test_name", "")))
+    raw_index = metadata.get("result_index", 0)
+    index = raw_index if isinstance(raw_index, int) else 0
+    source_worker = str(metadata.get("source_worker", ""))
+    return (nodeid, index, source_worker)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -136,6 +147,11 @@ class RampartSession:
         """True if any worker failed to deliver complete results."""
         return self._incomplete
 
+    @property
+    def incomplete_reasons(self) -> list[str]:
+        """The recorded reasons the run is incomplete (empty if complete)."""
+        return list(self._incomplete_reasons)
+
     def add_sinks(self, *, sinks: list[ReportSink]) -> None:
         """Register additional sinks for report emission.
 
@@ -174,9 +190,11 @@ class RampartSession:
     def absorb(self, *, node: pytest.Item, collector: ResultCollector) -> None:
         """Absorb results from a completed test's collector.
 
-        Tags each result with the short test name (extracted from
-        the node ID) and the harm category from ``@pytest.mark.harm``
-        so the terminal summary can group and display results.
+        Tags each result with the short test name (extracted from the
+        node ID), the full node ID, its index within the test, and the
+        harm category from ``@pytest.mark.harm``. The nodeid and index
+        give a total, deterministic ordering for the terminal summary and
+        report regardless of xdist worker completion order.
 
         Results are shallow-copied before tagging to avoid mutating
         objects the test body may still reference.
@@ -193,11 +211,16 @@ class RampartSession:
 
         collected = collector.results
         tagged: list[Result] = []
-        for original_result in collected:
+        for result_index, original_result in enumerate(collected):
             # Shallow copy is sufficient because we reconstruct all
             # mutable fields we modify (currently metadata and harm_category).
             result = copy.copy(original_result)
-            result.metadata = {**result.metadata, "test_name": test_name}
+            result.metadata = {
+                **result.metadata,
+                "test_name": test_name,
+                "nodeid": node.nodeid,
+                "result_index": result_index,
+            }
             if harm_category is not None and result.harm_category is None:
                 result.harm_category = harm_category
             tagged.append(result)
@@ -385,19 +408,18 @@ class RampartSession:
         cache is invalidated when new results are absorbed or merged
         or when metadata is updated.
 
-        Results are sorted by their pytest node ID (from
-        ``metadata['test_name']`` when available) for deterministic
-        ordering across xdist worker completion orders.
+        Results are sorted by ``(nodeid, result_index, source_worker)``
+        for a total, deterministic ordering across xdist worker
+        completion orders. ``nodeid`` falls back to ``test_name`` and
+        ``source_worker`` is absent (constant) outside xdist, so
+        single-process ordering is unaffected.
 
         Returns:
             TestRunReport: Aggregated test run results.
         """
         if self._cached_report is not None:
             return self._cached_report
-        sorted_results = sorted(
-            self._results,
-            key=lambda r: str(r.metadata.get("test_name", "")),
-        )
+        sorted_results = sorted(self._results, key=_result_sort_key)
         counts = Counter(r.status for r in sorted_results)
         metadata: dict[str, Any] = dict(self._report_metadata)
         if self._incomplete:

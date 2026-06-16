@@ -68,6 +68,9 @@ def rampart_sinks() -> list[ReportSink]:
 
 The JSON file contains aggregate statistics and per-result data that CI dashboards can consume.
 
+!!! tip "Running in parallel"
+    Under [`pytest-xdist`](xdist.md), prefer the `pytest_rampart_sinks` hook over the fixture — it is resolved on the controller, so it works the same in single-process and parallel CI runs. See [Registering Sinks](pytest-integration.md#pytest_rampart_sinks-hook).
+
 ---
 
 ## Pytest Options

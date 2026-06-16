@@ -123,6 +123,7 @@ def _make_config(
     is_worker: bool = False,
     numprocesses: int | None = None,
     dist: str = "no",
+    tx: list[str] | None = None,
     max_bytes: int | None = None,
 ) -> Any:
     config = MagicMock()
@@ -133,6 +134,7 @@ def _make_config(
     config.option = MagicMock()
     config.option.numprocesses = numprocesses
     config.option.dist = dist
+    config.option.tx = tx
 
     def _getoption(name: str, default: object = None) -> object:
         return max_bytes if name == SIZE_LIMIT_OPTION else default
@@ -166,8 +168,20 @@ class TestDetection:
         assert is_xdist_worker(config=config) is False
 
     def test_is_xdist_controller_true_with_numprocesses(self) -> None:
-        config = _make_config(numprocesses=2)
+        config = _make_config(numprocesses=2, dist="load")
         assert is_xdist_controller(config=config) is True
+
+    def test_is_xdist_controller_true_with_tx_without_numprocesses(self) -> None:
+        config = _make_config(dist="load", tx=["popen", "popen"])
+        assert is_xdist_controller(config=config) is True
+
+    def test_is_xdist_controller_false_when_dist_without_endpoints(self) -> None:
+        config = _make_config(dist="load")
+        assert is_xdist_controller(config=config) is False
+
+    def test_is_xdist_controller_false_with_zero_numprocesses(self) -> None:
+        config = _make_config(numprocesses=0, dist="no")
+        assert is_xdist_controller(config=config) is False
 
     def test_is_xdist_controller_false_when_no_numprocesses(self) -> None:
         config = _make_config(numprocesses=None)
@@ -247,6 +261,10 @@ class TestStripAnsi:
     def test_strips_multiple_sequences(self) -> None:
         text = "\x1b[1m\x1b[31mbold red\x1b[0m\x1b[0m"
         assert _strip_ansi(text=text) == "bold red"
+
+    def test_strips_osc_hyperlink_via_shared_sanitizer(self) -> None:
+        text = "\x1b]8;;http://example.com\x07link\x1b]8;;\x07"
+        assert _strip_ansi(text=text) == "link"
 
 
 class TestSerializationRoundTrip:
@@ -705,6 +723,69 @@ class TestHandleTestnodedown:
         assert session.trial_specs["test.py::test_x[trial-0]"].threshold == 0.8
 
 
+class TestOrderingDeterminism:
+    def _payload_node(
+        self,
+        *,
+        worker_id: str,
+        nodeid: str,
+        summary: str,
+    ) -> MagicMock:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={nodeid: [_make_result(summary=summary)]},
+        )
+        payload = serialize_worker_data(session=worker_session)
+        node = MagicMock()
+        node.gateway.id = worker_id
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        return node
+
+    def _merge_order(self, nodes: list[MagicMock]) -> list[str]:
+        session = RampartSession()
+        for node in nodes:
+            handle_testnodedown(session=session, node=node, error=None)
+        return [r.metadata["nodeid"] for r in session.build_report().results]
+
+    def test_report_order_independent_of_worker_completion_order(self) -> None:
+        node_a = self._payload_node(
+            worker_id="gw0",
+            nodeid="pkg/test_a.py::test_a",
+            summary="a",
+        )
+        node_z = self._payload_node(
+            worker_id="gw1",
+            nodeid="pkg/test_z.py::test_z",
+            summary="z",
+        )
+        forward = self._merge_order([node_a, node_z])
+        reverse = self._merge_order([node_z, node_a])
+        assert forward == reverse
+        assert forward == ["pkg/test_a.py::test_a", "pkg/test_z.py::test_z"]
+
+    def test_deserialize_sets_authoritative_nodeid_and_index(self) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={
+                "pkg::t": [_make_result(summary="a"), _make_result(summary="b")],
+            },
+        )
+        payload = serialize_worker_data(session=worker_session)
+        results = deserialize_worker_data(data=payload)["pkg::t"]
+        assert [r.metadata["nodeid"] for r in results] == ["pkg::t", "pkg::t"]
+        assert [r.metadata["result_index"] for r in results] == [0, 1]
+
+    def test_handle_testnodedown_tags_source_worker(self) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="x")]},
+        )
+        payload = serialize_worker_data(session=worker_session)
+        node = MagicMock()
+        node.gateway.id = "gw3"
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        session = RampartSession()
+        handle_testnodedown(session=session, node=node, error=None)
+        assert session._results[0].metadata["source_worker"] == "gw3"
+
+
 class TestTrialSpecs:
     def test_serialize_round_trip(self) -> None:
         session = RampartSession()
@@ -871,7 +952,27 @@ class TestSinkDiscovery:
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
         assert result == []
-        assert any("fixture dependencies" in r.getMessage() for r in caplog.records)
+        assert any("requires arguments" in r.getMessage() for r in caplog.records)
+
+    def test_warns_and_skips_fixture_form_pointing_to_hook(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        @pytest.fixture
+        def rampart_sinks() -> list[ReportSink]:
+            return []
+
+        plugin = MagicMock(
+            spec=["rampart_sinks", "__name__"],
+            rampart_sinks=rampart_sinks,
+            __name__="mod",
+        )
+        config = MagicMock()
+        config.pluginmanager.get_plugins.return_value = [plugin]
+        with caplog.at_level(logging.WARNING):
+            result = discover_sinks_from_conftest(config=config)
+        assert result == []
+        assert any("pytest_rampart_sinks" in r.getMessage() for r in caplog.records)
 
 
 class TestReportTestRunMetadata:

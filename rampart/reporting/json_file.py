@@ -8,9 +8,17 @@ configurable output directory. Ships with the framework as a
 built-in ``ReportSink`` for teams that want local file output
 without building a custom sink.
 
-Teams wire it up in their conftest:
+Teams wire it up in their conftest, either via the
+``pytest_rampart_sinks`` hook (recommended; works under ``pytest-xdist``)
+or the legacy ``rampart_sinks`` fixture:
 
 ```python
+# Recommended: hook, resolved on the xdist controller
+def pytest_rampart_sinks(config):
+    return [JsonFileReportSink(output_dir=Path(".report"))]
+
+
+# Legacy fixture (single-process fallback)
 @pytest.fixture(scope="session")
 def rampart_sinks():
     return [JsonFileReportSink(output_dir=Path(".report"))]
@@ -87,6 +95,12 @@ class JsonFileReportSink:
 
     def _serialize_result(self, result: Result) -> dict[str, Any]:
         """Convert a single Result to a JSON-serializable dict.
+
+        This is the flatter, public report projection. It is deliberately
+        separate from the full-fidelity xdist transport projection in
+        ``_xdist._serialize_result`` (different fields, sanitization, and
+        size handling); the two must not be naively merged into one
+        serializer.
 
         Args:
             result (Result): The result to serialize.

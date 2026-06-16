@@ -14,12 +14,6 @@ content (agent responses, payload text). Serialization is strictly
 JSON-safe primitives; deserialization validates schema version,
 enum values, and metadata depth; ANSI escapes are stripped from free
 text as defense-in-depth.
-
-Note: The architecture places all pytest plugin logic in plugin.py.
-This module extracts xdist-specific logic to keep plugin.py focused
-on hook registration and to isolate the serialization/security model.
-This is a documented deviation from the architecture, complementing
-the earlier extraction of RampartSession into _session.py.
 """
 
 from __future__ import annotations
@@ -27,10 +21,10 @@ from __future__ import annotations
 import json
 import logging
 import math
-import re
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
+from rampart.common.text import strip_ansi as _strip_ansi_impl
 from rampart.core.result import (
     HarmCategory,
     InjectionRecord,
@@ -65,7 +59,6 @@ SIZE_LIMIT_OPTION: str = "rampart_xdist_max_bytes"
 DEFAULT_SIZE_LIMIT_BYTES: int = 64 * 1024 * 1024
 MAX_METADATA_DEPTH: int = 6
 
-_ANSI_ESCAPE_RE: re.Pattern[str] = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _TRUNCATED_MARKER: str = "rampart_truncated"
 
 
@@ -99,8 +92,12 @@ def is_xdist_worker(*, config: pytest.Config) -> bool:
 def is_xdist_controller(*, config: pytest.Config) -> bool:
     """Return True when this process is the pytest-xdist controller.
 
-    The controller is defined as a process where xdist is active
-    (``--numprocesses`` is set) and which is NOT itself a worker.
+    The controller is the non-worker process that owns an active
+    distribution: a ``--dist`` mode other than ``"no"`` plus at least one
+    way of spawning execution endpoints (``--numprocesses`` workers or
+    explicit ``--tx`` gateways). Keying off distribution rather than the
+    worker count alone keeps ``-d``/``--tx`` runs (no ``-n``) on the
+    controller path while excluding a bare ``--dist`` with no endpoints.
 
     Args:
         config (pytest.Config): The pytest configuration object.
@@ -110,8 +107,11 @@ def is_xdist_controller(*, config: pytest.Config) -> bool:
     """
     if is_xdist_worker(config=config):
         return False
+    if get_dist_mode(config=config) == "no":
+        return False
     numprocesses = getattr(config.option, "numprocesses", None)
-    return numprocesses is not None and numprocesses != 0
+    tx = getattr(config.option, "tx", None)
+    return bool(numprocesses) or bool(tx)
 
 
 def get_dist_mode(*, config: pytest.Config) -> str:
@@ -176,15 +176,18 @@ def _size_limit(*, config: pytest.Config) -> int:
 
 
 def _strip_ansi(*, text: str) -> str:
-    """Remove ANSI escape sequences from free-form text.
+    """Remove ANSI escape sequences and control bytes from free-form text.
+
+    Delegates to :func:`rampart.common.text.strip_ansi` so the xdist
+    transport and the terminal summary share one hardened sanitizer.
 
     Args:
         text (str): The text to sanitize.
 
     Returns:
-        str: Text with ANSI escape sequences removed.
+        str: Text with escape sequences and control bytes removed.
     """
-    return _ANSI_ESCAPE_RE.sub("", text)
+    return _strip_ansi_impl(text)
 
 
 def _sanitize(  # noqa: PLR0911
@@ -410,7 +413,15 @@ def _serialize_injection_record(*, injection: InjectionRecord) -> dict[str, Any]
 
 
 def _serialize_result(*, result: Result, nodeid: str) -> dict[str, Any]:
-    """Serialize a Result to a JSON-safe dict."""
+    """Serialize a Result to a JSON-safe dict for the xdist transport.
+
+    This is the full-fidelity transport projection: it round-trips back
+    to a ``Result`` via :func:`_deserialize_result`, and intentionally
+    differs from the flatter public report shape produced by
+    ``JsonFileReportSink._serialize_result``. The two projections are
+    deliberately separate (different fields, sanitization, and size
+    handling) and must not be naively merged into one serializer.
+    """
     return {
         "safe": result.safe,
         "status": result.status.value,
@@ -794,6 +805,11 @@ def deserialize_worker_data(*, data: object) -> dict[str, list[Result]]:
     (or subclass). Caller should catch and mark the run incomplete
     rather than letting the exception propagate to pytest.
 
+    Each result's ``metadata["nodeid"]`` and ``metadata["result_index"]``
+    are set authoritatively from the outer mapping key and list position
+    so cross-worker ordering is total and independent of any (untrusted)
+    serialized values.
+
     Args:
         data (object): The deserialized JSON object from
             ``node.workeroutput``.
@@ -814,9 +830,14 @@ def deserialize_worker_data(*, data: object) -> dict[str, list[Result]]:
     for nodeid, results_data in cast("dict[Any, Any]", raw_results).items():
         if not isinstance(results_data, list):
             continue
-        out[str(nodeid)] = [
-            _deserialize_result(data=r) for r in cast("list[Any]", results_data)
-        ]
+        nodeid_str = str(nodeid)
+        deserialized: list[Result] = []
+        for index, raw_result in enumerate(cast("list[Any]", results_data)):
+            result = _deserialize_result(data=raw_result)
+            result.metadata["nodeid"] = nodeid_str
+            result.metadata["result_index"] = index
+            deserialized.append(result)
+        out[nodeid_str] = deserialized
     return out
 
 
@@ -948,6 +969,26 @@ def _safe_deserialize_trial_specs(
         return {}
 
 
+def _tag_source_worker(
+    *,
+    results_by_nodeid: dict[str, list[Result]],
+    worker_id_str: str,
+) -> None:
+    """Tag each merged result with the worker it came from.
+
+    Used as the final ordering tie-breaker so the same nodeid arriving
+    from multiple workers (e.g. ``--dist=each``) stays totally ordered.
+
+    Args:
+        results_by_nodeid (dict[str, list[Result]]): The deserialized
+            worker results to tag in place.
+        worker_id_str (str): The originating worker identifier.
+    """
+    for results in results_by_nodeid.values():
+        for result in results:
+            result.metadata["source_worker"] = worker_id_str
+
+
 def handle_testnodedown(
     *,
     session: RampartSession,
@@ -1033,6 +1074,10 @@ def handle_testnodedown(
             incoming_version,
             _package_version(),
         )
+    _tag_source_worker(
+        results_by_nodeid=results_by_nodeid,
+        worker_id_str=worker_id_str,
+    )
     session.merge_worker_results(results_by_nodeid=results_by_nodeid)
     if trial_specs:
         session.merge_trial_specs(trial_specs=trial_specs)
@@ -1057,8 +1102,9 @@ def discover_sinks_from_conftest(*, config: pytest.Config) -> list[ReportSink]:
     - Otherwise, log a warning and skip.
 
     Sinks that depend on other fixtures cannot be discovered this way.
-    Such configurations are a documented limitation; a hook-based API
-    is a planned follow-up.
+    Such configurations should register sinks via the
+    ``pytest_rampart_sinks`` hook, which is resolved identically on the
+    controller and in every worker.
 
     Args:
         config (pytest.Config): The pytest configuration object.
@@ -1095,15 +1141,17 @@ def _resolve_sink_candidate(
     candidate: object,
     plugin: object,
 ) -> list[object] | None:
-    """Resolve a ``rampart_sinks`` attribute into a list of sinks.
+    """Resolve a module-level ``rampart_sinks`` attribute into a list of sinks.
 
-    Handles three shapes:
+    Handles two shapes without touching pytest's private fixture API:
 
     - A list — used directly.
-    - A pytest fixture (``FixtureFunctionDefinition`` or equivalent) —
-      unwrapped to its underlying function via ``_get_wrapped_function``
-      or ``__wrapped__``; called only if it takes no parameters.
-    - A plain callable — called directly.
+    - A zero-argument plain function — called, and its list return used.
+
+    Any other shape — most importantly a ``@pytest.fixture``-wrapped
+    ``rampart_sinks``, which the controller cannot execute — is skipped
+    with a warning pointing at the ``pytest_rampart_sinks`` hook, which
+    works identically on the controller and in every worker.
 
     Returns None on failure (logged) so the caller can continue
     scanning other plugins.
@@ -1114,38 +1162,29 @@ def _resolve_sink_candidate(
     if isinstance(candidate, list):
         return cast("list[object]", candidate)
 
-    function: object = candidate
-    wrap_method = getattr(candidate, "_get_wrapped_function", None)
-    if callable(wrap_method):
-        function = wrap_method()
-    elif hasattr(candidate, "__wrapped__"):
-        function = getattr(candidate, "__wrapped__", candidate)
-
-    if not callable(function):
+    if not inspect.isfunction(candidate):
         logger.warning(
-            "rampart_sinks in %s is %s; expected callable or list[ReportSink].",
+            "rampart_sinks in %s is %s, which controller-side discovery "
+            "cannot resolve (fixtures do not run on the xdist controller). "
+            "Register sinks via the pytest_rampart_sinks hook instead.",
             plugin_name,
             type(candidate).__name__,
         )
         return None
 
-    try:
-        sig = inspect.signature(function)
-    except (TypeError, ValueError):
-        sig = None
-
-    if sig is not None and len(sig.parameters) > 0:
+    sig = inspect.signature(candidate)
+    if len(sig.parameters) > 0:
         logger.warning(
-            "rampart_sinks in %s requires fixture dependencies (%s); "
-            "controller-side discovery cannot satisfy those. Provide a "
-            "parameterless function or list, or run with --dist=no.",
+            "rampart_sinks in %s requires arguments (%s); controller-side "
+            "discovery cannot satisfy those. Use the pytest_rampart_sinks "
+            "hook, or provide a parameterless function or a list.",
             plugin_name,
             list(sig.parameters),
         )
         return None
 
     try:
-        value = function()
+        value = candidate()
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:  # noqa: BLE001 — broad on purpose: user code

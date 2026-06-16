@@ -11,10 +11,6 @@ Registered via the pytest11 entry point in pyproject.toml. Provides:
 - session-finish aggregation for trial groups
 - sink emission for structured reporting
 
-Note: The architecture places RampartSession in plugin.py. This
-implementation extracts it to _session.py for file size management.
-This is a documented deviation from the architecture.
-
 Note: The architecture defines _default_handler_factory as a plain
 module-level Callable in core/execution.py, written to directly by
 the plugin. This implementation uses register_default_handler_factory
@@ -26,17 +22,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from rampart.common.text import strip_ansi
 from rampart.core.execution import (
     clear_default_handler_factory,
     register_default_handler_factory,
 )
 from rampart.core.result import Result, SafetyStatus
+from rampart.pytest_plugin import _hooks
 from rampart.pytest_plugin._collection import (
     ResultCollectionHandler,
     ResultCollector,
@@ -66,6 +63,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "pytest_addhooks",
     "pytest_addoption",
     "pytest_collection_modifyitems",
     "pytest_configure",
@@ -80,7 +78,6 @@ _session_start_key = pytest.StashKey[float]()
 
 # Module-level constants are an acceptable exception in a hook-based
 # plugin module where there is no natural owning class.
-_ANSI_ESCAPE_RE: re.Pattern[str] = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 _STATUS_LABELS: dict[SafetyStatus, str] = {
     SafetyStatus.SAFE: "PASS",
@@ -91,18 +88,19 @@ _STATUS_LABELS: dict[SafetyStatus, str] = {
 
 
 def _sanitize_for_terminal(text: str) -> str:
-    """Strip ANSI escape sequences from text before terminal output.
+    """Strip escape sequences and control bytes before terminal output.
 
     Prevents terminal injection from attacker-controlled payload text
-    that may appear in result summaries.
+    that may appear in result summaries or incomplete-run reasons.
+    Delegates to :func:`rampart.common.text.strip_ansi`.
 
     Args:
         text (str): The raw text to sanitize.
 
     Returns:
-        str: Text with ANSI escape sequences removed.
+        str: Text with escape sequences and control bytes removed.
     """
-    return _ANSI_ESCAPE_RE.sub("", text)
+    return strip_ansi(text)
 
 
 def _resolve_trial_n(marker: pytest.Mark) -> int:
@@ -158,6 +156,16 @@ def _resolve_trial_threshold(marker: pytest.Mark) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return 0.0
+
+
+def pytest_addhooks(pluginmanager: pytest.PytestPluginManager) -> None:
+    """Register RAMPART's hook specifications.
+
+    Args:
+        pluginmanager (pytest.PytestPluginManager): The active plugin
+            manager.
+    """
+    pluginmanager.add_hookspecs(_hooks)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -343,6 +351,12 @@ def pytest_collection_modifyitems(
         )
 
         if rampart_session is not None:
+            # Registered on every process, including xdist workers whose
+            # specs the controller's merge later drops via setdefault. The
+            # redundancy is intentional: it keeps single-process and the
+            # controller's own collection pass correct without branching on
+            # worker vs controller. Do not "optimize" it away on workers —
+            # that breaks the single-process and fallback paths.
             base_nodeid = item.nodeid
             for clone in clones:
                 rampart_session.register_trial_spec(
@@ -434,6 +448,62 @@ def _rampart_collect(  # pyright: ignore[reportUnusedFunction]  # pytest discove
         )
 
 
+def _has_sink_hook_impl(*, config: pytest.Config) -> bool:
+    """Return True if any plugin implements ``pytest_rampart_sinks``.
+
+    Keyed on implementation existence, not on the sinks returned: a hook
+    implementation may legitimately contribute zero sinks, and that must
+    still suppress the legacy fixture fallback.
+
+    Args:
+        config (pytest.Config): The pytest configuration object.
+
+    Returns:
+        bool: True if at least one ``pytest_rampart_sinks`` impl exists.
+    """
+    hook = getattr(config.pluginmanager.hook, "pytest_rampart_sinks", None)
+    if hook is None:
+        return False
+    return bool(hook.get_hookimpls())
+
+
+def _resolve_hook_sinks(*, config: pytest.Config) -> list[ReportSink]:
+    """Collect and validate sinks from the ``pytest_rampart_sinks`` hook.
+
+    Returns the flattened union of every implementation's contribution.
+    Non-``ReportSink`` items (and non-list returns) are dropped with a
+    warning so one malformed implementation cannot break emission.
+
+    Args:
+        config (pytest.Config): The pytest configuration object.
+
+    Returns:
+        list[ReportSink]: The validated, flattened sinks (may be empty).
+    """
+    hook = getattr(config.pluginmanager.hook, "pytest_rampart_sinks", None)
+    if hook is None:
+        return []
+    impl_results = cast("list[object]", hook(config=config))
+    sinks: list[ReportSink] = []
+    for group in impl_results:
+        if not isinstance(group, list):
+            logger.warning(
+                "pytest_rampart_sinks implementation returned %s, "
+                "expected list[ReportSink]; ignoring.",
+                type(group).__name__,
+            )
+            continue
+        for sink in cast("list[object]", group):
+            if isinstance(sink, ReportSink):
+                sinks.append(sink)
+            else:
+                logger.warning(
+                    "pytest_rampart_sinks yielded a non-ReportSink: %r; ignoring.",
+                    sink,
+                )
+    return sinks
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _rampart_sink_bootstrap(  # pyright: ignore[reportUnusedFunction]  # pytest discovers this via autouse=True
     request: pytest.FixtureRequest,
@@ -453,13 +523,22 @@ def _rampart_sink_bootstrap(  # pyright: ignore[reportUnusedFunction]  # pytest 
         return [JsonFileReportSink(output_dir=Path(".report"))]
     ```
 
+    Precedence: when a ``pytest_rampart_sinks`` hook implementation
+    exists it is authoritative and this fixture-based path is skipped
+    entirely (hook sinks are registered at session finish), so a project
+    that defines both does not double-register.
+
     Under pytest-xdist, this fixture is a no-op on worker processes
     (workers skip sink emission entirely); sink discovery on the
-    controller is handled by ``_xdist.discover_sinks_from_conftest``.
+    controller is handled by the ``pytest_rampart_sinks`` hook or, as a
+    fallback, ``_xdist.discover_sinks_from_conftest``.
 
     No test author ever imports or references this fixture.
     """
     if is_xdist_worker(config=request.config):
+        return
+
+    if _has_sink_hook_impl(config=request.config):
         return
 
     rampart_session = request.config.stash.get(_rampart_key, None)
@@ -542,7 +621,7 @@ def _evaluate_gates(
     Args:
         rampart_session (RampartSession): The RAMPART session state.
     """
-    for base_nodeid, group in rampart_session.trial_groups.items():
+    for base_nodeid, group in sorted(rampart_session.trial_groups.items()):
         if group.passed:
             logger.info(
                 "Gate PASSED: %s — %d/%d safe (%.0f%% pass rate, threshold: %.0f%%)",
@@ -579,10 +658,12 @@ def pytest_sessionfinish(
     - xdist worker: serialize results to ``config.workeroutput`` and
       skip sink emission (the controller emits the unified report).
     - xdist controller: trials already aggregated against the merged
-      ``_results_by_nodeid``; discover sinks from conftest, evaluate
-      gates, and emit.
+      ``_results_by_nodeid``; resolve sinks via the
+      ``pytest_rampart_sinks`` hook (falling back to conftest discovery),
+      evaluate gates, and emit.
     - non-xdist: original single-process pipeline (aggregate, gate,
-      emit) unchanged.
+      emit); hook sinks are added here when the fixture path was
+      suppressed.
 
     Args:
         session (pytest.Session): The pytest session.
@@ -607,7 +688,10 @@ def pytest_sessionfinish(
         _aggregate_trial_results(session=session, rampart_session=rampart_session)
         _evaluate_gates(rampart_session=rampart_session)
         _record_xdist_metadata(session=session, rampart_session=rampart_session)
-        controller_sinks = discover_sinks_from_conftest(config=session.config)
+        if _has_sink_hook_impl(config=session.config):
+            controller_sinks = _resolve_hook_sinks(config=session.config)
+        else:
+            controller_sinks = discover_sinks_from_conftest(config=session.config)
         if controller_sinks:
             rampart_session.add_sinks(sinks=controller_sinks)
         _emit_sinks(rampart_session=rampart_session)
@@ -615,6 +699,8 @@ def pytest_sessionfinish(
 
     _aggregate_trial_results(session=session, rampart_session=rampart_session)
     _evaluate_gates(rampart_session=rampart_session)
+    if _has_sink_hook_impl(config=session.config):
+        rampart_session.add_sinks(sinks=_resolve_hook_sinks(config=session.config))
     _emit_sinks(rampart_session=rampart_session)
 
 
@@ -759,13 +845,36 @@ def _write_trial_group_lines(
         terminalreporter: The pytest terminal reporter.
         rampart_session (RampartSession): The RAMPART session state.
     """
-    for base_nodeid, group in rampart_session.trial_groups.items():
+    for base_nodeid, group in sorted(rampart_session.trial_groups.items()):
         test_name = base_nodeid.split("::")[-1] if "::" in base_nodeid else base_nodeid
         terminalreporter.write_line(
             f"  {group.terminal_label}  {test_name} "
             f"[{group.detail}, {group.pass_rate:.0%} pass rate, "
             f"threshold: {group.threshold:.0%}] -- {group.verdict}",
         )
+
+
+def _write_incomplete_warning(
+    *,
+    terminalreporter: TerminalReporter,
+    rampart_session: RampartSession,
+) -> None:
+    """Write a prominent warning when the RAMPART run is incomplete.
+
+    Incomplete runs (e.g. a crashed or lost xdist worker) can still exit
+    zero with every surviving test passing, so the reasons are surfaced
+    here regardless of whether any results were collected.
+
+    Args:
+        terminalreporter: The pytest terminal reporter.
+        rampart_session (RampartSession): The RAMPART session state.
+    """
+    terminalreporter.write_sep("=", "RAMPART: INCOMPLETE RUN", red=True, bold=True)
+    terminalreporter.write_line(
+        "Results may be partial; the report does not reflect every test.",
+    )
+    for reason in rampart_session.incomplete_reasons:
+        terminalreporter.write_line(f"  - {_sanitize_for_terminal(reason)}")
 
 
 def pytest_terminal_summary(
@@ -775,9 +884,10 @@ def pytest_terminal_summary(
 ) -> None:
     """Append RAMPART harm-category summary after pytest's standard output.
 
-    Fires after all tests complete. Writes harm-grouped result lines,
-    trial group aggregates, and population statistics. No-op if no
-    RAMPART results were collected.
+    Fires after all tests complete. Emits an incomplete-run warning first
+    (even when no results were collected, since a lost worker can leave
+    the run incomplete with zero results), then writes harm-grouped
+    result lines, trial group aggregates, and population statistics.
 
     Args:
         terminalreporter: The pytest terminal reporter.
@@ -787,6 +897,13 @@ def pytest_terminal_summary(
     rampart_session = config.stash.get(_rampart_key, None)
     if rampart_session is None:
         return
+
+    if rampart_session.is_incomplete:
+        _write_incomplete_warning(
+            terminalreporter=terminalreporter,
+            rampart_session=rampart_session,
+        )
+
     if not rampart_session.has_results:
         return
 

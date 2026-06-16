@@ -74,36 +74,76 @@ pytest -n 4 --dist=loadgroup
 
 ---
 
-## Constraints on `rampart_sinks`
+## Registering Sinks: the `pytest_rampart_sinks` hook
 
-When running under xdist, the controller process does not execute test fixtures. To discover your sinks, RAMPART scans registered conftest modules for a `rampart_sinks` attribute and calls it directly.
+The **recommended** way to register report sinks is the `pytest_rampart_sinks`
+hook. It is resolved on the controller — which never executes fixtures — so it
+behaves identically in single-process and xdist runs, and (unlike the fixture
+path) supports sinks that need configuration.
 
-**Supported shapes:**
+Implement it in your `conftest.py`:
 
 ```python
-# Parameterless fixture — works on both single-process and xdist
+# conftest.py
+from pathlib import Path
+
+from rampart.reporting import JsonFileReportSink
+
+
+def pytest_rampart_sinks(config):
+    return [JsonFileReportSink(output_dir=Path(".report"))]
+```
+
+- Multiple implementations are supported; RAMPART emits to the **union** of every
+  returned sink.
+- An implementation may return an empty list to contribute none.
+- Non-`ReportSink` items (or a non-list return) are dropped with a warning, so one
+  malformed implementation cannot break emission.
+
+### Precedence vs the `rampart_sinks` fixture
+
+The legacy `rampart_sinks` fixture is still supported as a **single-process
+fallback**. The rule is:
+
+- If **any** `pytest_rampart_sinks` hook implementation exists, the hook is
+  authoritative and the fixture path is skipped entirely (so a project that
+  defines both does **not** double-register).
+- If **no** hook implementation exists, RAMPART falls back to the fixture. On the
+  xdist controller this fallback scans registered conftest modules for a
+  `rampart_sinks` attribute.
+
+### Fixture fallback constraints (no hook present)
+
+When you rely on the fixture fallback under xdist, the controller cannot execute
+fixtures, so only these shapes resolve:
+
+```python
+# Parameterless session fixture — resolves single-process AND on the
+# xdist controller.
 @pytest.fixture(scope="session")
 def rampart_sinks():
     return [JsonFileReportSink(output_dir=Path(".report"))]
 
-# Plain list assigned at module level — works on both
+# Plain list assigned at module level — resolved on the xdist controller
+# only. Single-process discovery looks up a *fixture* named rampart_sinks,
+# so a bare module-level list is silently ignored there; use the fixture
+# form above (or the hook) for single-process runs.
 rampart_sinks = [JsonFileReportSink(output_dir=Path(".report"))]
 ```
 
-**Not supported under xdist** (the warning is logged and the sink is skipped):
+A **fixture with dependencies** cannot be resolved on the controller and is
+skipped with a warning:
 
 ```python
-# Fixture with dependencies — cannot be resolved on the controller
+# Not resolvable on the controller — use the hook instead
 @pytest.fixture(scope="session")
 def rampart_sinks(my_sink_config, db_connection):
     return [DatabaseSink(connection=db_connection)]
 ```
 
-If your sinks need dependencies, consider:
-
-- Constructing them at module level with explicit configuration
-- Reading configuration from environment variables inside a parameterless function
-- Running without xdist (`pytest` instead of `pytest -n 4`) until a hook-based registration API is added
+If your sinks need dependencies, **use the `pytest_rampart_sinks` hook** — it
+receives the `pytest.Config` and runs on the controller, so you can build sinks
+from `config` values or environment variables there.
 
 ---
 
@@ -161,10 +201,38 @@ report.metadata["dist_mode"]      # "load", "loadgroup", etc.
 
 ---
 
+## Durability limitations
+
+The current worker→controller transport flushes a worker's results only at its
+clean `pytest_sessionfinish`. This has two consequences you should be aware of:
+
+- **A worker killed mid-run loses its already-finished results.** Because results
+  are shipped in a single batch at session end, a worker that crashes, is killed
+  (e.g. OOM, timeout, `-x` shutdown), or otherwise never reaches
+  `pytest_sessionfinish` contributes **nothing** — even tests it had already
+  completed. The run is marked incomplete (see [Incomplete Runs](#incomplete-runs)).
+- **The size cap drops the whole worker payload, not just the oversized record.**
+  When a worker's aggregate serialized payload exceeds
+  `--rampart-xdist-max-bytes`, the **entire** worker payload is dropped (and the
+  worker marked incomplete), rather than only the single oversized transcript.
+
+Both behaviors are deliberate fail-closed choices for this release. A durable
+per-worker transport (incremental JSONL shards that survive a killed worker, with
+the size cap applied per-record) is in progress as a follow-up change; until it
+lands, prefer `--dist=loadgroup` for trial locality and size your cap to your
+largest expected worker payload.
+
+---
+
 ## Limitations
 
-- Sinks discovered on the controller cannot depend on other pytest fixtures (see Constraints above).
-- Mixed RAMPART versions across controller and workers are unsupported; install the same version everywhere.
-- `pytest-xdist` itself does not support interactive debugging (`--pdb`, `--trace`); use single-process mode for debugging.
-
-A hook-based sink registration API for complex sink configurations is a planned follow-up.
+- Sinks discovered through the **fixture fallback** on the controller cannot depend
+  on other pytest fixtures — use the `pytest_rampart_sinks` hook instead (see
+  [Registering Sinks](#registering-sinks-the-pytest_rampart_sinks-hook)).
+- Results from a worker that dies before `pytest_sessionfinish` are lost, and an
+  over-cap worker payload is dropped wholesale (see
+  [Durability limitations](#durability-limitations)).
+- Mixed RAMPART versions across controller and workers are unsupported; install the
+  same version everywhere.
+- `pytest-xdist` itself does not support interactive debugging (`--pdb`, `--trace`);
+  use single-process mode for debugging.
