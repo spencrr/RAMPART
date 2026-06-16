@@ -7,12 +7,12 @@ RAMPART enforces a consistent code style through automated tooling and documente
 | Tool | Purpose | Config location |
 |------|---------|-----------------|
 | [Ruff](https://docs.astral.sh/ruff/) | Linting and formatting | `pyproject.toml` `[tool.ruff.*]` |
-| [Pyright](https://github.com/microsoft/pyright) | Static type checking (strict mode) | `pyproject.toml` `[tool.pyright]` |
+| [ty](https://github.com/astral-sh/ty) | Static type checking | `pyproject.toml` `[tool.ty]` |
 | [pre-commit](https://pre-commit.com/) | Git hooks for automated checks | `.pre-commit-config.yaml` |
 
 ### Running Checks
 
-Pre-commit is the primary entry point — it runs Ruff (lint + format) and Pyright in one command:
+Pre-commit is the primary entry point — it runs Ruff (lint + format) and ty in one command:
 
 ```bash
 # Install the Git hook once (optional, runs on every commit)

@@ -196,7 +196,7 @@ class TestRampartSession:
         assert group.unsafe == 2
         assert group.errors == 1
         assert group.threshold == 0.3
-        assert group.pass_rate == pytest.approx(0.4)  # pyright: ignore[reportUnknownMemberType]
+        assert group.pass_rate == pytest.approx(0.4)
         assert not group.passed  # UNSAFE present → always fails
 
     def test_record_trial_group_all_errors(self) -> None:
@@ -570,7 +570,7 @@ class TestRampartSessionAddSinks:
             pass
 
         with pytest.raises(TypeError, match="Expected ReportSink"):
-            session.add_sinks(sinks=[NotASink()])  # pyright: ignore[reportArgumentType]
+            session.add_sinks(sinks=[NotASink()])
 
     def test_add_sinks_preserves_existing(self) -> None:
         """Config-loaded sinks are not lost when fixture sinks are added."""
