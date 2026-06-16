@@ -954,12 +954,29 @@ class TestSinkDiscovery:
         assert result == []
         assert any("requires arguments" in r.getMessage() for r in caplog.records)
 
-    def test_warns_and_skips_fixture_form_pointing_to_hook(
+    def test_resolves_parameterless_fixture_form(self) -> None:
+        sink = MagicMock(spec=ReportSink)
+
+        @pytest.fixture
+        def rampart_sinks() -> list[ReportSink]:
+            return [sink]
+
+        plugin = MagicMock(
+            spec=["rampart_sinks", "__name__"],
+            rampart_sinks=rampart_sinks,
+            __name__="mod",
+        )
+        config = MagicMock()
+        config.pluginmanager.get_plugins.return_value = [plugin]
+        result = discover_sinks_from_conftest(config=config)
+        assert sink in result
+
+    def test_warns_and_skips_fixture_with_dependencies(
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         @pytest.fixture
-        def rampart_sinks() -> list[ReportSink]:
+        def rampart_sinks(tmp_path: object) -> list[ReportSink]:
             return []
 
         plugin = MagicMock(
@@ -972,6 +989,7 @@ class TestSinkDiscovery:
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
         assert result == []
+        assert any("requires arguments" in r.getMessage() for r in caplog.records)
         assert any("pytest_rampart_sinks" in r.getMessage() for r in caplog.records)
 
 

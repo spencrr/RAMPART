@@ -47,6 +47,8 @@ from rampart.pytest_plugin._session import TrialSpec
 from rampart.reporting.sink import ReportSink
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import pytest
 
     from rampart.pytest_plugin._session import RampartSession
@@ -1136,6 +1138,32 @@ def discover_sinks_from_conftest(*, config: pytest.Config) -> list[ReportSink]:
     return discovered
 
 
+def _unwrap_fixture_function(candidate: object) -> Callable[..., object] | None:
+    """Return the underlying function of a ``@pytest.fixture``-wrapped object.
+
+    pytest >= 8.4 wraps fixtures in a ``FixtureFunctionDefinition`` whose
+    ``inspect.isfunction`` is False; the real function is reachable via
+    ``_get_wrapped_function()`` (with ``_fixture_function`` / ``__wrapped__``
+    as fallbacks). Returns the recovered function, or None when
+    ``candidate`` is not a fixture wrapper we can unwrap.
+    """
+    import inspect  # noqa: PLC0415
+
+    getter = getattr(candidate, "_get_wrapped_function", None)
+    if callable(getter):
+        try:
+            wrapped = getter()
+        except Exception:  # noqa: BLE001 — defensive across pytest versions
+            wrapped = None
+        if inspect.isfunction(wrapped):
+            return wrapped
+    for attr in ("_fixture_function", "__wrapped__"):
+        wrapped = getattr(candidate, attr, None)
+        if inspect.isfunction(wrapped):
+            return wrapped
+    return None
+
+
 def _resolve_sink_candidate(
     *,
     candidate: object,
@@ -1143,15 +1171,19 @@ def _resolve_sink_candidate(
 ) -> list[object] | None:
     """Resolve a module-level ``rampart_sinks`` attribute into a list of sinks.
 
-    Handles two shapes without touching pytest's private fixture API:
+    Handles three shapes:
 
     - A list — used directly.
     - A zero-argument plain function — called, and its list return used.
+    - A ``@pytest.fixture``-wrapped *parameterless* function — unwrapped to
+      its underlying function and called directly (no pytest fixture
+      machinery), so the documented session-fixture fallback keeps working
+      on the xdist controller.
 
-    Any other shape — most importantly a ``@pytest.fixture``-wrapped
-    ``rampart_sinks``, which the controller cannot execute — is skipped
-    with a warning pointing at the ``pytest_rampart_sinks`` hook, which
-    works identically on the controller and in every worker.
+    Any other shape — a fixture that depends on other fixtures, a callable
+    requiring arguments, or a non-list return — is skipped with a warning
+    pointing at the ``pytest_rampart_sinks`` hook, which works identically
+    on the controller and in every worker.
 
     Returns None on failure (logged) so the caller can continue
     scanning other plugins.
@@ -1162,17 +1194,22 @@ def _resolve_sink_candidate(
     if isinstance(candidate, list):
         return cast("list[object]", candidate)
 
-    if not inspect.isfunction(candidate):
+    func: Callable[..., object] | None
+    if inspect.isfunction(candidate):
+        func = candidate
+    else:
+        func = _unwrap_fixture_function(candidate)
+    if func is None:
         logger.warning(
             "rampart_sinks in %s is %s, which controller-side discovery "
-            "cannot resolve (fixtures do not run on the xdist controller). "
-            "Register sinks via the pytest_rampart_sinks hook instead.",
+            "cannot resolve. Register sinks via the pytest_rampart_sinks "
+            "hook instead.",
             plugin_name,
             type(candidate).__name__,
         )
         return None
 
-    sig = inspect.signature(candidate)
+    sig = inspect.signature(func)
     if len(sig.parameters) > 0:
         logger.warning(
             "rampart_sinks in %s requires arguments (%s); controller-side "
@@ -1184,7 +1221,7 @@ def _resolve_sink_candidate(
         return None
 
     try:
-        value = candidate()
+        value = func()
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:  # noqa: BLE001 — broad on purpose: user code

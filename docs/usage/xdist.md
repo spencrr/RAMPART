@@ -114,8 +114,10 @@ fallback**. The rule is:
 
 ### Fixture fallback constraints (no hook present)
 
-When you rely on the fixture fallback under xdist, the controller cannot execute
-fixtures, so only these shapes resolve:
+When you rely on the fixture fallback under xdist, pytest's fixture machinery
+does not run on the controller. RAMPART therefore unwraps a **parameterless**
+`rampart_sinks` fixture and calls its underlying function directly, so these
+shapes resolve:
 
 ```python
 # Parameterless session fixture — resolves single-process AND on the
