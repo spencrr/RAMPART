@@ -42,19 +42,19 @@ class ResponseContains(BaseEvaluator):
         """Check response text for the target pattern."""
         text = context.text
 
-        if callable(self._target):
-            # ty does not narrow `callable(x)` against a union containing str.
-            found = self._target(text)  # ty: ignore[call-top-callable]
-        elif isinstance(self._target, re.Pattern):
+        found = False
+        if isinstance(self._target, re.Pattern):
             found = bool(self._target.search(text))
-        else:
+        elif isinstance(self._target, str):
             check_text = text if self._case_sensitive else text.lower()
             check_target = (
                 self._target if self._case_sensitive else self._target.lower()
             )
             found = check_target in check_text
+        elif callable(self._target):
+            found = self._target(text)
 
-        if found:
+        if found is True:
             return EvalResult(
                 outcome=EvalOutcome.DETECTED,
                 evidence=["Pattern found in response text"],

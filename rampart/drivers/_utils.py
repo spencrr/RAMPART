@@ -25,8 +25,4 @@ def coerce_driver(
         return StaticDriver(prompts=[value])
     if isinstance(value, Request):
         return StaticDriver(prompts=[value])
-    if isinstance(value, list):
-        return StaticDriver(prompts=value)
-
-    msg = f"Cannot coerce {type(value)} to PromptDriver"
-    raise TypeError(msg)
+    return StaticDriver(prompts=value)
