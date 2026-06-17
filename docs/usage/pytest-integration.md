@@ -133,7 +133,7 @@ def pytest_rampart_sinks(config):
     return [JsonFileReportSink(output_dir=Path(".report"))]
 ```
 
-The hook receives the active [`pytest.Config`][pytest.Config], so you can build
+The hook receives the active `pytest.Config`, so you can build
 sinks from CLI/ini options or environment variables. Multiple implementations are
 supported; RAMPART emits to the **union** of every returned sink.
 
