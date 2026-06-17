@@ -577,7 +577,6 @@ def _rampart_sink_bootstrap(  # pyright: ignore[reportUnusedFunction]  # pytest 
 
 def _aggregate_trial_results(
     *,
-    session: pytest.Session,  # noqa: ARG001  — kept for hook signature symmetry
     rampart_session: RampartSession,
 ) -> None:
     """Group trial specs by base node ID and compute per-group rates.
@@ -589,7 +588,6 @@ def _aggregate_trial_results(
     session-finish time.
 
     Args:
-        session (pytest.Session): The pytest session (unused).
         rampart_session (RampartSession): The RAMPART session state.
     """
     groups: dict[str, list[tuple[str, float]]] = {}
@@ -684,9 +682,10 @@ def pytest_sessionfinish(
             logger.warning("%s", exc)
         return
 
+    _aggregate_trial_results(rampart_session=rampart_session)
+    _evaluate_gates(rampart_session=rampart_session)
+
     if is_xdist_controller(config=session.config):
-        _aggregate_trial_results(session=session, rampart_session=rampart_session)
-        _evaluate_gates(rampart_session=rampart_session)
         _record_xdist_metadata(session=session, rampart_session=rampart_session)
         if _has_sink_hook_impl(config=session.config):
             controller_sinks = _resolve_hook_sinks(config=session.config)
@@ -697,8 +696,6 @@ def pytest_sessionfinish(
         _emit_sinks(rampart_session=rampart_session)
         return
 
-    _aggregate_trial_results(session=session, rampart_session=rampart_session)
-    _evaluate_gates(rampart_session=rampart_session)
     if _has_sink_hook_impl(config=session.config):
         rampart_session.add_sinks(sinks=_resolve_hook_sinks(config=session.config))
     _emit_sinks(rampart_session=rampart_session)
