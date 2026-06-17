@@ -53,11 +53,11 @@ The result: **one** `JsonFileReportSink` output file, **one** call to `MyCustomS
 
 | `--dist` mode | Trial behavior |
 |---------------|----------------|
-| `loadgroup` | All trial clones for one test run on the same worker (recommended for locality) |
-| `load` (default) | Trial clones distributed round-robin across workers |
+| `loadgroup` | All trial clones for one test pinned to the same worker |
+| `load` (default) | Trial clones distributed across all workers |
 | `loadscope` / `loadfile` | Grouped by class/module/file |
 
-**Correctness is preserved regardless of mode** — the controller aggregates trial groups from the merged result set. You'll see a warning if you use `@trial` markers without `--dist=loadgroup`:
+**Correctness is preserved regardless of mode** — the controller aggregates trial groups from the merged result set and evaluates each group's threshold against the full population. You'll see a warning if you use `@trial` markers without `--dist=loadgroup`:
 
 ```text
 RAMPART @trial markers present with --dist=load. Trial clones may be
@@ -66,11 +66,35 @@ all results), but using --dist=loadgroup keeps trial clones co-located
 on one worker for better locality.
 ```
 
-To silence the warning and improve locality:
+This warning is **informational, not a correctness signal** — see below for when it's safe to ignore.
 
-```bash
-pytest -n 4 --dist=loadgroup
-```
+### Choosing `loadgroup` vs `load`
+
+**Both modes produce an identical, correct report.** The controller merges per-worker
+partials into one population and evaluates each trial's threshold against the full
+group either way. The choice is about *execution*, not correctness:
+
+- **`load` (default)** spreads a test's trial clones across **all** workers, so a
+  20-clone trial keeps every worker busy. It is usually the **fastest** option and is
+  the right default when trial clones are **independent** (no shared per-group state).
+- **`loadgroup`** pins all clones of one trial group to a **single** worker. Prefer it
+  only when a trial group needs **cohesion** — e.g. clones share a session-scoped
+  fixture, a per-group cache/connection, or other worker-local state that must not be
+  split across processes. The trade-off is less parallelism, so it can run slower.
+
+**Rule of thumb:** independent trials → plain `pytest -n 4` (faster); trials that
+share per-group worker state → `pytest -n 4 --dist=loadgroup`.
+
+As an illustration, one 22-item suite containing a 20-clone trial measured:
+
+| Mode | Command | Wall time | Reports | `total_runs` |
+|------|---------|-----------|---------|--------------|
+| Serial | `pytest -n 0` | 203.4s | 1 | 22 |
+| Parallel, loadgroup | `pytest -n 4 --dist=loadgroup` | 165.5s | 1 | 22 |
+| Parallel, default load | `pytest -n 4` | **113.8s** | 1 | 22 |
+
+All three emit the same single report and the same trial verdict; `load` is fastest
+here because the 20 clones fan out across the 4 workers instead of being pinned to one.
 
 ---
 
@@ -221,8 +245,9 @@ clean `pytest_sessionfinish`. This has two consequences you should be aware of:
 Both behaviors are deliberate fail-closed choices for this release. A durable
 per-worker transport (incremental JSONL shards that survive a killed worker, with
 the size cap applied per-record) is in progress as a follow-up change; until it
-lands, prefer `--dist=loadgroup` for trial locality and size your cap to your
-largest expected worker payload.
+lands, use `--dist=loadgroup` only when your trial groups need worker cohesion (see
+[Choosing `loadgroup` vs `load`](#choosing-loadgroup-vs-load)) and size your cap to
+your largest expected worker payload.
 
 ---
 

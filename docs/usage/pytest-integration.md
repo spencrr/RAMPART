@@ -69,7 +69,7 @@ async def test_with_threshold(adapter):
 - The trial group aggregate appears in the terminal summary
 
 !!! tip "Running trials in parallel"
-    Under [`pytest-xdist`](xdist.md), use `--dist=loadgroup` to co-locate trial clones on a single worker. Aggregation is correct under any `--dist` mode, but `loadgroup` reduces cross-worker overhead.
+    Under [`pytest-xdist`](xdist.md), aggregation is correct under any `--dist` mode. The default `--dist=load` spreads trial clones across all workers and is usually fastest; use `--dist=loadgroup` only when a trial group must stay on one worker (shared session fixture or per-group worker state). See [Choosing `loadgroup` vs `load`](xdist.md#choosing-loadgroup-vs-load).
 
 ---
 

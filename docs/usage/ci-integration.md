@@ -22,10 +22,10 @@ For faster CI runs, use [`pytest-xdist`](xdist.md):
 
 ```bash
 pip install pytest-xdist
-pytest tests/ -n auto --dist=loadgroup
+pytest tests/ -n auto
 ```
 
-RAMPART aggregates results across worker processes and emits a single unified report. `--dist=loadgroup` is recommended when using `@trial` markers so that trial clones run on the same worker. See [Parallel Execution](xdist.md) for details and security considerations.
+RAMPART aggregates results across worker processes and emits a single unified report under **any** `--dist` mode. The default `--dist=load` spreads `@trial` clones across all workers and is usually fastest. Add `--dist=loadgroup` only when a trial group needs to stay on one worker (e.g. clones share a session fixture or per-group worker state). See [Choosing `loadgroup` vs `load`](xdist.md#choosing-loadgroup-vs-load) for details and security considerations.
 
 ---
 
