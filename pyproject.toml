@@ -132,11 +132,5 @@ python-version = "3.11"
 [tool.ty.src]
 include = ["rampart", "tests"]
 
-[[tool.ty.overrides]]
-include = ["tests/**"]
-
-[tool.ty.overrides.rules]
-invalid-argument-type = "ignore"
-
 [tool.uv.sources]
 pyrit = { git = "https://github.com/microsoft/PyRIT", rev = "6dc8b94139757390286bbce7d53c1f7e58e66e29" } # v0.13.0

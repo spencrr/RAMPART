@@ -231,7 +231,7 @@ class TestValidation:
 
     def test_none_model_raises_value_error(self):
         config = LLMConfig(
-            model=None,
+            model=None,  # ty: ignore[invalid-argument-type]
             endpoint="https://api.openai.com/v1",
         )
         with pytest.raises(ValueError, match="model"):
@@ -240,7 +240,7 @@ class TestValidation:
     def test_none_endpoint_raises_value_error(self):
         config = LLMConfig(
             model="gpt-4o",
-            endpoint=None,
+            endpoint=None,  # ty: ignore[invalid-argument-type]
         )
         with pytest.raises(ValueError, match="endpoint"):
             create_prompt_target(config)
