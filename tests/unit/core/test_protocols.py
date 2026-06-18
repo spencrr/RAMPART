@@ -9,7 +9,6 @@ inheriting from the protocol.
 """
 
 import types
-from abc import abstractmethod
 from typing import Self
 
 from rampart.core.adapter import AgentAdapter, Session
@@ -63,8 +62,8 @@ class TestSessionProtocol:
 class TestAgentAdapterProtocol:
     def test_structural_subtyping(self) -> None:
         class MyAdapter:
-            @abstractmethod
-            async def create_session_async(self) -> Session: ...
+            async def create_session_async(self) -> Session:
+                raise NotImplementedError
 
             @property
             def manifest(self) -> AppManifest:
