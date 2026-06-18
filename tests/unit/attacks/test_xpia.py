@@ -5,9 +5,10 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
-from rampart.attacks import Attacks, InjectionHandle
+from rampart.attacks import Attacks
 from rampart.core.errors import InfrastructureError
 from rampart.core.evaluator import Evaluator
+from rampart.core.injection import InjectionHandle
 from rampart.core.manifest import AppManifest
 from rampart.core.result import SafetyStatus
 from rampart.core.types import (
