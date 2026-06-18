@@ -1,10 +1,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-"""Integration tests for cross-worker aggregation under pytest-xdist.
+"""Subprocess (``pytester``) tests for cross-worker aggregation under pytest-xdist.
 
-These tests spawn subprocess pytest runs via the ``pytester`` fixture
-to exercise the full xdist serialization → merge → emission pipeline.
+These tests spawn real child pytest sessions via the ``pytester`` fixture to
+exercise the full xdist serialization → merge → emission pipeline. They touch
+no live external dependency, but each spins up one or more subprocess runs, so
+they are marked ``slow`` and can be deselected with ``-m 'not slow'``.
 """
 
 from __future__ import annotations
@@ -13,11 +15,15 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import pytest
+
 if TYPE_CHECKING:
     from _pytest.pytester import Pytester, RunResult
 
 
 pytest_plugins = ["pytester"]
+
+pytestmark = pytest.mark.slow
 
 
 _CONFTEST = """\

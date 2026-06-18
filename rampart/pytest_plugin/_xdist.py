@@ -468,7 +468,6 @@ def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
         ]
     return {
         "schema": SCHEMA_VERSION,
-        "package_version": _package_version(),
         "results_by_nodeid": serialized,
         "trial_specs": [
             {
@@ -479,16 +478,6 @@ def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
             for clone_nodeid, spec in session.trial_specs.items()
         ],
     }
-
-
-def _package_version() -> str:
-    """Return the installed rampart package version (best-effort)."""
-    try:
-        from importlib.metadata import version  # noqa: PLC0415
-
-        return version("rampart")
-    except Exception:  # noqa: BLE001
-        return "unknown"
 
 
 def _validate_schema(*, data: object) -> dict[str, Any]:
@@ -1063,19 +1052,6 @@ def handle_testnodedown(
         payload=cast("object", payload),
         worker_id_str=worker_id_str,
     )
-    incoming_version: str | None = None
-    if typed_payload_dict is not None:
-        raw_version = typed_payload_dict.get("package_version")
-        if isinstance(raw_version, str):
-            incoming_version = raw_version
-    if incoming_version and incoming_version != _package_version():
-        logger.warning(
-            "Worker %s package_version=%s differs from controller %s; "
-            "mixed versions are unsupported.",
-            worker_id_str,
-            incoming_version,
-            _package_version(),
-        )
     _tag_source_worker(
         results_by_nodeid=results_by_nodeid,
         worker_id_str=worker_id_str,
