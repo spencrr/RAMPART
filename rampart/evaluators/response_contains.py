@@ -54,7 +54,7 @@ class ResponseContains(BaseEvaluator):
         elif callable(self._target):
             found = self._target(text)
 
-        if found is True:
+        if found:
             return EvalResult(
                 outcome=EvalOutcome.DETECTED,
                 evidence=["Pattern found in response text"],
