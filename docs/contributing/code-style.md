@@ -32,7 +32,7 @@ uv run ruff format .
 A few details worth knowing:
 
 - **Ruff** is configured with `select = ["ALL"]`. Test files have relaxed rules (no docstrings, no type annotations, magic values allowed) via `per-file-ignores` in `pyproject.toml`.
-- **Pyright** runs in **strict mode** targeting Python 3.11 — every function needs complete parameter and return type annotations.
+- **ty** targets Python 3.11 — every function needs complete parameter and return type annotations.
 
 
 ## Key Conventions
@@ -157,7 +157,7 @@ Before committing, run pre-commit — it covers everything the automated tooling
 uv run pre-commit run --all-files
 ```
 
-This runs Ruff (linting + formatting) and Pyright (strict type checking), which together enforce the copyright header, type annotations, log formatting, import organization, and most other conventions on this page.
+This runs Ruff (linting + formatting) and ty (type checking), which together enforce the copyright header, type annotations, log formatting, import organization, and most other conventions on this page.
 
 A few rules are **not** caught by tooling and still need a human eye:
 
