@@ -9,7 +9,7 @@ import json
 import logging
 import math
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -913,7 +913,7 @@ class TestSinkDiscovery:
         )
         config = MagicMock()
         config.pluginmanager.get_plugins.return_value = [plugin]
-        result = discover_sinks_from_conftest(config=config)
+        result = discover_sinks_from_conftest(config=cast("pytest.Config", config))
         assert sink in result
 
     def test_finds_list_rampart_sinks(self) -> None:
@@ -925,14 +925,14 @@ class TestSinkDiscovery:
         )
         config = MagicMock()
         config.pluginmanager.get_plugins.return_value = [plugin]
-        result = discover_sinks_from_conftest(config=config)
+        result = discover_sinks_from_conftest(config=cast("pytest.Config", config))
         assert sink in result
 
     def test_returns_empty_when_no_rampart_sinks(self) -> None:
         plugin = MagicMock(spec=["__name__"], __name__="mod")
         config = MagicMock()
         config.pluginmanager.get_plugins.return_value = [plugin]
-        result = discover_sinks_from_conftest(config=config)
+        result = discover_sinks_from_conftest(config=cast("pytest.Config", config))
         assert result == []
 
     def test_warns_on_callable_with_required_args(
@@ -950,7 +950,7 @@ class TestSinkDiscovery:
         config = MagicMock()
         config.pluginmanager.get_plugins.return_value = [plugin]
         with caplog.at_level(logging.WARNING):
-            result = discover_sinks_from_conftest(config=config)
+            result = discover_sinks_from_conftest(config=cast("pytest.Config", config))
         assert result == []
         assert any("requires arguments" in r.getMessage() for r in caplog.records)
 
@@ -968,7 +968,7 @@ class TestSinkDiscovery:
         )
         config = MagicMock()
         config.pluginmanager.get_plugins.return_value = [plugin]
-        result = discover_sinks_from_conftest(config=config)
+        result = discover_sinks_from_conftest(config=cast("pytest.Config", config))
         assert sink in result
 
     def test_warns_and_skips_fixture_with_dependencies(
@@ -987,7 +987,7 @@ class TestSinkDiscovery:
         config = MagicMock()
         config.pluginmanager.get_plugins.return_value = [plugin]
         with caplog.at_level(logging.WARNING):
-            result = discover_sinks_from_conftest(config=config)
+            result = discover_sinks_from_conftest(config=cast("pytest.Config", config))
         assert result == []
         assert any("requires arguments" in r.getMessage() for r in caplog.records)
         assert any("pytest_rampart_sinks" in r.getMessage() for r in caplog.records)
