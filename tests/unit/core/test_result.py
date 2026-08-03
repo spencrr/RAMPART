@@ -6,6 +6,8 @@
 Result, SafetyStatus, HarmCategory, resolve functions.
 """
 
+import warnings
+
 import pytest
 
 from rampart.core.result import (
@@ -15,6 +17,8 @@ from rampart.core.result import (
     SafetyStatus,
     resolve_as_attack,
     resolve_as_probe,
+    resolve_attack_verdict,
+    resolve_probe_verdict,
 )
 from rampart.core.types import (
     EvalOutcome,
@@ -22,6 +26,7 @@ from rampart.core.types import (
     ObservabilityLevel,
     Request,
     Response,
+    TerminationReason,
     Turn,
 )
 
@@ -113,6 +118,19 @@ class TestResult:
         assert r.observability_level is ObservabilityLevel.RESPONSE_ONLY
         assert r.injections == []
         assert r.metadata == {}
+        assert r.evaluation is None
+        assert r.termination_reason is None
+
+    def test_final_evaluation_and_termination_reason_round_trip(self) -> None:
+        evaluation = _er(EvalOutcome.DETECTED)
+        r = Result(
+            status=SafetyStatus.UNSAFE,
+            summary="bad",
+            evaluation=evaluation,
+            termination_reason=TerminationReason.STOP_CONDITION,
+        )
+        assert r.evaluation is evaluation
+        assert r.termination_reason is TerminationReason.STOP_CONDITION
 
     def test_harm_category_accepts_enum(self) -> None:
         r = Result(
@@ -180,6 +198,23 @@ class TestResultEvalResultsProperty:
             turns=turns,
         )
         assert r.eval_results == [er]
+
+    def test_final_evaluation_is_not_in_turn_eval_results(self) -> None:
+        final = _er(EvalOutcome.DETECTED)
+        turn_evaluation = _er(EvalOutcome.NOT_DETECTED)
+        r = Result(
+            status=SafetyStatus.UNSAFE,
+            summary="bad",
+            evaluation=final,
+            turns=[
+                Turn(
+                    request=Request(prompt="p"),
+                    response=Response(text="r"),
+                    eval_result=turn_evaluation,
+                ),
+            ],
+        )
+        assert r.eval_results == [turn_evaluation]
 
 
 class TestResolveAsAttack:
@@ -282,3 +317,47 @@ class TestResolveAsProbe:
             ],
         )
         assert status is SafetyStatus.SAFE
+
+
+def test_legacy_resolvers_remain_warning_free() -> None:
+    """The additive API does not start the legacy deprecation clock."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert resolve_as_attack(eval_results=[]) is SafetyStatus.ERROR
+        assert resolve_as_probe(eval_results=[]) is SafetyStatus.ERROR
+
+
+class TestResolveAttackVerdict:
+    @pytest.mark.parametrize(
+        ("evaluation", "expected"),
+        [
+            (None, SafetyStatus.ERROR),
+            (_er(EvalOutcome.DETECTED), SafetyStatus.UNSAFE),
+            (_er(EvalOutcome.NOT_DETECTED), SafetyStatus.SAFE),
+            (_er(EvalOutcome.UNDETERMINED), SafetyStatus.UNDETERMINED),
+        ],
+    )
+    def test_maps_single_evaluation(
+        self,
+        evaluation: EvalResult | None,
+        expected: SafetyStatus,
+    ) -> None:
+        assert resolve_attack_verdict(evaluation=evaluation) is expected
+
+
+class TestResolveProbeVerdict:
+    @pytest.mark.parametrize(
+        ("evaluation", "expected"),
+        [
+            (None, SafetyStatus.ERROR),
+            (_er(EvalOutcome.DETECTED), SafetyStatus.SAFE),
+            (_er(EvalOutcome.NOT_DETECTED), SafetyStatus.UNSAFE),
+            (_er(EvalOutcome.UNDETERMINED), SafetyStatus.UNDETERMINED),
+        ],
+    )
+    def test_maps_single_evaluation(
+        self,
+        evaluation: EvalResult | None,
+        expected: SafetyStatus,
+    ) -> None:
+        assert resolve_probe_verdict(evaluation=evaluation) is expected

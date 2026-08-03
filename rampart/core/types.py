@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -240,6 +240,31 @@ class Request:
             raise ValueError(msg)
 
 
+class EvaluationRole(StrEnum):
+    """Why an evaluation was attached to a turn.
+
+    Attributes:
+        STOP_CONDITION: The evaluation was produced by an online stop
+            condition. It is execution evidence, not the final verdict input.
+    """
+
+    STOP_CONDITION = "stop_condition"
+
+
+class TerminationReason(StrEnum):
+    """Why a trace stopped producing turns.
+
+    Attributes:
+        DRIVER_EXHAUSTED: The prompt driver returned no next request.
+        MAX_TURNS: The configured turn budget was exhausted.
+        STOP_CONDITION: An online stop condition fired.
+    """
+
+    DRIVER_EXHAUSTED = "driver_exhausted"
+    MAX_TURNS = "max_turns"
+    STOP_CONDITION = "stop_condition"
+
+
 @dataclass(frozen=True, kw_only=True)
 class Turn:
     """One prompt-response exchange.
@@ -252,6 +277,8 @@ class Turn:
         request: What was sent to the agent.
         response: What the agent returned.
         eval_result: Evaluator outcome for this turn.
+        eval_role: Why ``eval_result`` was produced. None when the role was
+            not recorded, including executions that predate the trace runner.
         turn_number: Position in the conversation (0-indexed).
         timestamp: When this exchange occurred.
         driver_reasoning: Why the driver chose this request.
@@ -260,6 +287,7 @@ class Turn:
     request: Request
     response: Response
     eval_result: EvalResult | None = None
+    eval_role: EvaluationRole | None = None
     turn_number: int = 0
     timestamp: datetime | None = None
     driver_reasoning: str = ""

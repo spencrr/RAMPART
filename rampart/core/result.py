@@ -18,6 +18,7 @@ from rampart.core.types import (
     EvalOutcome,
     EvalResult,
     ObservabilityLevel,
+    TerminationReason,
     Turn,
 )
 
@@ -107,7 +108,11 @@ class Result:
     Args:
         status: Categorical status for structured reporting.
         summary: Human-readable one-line summary.
+        evaluation: The single final-trace evaluation that produced the
+            verdict. None for error results and legacy/manual results.
         turns: The full conversation for evidence and debugging.
+        termination_reason: Why the trace stopped producing turns. None when
+            execution failed before a normal trace termination was recorded.
         duration_seconds: How long the test execution took.
         harm_category: Which harm category this test covers.
             Accepts HarmCategory enum values for built-in categories or plain strings
@@ -122,7 +127,9 @@ class Result:
 
     status: SafetyStatus
     summary: str
+    evaluation: EvalResult | None = None
     turns: list[Turn] = field(default_factory=list[Turn])
+    termination_reason: TerminationReason | None = None
     duration_seconds: float = 0.0
     harm_category: HarmCategory | str | None = None
     strategy: str = ""
@@ -166,6 +173,46 @@ class Result:
             f"status={self.status.value}, "
             f"summary={self.summary!r})"
         )
+
+
+def resolve_attack_verdict(*, evaluation: EvalResult | None) -> SafetyStatus:
+    """Map one final evaluation using attack polarity.
+
+    Args:
+        evaluation: The final-trace evaluator result, or None when no trace
+            was available to evaluate.
+
+    Returns:
+        SafetyStatus: DETECTED maps to UNSAFE, NOT_DETECTED maps to SAFE,
+            UNDETERMINED is preserved, and None maps to ERROR.
+    """
+    if evaluation is None:
+        return SafetyStatus.ERROR
+    if evaluation.outcome is EvalOutcome.DETECTED:
+        return SafetyStatus.UNSAFE
+    if evaluation.outcome is EvalOutcome.UNDETERMINED:
+        return SafetyStatus.UNDETERMINED
+    return SafetyStatus.SAFE
+
+
+def resolve_probe_verdict(*, evaluation: EvalResult | None) -> SafetyStatus:
+    """Map one final evaluation using probe polarity.
+
+    Args:
+        evaluation: The final-trace evaluator result, or None when no trace
+            was available to evaluate.
+
+    Returns:
+        SafetyStatus: DETECTED maps to SAFE, NOT_DETECTED maps to UNSAFE,
+            UNDETERMINED is preserved, and None maps to ERROR.
+    """
+    if evaluation is None:
+        return SafetyStatus.ERROR
+    if evaluation.outcome is EvalOutcome.DETECTED:
+        return SafetyStatus.SAFE
+    if evaluation.outcome is EvalOutcome.UNDETERMINED:
+        return SafetyStatus.UNDETERMINED
+    return SafetyStatus.UNSAFE
 
 
 def resolve_as_attack(*, eval_results: list[EvalResult]) -> SafetyStatus:
