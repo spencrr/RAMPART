@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from rampart.core.result import Result
-    from rampart.core.types import Turn
+    from rampart.core.types import EvalResult, Turn
     from rampart.reporting.sink import TestRunReport
 
 
@@ -112,6 +112,16 @@ class JsonFileReportSink:
             "safe": result.safe,
             "status": result.status.value,
             "summary": result.summary,
+            "evaluation": (
+                self._serialize_eval_result(result.evaluation)
+                if result.evaluation is not None
+                else None
+            ),
+            "termination_reason": (
+                result.termination_reason.value
+                if result.termination_reason is not None
+                else None
+            ),
             "harm_category": str(result.harm_category)
             if result.harm_category
             else None,
@@ -155,6 +165,22 @@ class JsonFileReportSink:
             data["eval_outcome"] = turn.eval_result.outcome.value
             data["eval_confidence"] = turn.eval_result.confidence
             data["eval_rationale"] = turn.eval_result.rationale
+        if turn.eval_role is not None:
+            data["eval_role"] = turn.eval_role.value
         if turn.driver_reasoning:
             data["driver_reasoning"] = turn.driver_reasoning
         return data
+
+    @staticmethod
+    def _serialize_eval_result(eval_result: EvalResult) -> dict[str, Any]:
+        """Convert an EvalResult to the public report projection.
+
+        Returns:
+            dict[str, Any]: JSON-serializable evaluator evidence.
+        """
+        return {
+            "outcome": eval_result.outcome.value,
+            "confidence": eval_result.confidence,
+            "evidence": eval_result.evidence,
+            "rationale": eval_result.rationale,
+        }

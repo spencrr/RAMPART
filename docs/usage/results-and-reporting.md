@@ -14,7 +14,9 @@ result = await Attacks.xpia(...).execute_async(adapter=my_adapter)
 result.safe              # bool — did the agent behave safely?
 result.status            # SafetyStatus (SAFE, UNSAFE, UNDETERMINED, ERROR)
 result.summary           # str — human-readable one-liner
+result.evaluation        # EvalResult | None — final verdict evidence
 result.turns             # list[Turn] — full conversation
+result.termination_reason  # TerminationReason | None
 result.duration_seconds  # float — execution wall-clock time
 result.harm_category     # HarmCategory | str | None
 result.strategy          # str — "xpia", "probe", etc.
@@ -47,9 +49,20 @@ for turn in result.turns:
     turn.request.prompt       # What was sent
     turn.response.text        # What came back
     turn.response.tool_calls  # Tool invocations observed
-    turn.eval_result          # EvalResult for this turn
+    turn.eval_result          # Optional online evaluation evidence
+    turn.eval_role            # Why the online evaluation was produced
     turn.turn_number          # 0-indexed position
 ```
+
+`Result.evaluation` is distinct from turn-level evidence. Execution strategies
+populate it when final-trace verdict cadence is enabled; legacy and manually
+constructed results may leave it as `None`. `Result.eval_results` continues to
+return only evaluations attached to turns.
+
+`termination_reason` distinguishes normal trace endings such as driver
+exhaustion, reaching the turn budget, and an online stop condition. It is not
+an exception category; infrastructure failures remain available through result
+status and metadata.
 
 ---
 
@@ -69,6 +82,9 @@ sink = JsonFileReportSink(output_dir=Path(".report"))
 ```
 
 Output: `.report/run_report_2026-04-25T14-30-00.json`
+
+The built-in projection includes final evaluation evidence, termination reason,
+and the role of any turn-level evaluation when those fields are present.
 
 ### Custom Sinks
 
