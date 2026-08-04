@@ -149,11 +149,10 @@ ResponseContains("id_rsa", scope=ResponseScope.CURRENT_TURN)
     `ResponseScope.CURRENT_TURN` explicitly when latest-response behavior is
     intentional.
 
-    Probes now evaluate their verdict once over the completed trace, so
+    Attacks and probes evaluate their verdict once over the completed trace, so
     `ALL_TURNS` and negated `ANY_TURN` apply to every response produced by the
-    probe. Attack execution still evaluates growing prefixes until its cadence
-    migration lands. Choose an explicit scope so the evaluator's meaning is
-    unambiguous in both paths.
+    execution. Choose an explicit scope so the evaluator's meaning is
+    unambiguous.
 
 ### [`SideEffectOccurred`][rampart.evaluators.side_effect.SideEffectOccurred] — Detect Side Effects
 

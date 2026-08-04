@@ -30,6 +30,8 @@ class ToolCalled(BaseEvaluator):
              Parameter name -> expected value or predicate.
     """
 
+    _detected_absorbing = True
+
     def __init__(
         self,
         tool_name: str,

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
+import pytest
+
 from rampart.attacks import Attacks
 from rampart.core.errors import InfrastructureError
 from rampart.core.evaluator import Evaluator
@@ -12,14 +14,17 @@ from rampart.core.injection import InjectionHandle
 from rampart.core.manifest import AppManifest
 from rampart.core.result import SafetyStatus
 from rampart.core.types import (
+    EvalContext,
     EvalOutcome,
     EvalResult,
     ObservabilityLevel,
     Payload,
     Request,
     Response,
+    TerminationReason,
     ToolCall,
 )
+from rampart.evaluators import ResponseContains, ResponseScope, ToolCalled
 from tests.fixtures import MockAdapter
 
 _DEFAULT_MANIFEST = AppManifest(name="TestAgent")
@@ -110,10 +115,21 @@ class TestXPIADetection:
         assert result.status is SafetyStatus.UNDETERMINED
 
 
-class TestXPIAEarlyStop:
-    """Per-turn evaluation stops the conversation on first detection."""
+class TestXPIAParameterValidation:
+    def test_invalid_stop_policy_raises(self) -> None:
+        with pytest.raises(ValueError, match="'auto'"):
+            Attacks.xpia(
+                inject=_mock_handle(),
+                trigger="Summarize Q3",
+                evaluator=_mock_evaluator(EvalOutcome.NOT_DETECTED),
+                stop_when="always",  # ty: ignore[invalid-argument-type]
+            )
 
-    async def test_stops_after_first_detection(self) -> None:
+
+class TestXPIAEarlyStop:
+    """Explicit and automatic attack stopping preserve justified costs."""
+
+    async def test_explicit_identical_stop_reuses_fired_evaluation(self) -> None:
         evaluator = AsyncMock()
         evaluator.evaluate_async.side_effect = [
             EvalResult(outcome=EvalOutcome.NOT_DETECTED),
@@ -124,24 +140,97 @@ class TestXPIAEarlyStop:
             inject=_mock_handle(),
             trigger=["Turn 1", "Turn 2", "Turn 3"],
             evaluator=evaluator,
+            stop_when=evaluator,
         ).execute_async(adapter=_adapter())
 
         assert result.status is SafetyStatus.UNSAFE
         assert len(result.turns) == 2
+        assert result.termination_reason is TerminationReason.STOP_CONDITION
+        assert evaluator.evaluate_async.await_count == 2
 
-    async def test_completes_all_turns_when_not_detected(self) -> None:
+    async def test_explicit_non_firing_stop_reuses_terminal_evaluation(self) -> None:
+        evaluator = _mock_evaluator(EvalOutcome.NOT_DETECTED)
         result = await Attacks.xpia(
             inject=_mock_handle(),
-            trigger=["Turn 1", "Turn 2"],
-            evaluator=_mock_evaluator(EvalOutcome.NOT_DETECTED),
+            trigger=["Turn 1", "Turn 2", "Turn 3"],
+            evaluator=evaluator,
+            stop_when=evaluator,
         ).execute_async(adapter=_adapter())
 
         assert result.status is SafetyStatus.SAFE
+        assert len(result.turns) == 3
+        assert evaluator.evaluate_async.await_count == 3
+
+    async def test_auto_stop_uses_absorbing_tool_evaluator(self) -> None:
+        result = await Attacks.xpia(
+            inject=_mock_handle(),
+            trigger=["Turn 1", "Turn 2", "Turn 3"],
+            evaluator=ToolCalled("exfiltrate"),
+        ).execute_async(
+            adapter=_adapter(
+                responses=[
+                    Response(text="one"),
+                    Response(
+                        text="two",
+                        tool_calls=[ToolCall(name="exfiltrate")],
+                    ),
+                ],
+            ),
+        )
+
+        assert result.status is SafetyStatus.UNSAFE
         assert len(result.turns) == 2
+        assert result.termination_reason is TerminationReason.STOP_CONDITION
+
+    async def test_auto_does_not_stop_unknown_evaluator(self) -> None:
+        evaluator = _mock_evaluator(EvalOutcome.DETECTED)
+        result = await Attacks.xpia(
+            inject=_mock_handle(),
+            trigger=["Turn 1", "Turn 2", "Turn 3"],
+            evaluator=evaluator,
+        ).execute_async(adapter=_adapter())
+
+        assert result.status is SafetyStatus.UNSAFE
+        assert len(result.turns) == 3
+        assert evaluator.evaluate_async.await_count == 1
+
+    async def test_none_disables_auto_stop(self) -> None:
+        result = await Attacks.xpia(
+            inject=_mock_handle(),
+            trigger=["Turn 1", "Turn 2"],
+            evaluator=ToolCalled("exfiltrate"),
+            stop_when=None,
+        ).execute_async(
+            adapter=_adapter(
+                responses=[
+                    Response(tool_calls=[ToolCall(name="exfiltrate")], text="one"),
+                    Response(text="two"),
+                ],
+            ),
+        )
+
+        assert result.status is SafetyStatus.UNSAFE
+        assert len(result.turns) == 2
+        assert result.termination_reason is TerminationReason.DRIVER_EXHAUSTED
+        assert result.evaluation is not None
+
+    async def test_any_turn_response_evaluator_is_auto_stoppable(self) -> None:
+        result = await Attacks.xpia(
+            inject=_mock_handle(),
+            trigger=["Turn 1", "Turn 2"],
+            evaluator=ResponseContains("secret", scope=ResponseScope.ANY_TURN),
+        ).execute_async(
+            adapter=_adapter(
+                responses=[Response(text="secret"), Response(text="clean")],
+            ),
+        )
+
+        assert len(result.turns) == 1
+        assert result.status is SafetyStatus.UNSAFE
 
 
 class TestXPIAMaxTurns:
-    """Max-turns resolves normally via resolve_as_attack."""
+    """Max turns resolves normally from the terminal evaluation."""
 
     async def test_max_turns_resolves_normally(self) -> None:
         result = await Attacks.xpia(
@@ -153,6 +242,20 @@ class TestXPIAMaxTurns:
 
         assert result.status is SafetyStatus.SAFE
         assert len(result.turns) == 2
+        assert result.termination_reason is TerminationReason.MAX_TURNS
+
+    async def test_zero_turn_budget_returns_error(self) -> None:
+        evaluator = AsyncMock(spec=Evaluator)
+        result = await Attacks.xpia(
+            inject=_mock_handle(),
+            trigger="unused",
+            evaluator=evaluator,
+            max_turns=0,
+        ).execute_async(adapter=_adapter())
+
+        assert result.status is SafetyStatus.ERROR
+        assert result.termination_reason is TerminationReason.MAX_TURNS
+        evaluator.evaluate_async.assert_not_awaited()
 
 
 class TestXPIACleanup:
@@ -201,6 +304,58 @@ class TestXPIACleanup:
         assert result.status is SafetyStatus.ERROR
         assert "evaluator boom" in result.summary
         handle.__aexit__.assert_awaited_once()
+
+    async def test_terminal_evaluation_runs_before_injection_cleanup(self) -> None:
+        handle = _mock_handle()
+
+        def evaluate(*, context: EvalContext) -> EvalResult:
+            assert context.turns
+            handle.__aexit__.assert_not_awaited()
+            return EvalResult(outcome=EvalOutcome.NOT_DETECTED)
+
+        evaluator = AsyncMock(spec=Evaluator)
+        evaluator.evaluate_async.side_effect = evaluate
+
+        result = await Attacks.xpia(
+            inject=handle,
+            trigger="Summarize Q3",
+            evaluator=evaluator,
+            stop_when=None,
+        ).execute_async(adapter=_adapter())
+
+        assert result.status is SafetyStatus.SAFE
+        handle.__aexit__.assert_awaited_once()
+
+    async def test_cleanup_failure_discards_successful_evaluation(self) -> None:
+        handle = _mock_handle()
+        handle.__aexit__.side_effect = RuntimeError("cleanup failed")
+
+        result = await Attacks.xpia(
+            inject=handle,
+            trigger="Summarize Q3",
+            evaluator=_mock_evaluator(EvalOutcome.NOT_DETECTED),
+            stop_when=None,
+        ).execute_async(adapter=_adapter())
+
+        assert result.status is SafetyStatus.ERROR
+        assert result.evaluation is None
+        assert result.termination_reason is None
+
+
+class TestXPIAZeroTurns:
+    async def test_empty_trigger_returns_error_without_evaluation(self) -> None:
+        evaluator = AsyncMock(spec=Evaluator)
+
+        result = await Attacks.xpia(
+            inject=_mock_handle(),
+            trigger=[],
+            evaluator=evaluator,
+        ).execute_async(adapter=_adapter())
+
+        assert result.status is SafetyStatus.ERROR
+        assert result.evaluation is None
+        assert result.termination_reason is TerminationReason.DRIVER_EXHAUSTED
+        evaluator.evaluate_async.assert_not_awaited()
 
 
 class TestXPIAInfrastructureError:
@@ -251,6 +406,27 @@ class TestXPIAObservabilityAdjustment:
 
         assert result.safe is False
         assert result.status is SafetyStatus.UNDETERMINED
+        assert result.metadata["observability_adjusted"] is True
+        assert "Insufficient observability" in result.summary
+
+    async def test_adjustment_does_not_mutate_response_metadata(self) -> None:
+        response_metadata = {"conversation_id": "c-01"}
+        result = await Attacks.xpia(
+            inject=_mock_handle(),
+            trigger="Summarize Q3",
+            evaluator=_mock_evaluator(EvalOutcome.NOT_DETECTED),
+            stop_when=None,
+        ).execute_async(
+            adapter=_adapter(
+                responses=[Response(text="ok", metadata=response_metadata)],
+                observability=ObservabilityLevel.RESPONSE_ONLY,
+            ),
+        )
+
+        assert result.metadata["observability_adjusted"] is True
+        assert "observability_adjusted" not in response_metadata
+        assert "observability_adjusted" not in result.turns[0].response.metadata
+        assert result.metadata is not result.turns[0].response.metadata
 
     async def test_response_only_with_tool_calls_stays_safe(self) -> None:
         result = await Attacks.xpia(
@@ -349,10 +525,12 @@ class TestResponseMetadataPropagation:
         assert result.metadata == {}
 
     async def test_multi_turn_metadata_keyed_by_turn_number(self) -> None:
+        turn_0_metadata = {"page_url": "url0"}
+        turn_1_metadata = {"page_url": "url1"}
         adapter = _adapter(
             responses=[
-                Response(text="turn0", metadata={"page_url": "url0"}),
-                Response(text="turn1", metadata={"page_url": "url1"}),
+                Response(text="turn0", metadata=turn_0_metadata),
+                Response(text="turn1", metadata=turn_1_metadata),
             ],
         )
         result = await Attacks.xpia(
@@ -364,3 +542,6 @@ class TestResponseMetadataPropagation:
         assert "turn_0" in result.metadata
         assert result.metadata["turn_0"]["page_url"] == "url0"
         assert result.metadata["turn_1"]["page_url"] == "url1"
+        result.metadata["turn_0"]["page_url"] = "changed"
+        assert turn_0_metadata["page_url"] == "url0"
+        assert turn_1_metadata["page_url"] == "url1"

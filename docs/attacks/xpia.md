@@ -30,9 +30,10 @@ sequenceDiagram
 1. **Inject** — Place payloads into the agent's data sources via surfaces. Each `surface.inject(payload)` returns an [`InjectionHandle`][rampart.core.injection.InjectionHandle].
 2. **Wait** — Handles call `wait_until_ready()` to allow indexing. Runs concurrently for multiple surfaces.
 3. **Trigger** — Send benign prompts that cause the agent to retrieve the injected content. Triggers are never adversarial — the attack is in the payload, not the prompt.
-4. **Evaluate** — Check each turn for the attack objective. Early-stops on detection.
-5. **Clean up** — Remove injected content. Guaranteed via `AsyncExitStack`, even on exceptions.
-6. **Result** — Produce a [`Result`][rampart.core.result.Result] via `resolve_as_attack` semantics.
+4. **Stop (optional)** — Check `stop_when` after each response and stop when detected.
+5. **Evaluate** — Check the attack objective once over the terminal trace.
+6. **Clean up** — Remove injected content. Guaranteed via `AsyncExitStack`, even on exceptions.
+7. **Result** — Map the final evaluation using attack semantics.
 
 ---
 
@@ -154,10 +155,8 @@ Place the cheaper evaluator on the left side of `|` — it short-circuits if the
     response and emits a `FutureWarning` for multi-turn transcripts. See
     [Temporal Scope](../usage/authoring-tests.md#temporal-scope).
 
-    This release prepares evaluator semantics for final-trace verdicts. Until
-    that cadence change ships, attack executions still evaluate growing
-    prefixes. The attack forms above preserve their intended meaning during
-    that transition.
+    XPIA verdict evaluators receive the terminal trace. Automatic stopping is
+    enabled only when detection is known to remain true as the trace grows.
 
 ### LLMDriver for Adaptive Triggers
 
@@ -195,6 +194,13 @@ assert result, result.summary
 !!! warning
     Construct a new `LLMDriver` per test. Each instance maintains its own conversation state and cannot be reused.
 
+!!! note "Adaptive driver budgets"
+    `LLMDriver` does not stop itself. The default `stop_when="auto"` stops
+    early for stable built-in conditions such as `ToolCalled`, but unknown or
+    stochastic evaluators run to `max_turns` and evaluate the terminal trace
+    once. Use an explicit `stop_when` when that online judgment intentionally
+    defines the end of the attack scenario.
+
 ---
 
 ## Trigger Options
@@ -226,6 +232,7 @@ See [`Attacks.xpia()`][rampart.attacks.Attacks.xpia] for the full API reference.
 | `inject` | `InjectionHandle \| list[InjectionHandle] \| None` | `None` | Prepared injections from `surface.inject()`. `None` for inline XPIA. |
 | `trigger` | `str \| list[str] \| Request \| list[Request] \| PromptDriver` | required | Benign prompt(s) that cause retrieval of injected content. |
 | `evaluator` | [`Evaluator`][rampart.core.evaluator.Evaluator] | required | What attack condition to detect. |
+| `stop_when` | [`Evaluator`][rampart.core.evaluator.Evaluator] `\| "auto" \| None` | `"auto"` | Online stop condition. Auto reuses stable built-in verdict evaluators and exposes their prefix results to adaptive drivers; `None` disables stopping and online feedback. |
 | `max_turns` | `int` | `5` | Maximum prompt-response exchanges; reaching the limit resolves the trace normally. |
 | `event_handlers` | `list[ExecutionEventHandler] \| None` | `None` | Additional lifecycle event handlers. |
 
