@@ -149,12 +149,11 @@ ResponseContains("id_rsa", scope=ResponseScope.CURRENT_TURN)
     `ResponseScope.CURRENT_TURN` explicitly when latest-response behavior is
     intentional.
 
-    This is a preparatory API change. Executions continue to evaluate growing
-    prefixes until final-trace verdict cadence ships. In particular, probes
-    still stop on the first detected prefix, so `ALL_TURNS` and negated
-    `ANY_TURN` cannot yet enforce requirements on prompts that were never
-    sent. Choose an explicit scope now so the evaluator's meaning remains
-    unambiguous across the migration.
+    Probes now evaluate their verdict once over the completed trace, so
+    `ALL_TURNS` and negated `ANY_TURN` apply to every response produced by the
+    probe. Attack execution still evaluates growing prefixes until its cadence
+    migration lands. Choose an explicit scope so the evaluator's meaning is
+    unambiguous in both paths.
 
 ### [`SideEffectOccurred`][rampart.evaluators.side_effect.SideEffectOccurred] — Detect Side Effects
 

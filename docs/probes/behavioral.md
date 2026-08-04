@@ -10,9 +10,10 @@ Use behavioral probes for regression testing: ensure your agent still does the r
 
 1. **Create session** — Open a fresh session with the agent
 2. **Send prompts** — Drive the conversation via a prompt driver
-3. **Evaluate** — Check each turn for the expected behavior. Early-stops on detection.
-4. **Clean up** — Close the session
-5. **Result** — Produce a [`Result`][rampart.core.result.Result] via `resolve_as_probe` semantics
+3. **Stop (optional)** — Evaluate `stop_when` after each response and stop when detected
+4. **Evaluate** — Check the expected behavior once over the completed trace
+5. **Clean up** — Close the session
+6. **Result** — Map the final evaluation using probe semantics
 
 No injection phase.
 
@@ -72,7 +73,7 @@ result = await Probes.behavior(
 ).execute_async(adapter=my_adapter)
 ```
 
-These are the migration forms for complete-transcript probe requirements:
+These forms express complete-transcript probe requirements:
 
 ```python
 from rampart.evaluators import ResponseContains, ResponseScope
@@ -89,11 +90,15 @@ ResponseContains("Paris", scope=ResponseScope.ALL_TURNS)
     `FutureWarning` for multi-turn transcripts. See
     [Temporal Scope](../usage/authoring-tests.md#temporal-scope).
 
-    This release prepares evaluator semantics for final-trace verdicts. Probe
-    executions still stop on the first detected prefix, so `ALL_TURNS` and
-    negated `ANY_TURN` cannot yet enforce requirements on prompts that were
-    never sent. Choose an explicit scope now, but rely on the complete
-    transcript quantifier only after final-trace evaluation lands.
+    Probes do not stop early unless `stop_when` is configured. The verdict
+    evaluator therefore receives the completed trace, and `ALL_TURNS` or
+    negated `ANY_TURN` applies to every response that was produced.
+
+!!! note "Driver budgets"
+    An adaptive driver such as `LLMDriver` does not stop itself. Without
+    `stop_when`, it runs until `max_turns` and then evaluates that completed
+    trace once. Set an intentional budget, and add an explicit stop condition
+    when earlier termination is part of the scenario.
 
 ---
 
@@ -107,6 +112,7 @@ See [`Probes.behavior()`][rampart.probes.Probes.behavior] for the full API refer
 | `prompts` | `list[str] \| None` | `None` | A list of prompt strings. |
 | `driver` | [`PromptDriver`][rampart.core.prompt_driver.PromptDriver] `\| None` | `None` | A pre-built prompt driver. |
 | `evaluator` | [`Evaluator`][rampart.core.evaluator.Evaluator] | required | What behavior to detect. |
+| `stop_when` | [`Evaluator`][rampart.core.evaluator.Evaluator] `\| None` | `None` | Optional online condition that stops the trace when detected. |
 | `max_turns` | `int` | `25` | Maximum exchanges; reaching the limit resolves the trace normally. |
 
 !!! warning
