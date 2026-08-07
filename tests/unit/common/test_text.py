@@ -90,3 +90,45 @@ class TestFormatExceptionForTerminal:
         assert "\x7f" not in formatted
         assert "\x9b" not in formatted
         assert str(caught) == raw_message
+
+    def test_falls_back_when_syntax_error_filename_formatting_raises(self) -> None:
+        class FormattingError(Exception):
+            pass
+
+        class HostileFilename:
+            def __str__(self) -> str:
+                raise FormattingError("hostile\x1b\nmessage")
+
+        FormattingError.__name__ = "Formatting\x1b\nError\x9b"
+        filename = HostileFilename()
+        syntax_error = SyntaxError("bad syntax")
+        syntax_error.filename = filename  # ty: ignore[invalid-assignment]
+
+        formatted = format_exception_for_terminal(syntax_error)
+
+        assert formatted == (
+            r"<traceback unavailable for SyntaxError; "
+            r"Formatting\x1b\x0aError\x9b raised while formatting>"
+        )
+        assert "\x1b" not in formatted
+        assert "\n" not in formatted
+        assert "\x9b" not in formatted
+        assert syntax_error.filename is filename
+
+    @pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+    def test_does_not_swallow_process_control_exceptions(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        error_type: type[BaseException],
+    ) -> None:
+        def _raise_process_control(*args: object, **kwargs: object) -> list[str]:
+            del args, kwargs
+            raise error_type
+
+        monkeypatch.setattr(
+            "rampart.common.text.traceback.format_exception",
+            _raise_process_control,
+        )
+
+        with pytest.raises(error_type):
+            format_exception_for_terminal(RuntimeError("boom"))

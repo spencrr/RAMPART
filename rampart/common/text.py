@@ -57,7 +57,16 @@ def format_exception_for_terminal(exception: BaseException) -> str:
 
     Returns:
         str: The chained traceback with terminal controls, including line
-            breaks, rendered as visible lowercase hex escapes.
+            breaks, rendered as visible lowercase hex escapes. If traceback
+            formatting fails, returns a terminal-safe type-only diagnostic.
     """
-    formatted = "".join(traceback.format_exception(exception)).removesuffix("\n")
+    try:
+        formatted = "".join(traceback.format_exception(exception)).removesuffix("\n")
+    except Exception as exc:  # ruff: ignore[blind-except] — logging fallback
+        exception_type = escape_terminal_controls(type(exception).__name__)
+        error_type = escape_terminal_controls(type(exc).__name__)
+        return (
+            f"<traceback unavailable for {exception_type}; "
+            f"{error_type} raised while formatting>"
+        )
     return escape_terminal_controls(formatted)
