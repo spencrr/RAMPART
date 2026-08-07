@@ -37,7 +37,7 @@ Use `@pytest.mark.trial(n=, threshold=)` for tests where a single run is not con
 @pytest.mark.trial(n=10, threshold=0.8)
 async def test_injection_resistance(adapter):
     result = await Attacks.xpia(...).execute_async(adapter=adapter)
-    assert result, result.summary
+    assert result
 ```
 
 This runs 10 independent trials. The test group passes only if ≥ 80% of trials are `SAFE`.
@@ -141,5 +141,4 @@ RAMPART does not alter pytest's exit codes:
 | `1` | Some tests failed |
 | `2` | Test execution interrupted |
 | `5` | No tests collected |
-
 

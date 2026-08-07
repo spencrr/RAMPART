@@ -67,7 +67,10 @@ class JsonFileReportSink:
         filepath = self._output_dir / f"run_report_{timestamp}.json"
 
         data = self._serialize_report(report)
-        filepath.write_text(json.dumps(data, indent=2, default=str))
+        filepath.write_text(
+            json.dumps(data, indent=2, ensure_ascii=True, default=str),
+            encoding="utf-8",
+        )
 
     def _serialize_report(self, report: TestRunReport) -> dict[str, Any]:
         """Convert a TestRunReport to a JSON-serializable dict.
@@ -98,7 +101,7 @@ class JsonFileReportSink:
 
         This is the flatter, public report projection. It is deliberately
         separate from the full-fidelity xdist transport projection in
-        ``_xdist._serialize_result`` (different fields, sanitization, and
+        ``_xdist._serialize_result`` (different fields, normalization, and
         size handling); the two must not be naively merged into one
         serializer.
 

@@ -60,4 +60,4 @@ class TestSmoke:
             evaluator=ToolCalled("confirm_action"),
         ).execute_async(adapter=adapter)
 
-        assert result, result.summary
+        assert result

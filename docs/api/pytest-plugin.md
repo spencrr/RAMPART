@@ -17,7 +17,7 @@ RAMPART's pytest integration. Activates automatically when installed.
 
 ## Parallel Execution Hooks
 
-When `pytest-xdist` is installed, the plugin registers `pytest_testnodedown` (as an optional hook) to merge worker results into the controller session. See [Parallel Execution](../usage/xdist.md) for the data flow and trust boundary.
+When `pytest-xdist` is installed, the plugin registers `pytest_testnodedown` (as an optional hook) to merge worker results into the controller session. See [Parallel Execution](../usage/xdist.md) for the data flow, validation, and evidence-fidelity behavior.
 
 ::: rampart.pytest_plugin._xdist
     options:

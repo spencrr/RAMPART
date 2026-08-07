@@ -9,11 +9,10 @@ logic for running RAMPART under pytest-xdist. Workers serialize their
 worker payloads in ``pytest_testnodedown`` and emits a single unified
 report at session end.
 
-Trust boundary: worker payloads may contain attacker-controlled
-content (agent responses, payload text). Serialization is strictly
-JSON-safe primitives; deserialization validates schema version,
-enum values, and metadata depth; ANSI escapes are stripped from free
-text as defense-in-depth.
+Worker payloads use JSON-safe primitives. Deserialization validates schema
+version, enum values, and metadata depth while preserving textual evidence.
+Terminal presentation safety is enforced only at terminal and logging
+boundaries.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from rampart.common.deprecation import emit_deprecation_warning
-from rampart.common.text import strip_ansi as _strip_ansi_impl
+from rampart.common.text import escape_terminal_controls
 from rampart.core.result import (
     HarmCategory,
     InjectionRecord,
@@ -183,26 +182,10 @@ def _size_limit(*, config: pytest.Config) -> int:
     return parsed
 
 
-def _strip_ansi(*, text: str) -> str:
-    """Remove ANSI escape sequences and control bytes from free-form text.
-
-    Delegates to :func:`rampart.common.text.strip_ansi` so the xdist
-    transport and the terminal summary share one hardened sanitizer.
-
-    Args:
-        text (str): The text to sanitize.
-
-    Returns:
-        str: Text with escape sequences and control bytes removed.
-    """
-    return _strip_ansi_impl(text)
-
-
-def _sanitize(  # ruff: ignore[too-many-return-statements]
+def _to_json_safe(  # ruff: ignore[too-many-return-statements]
     *,
     value: Any,  # ruff: ignore[any-type]
     depth: int = 0,
-    strip_ansi: bool = False,
 ) -> Any:  # ruff: ignore[any-type]
     """Coerce a value to a JSON-safe form.
 
@@ -210,15 +193,9 @@ def _sanitize(  # ruff: ignore[too-many-return-statements]
     (str, int, bool, NoneType, finite float, dict, list, tuple) are
     coerced via ``repr()``. NaN/Inf floats are coerced to ``None``.
 
-    When ``strip_ansi=True`` (set on the deserialization path), ANSI
-    escape sequences are removed from every nested string value so
-    that attacker-controlled escapes inside ``arguments``, ``details``,
-    and ``metadata`` cannot reach terminal renderers.
-
     Args:
-        value (Any): The value to sanitize.
+        value (Any): The value to convert.
         depth (int): Current recursion depth (internal).
-        strip_ansi (bool): If True, strip ANSI escapes from strings.
 
     Returns:
         Any: A JSON-safe representation.
@@ -228,26 +205,25 @@ def _sanitize(  # ruff: ignore[too-many-return-statements]
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return _strip_ansi(text=value) if strip_ansi else value
+        return value
     if isinstance(value, int):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, dict):
         return {
-            str(k): _sanitize(value=v, depth=depth + 1, strip_ansi=strip_ansi)
+            str(k): _to_json_safe(value=v, depth=depth + 1)
             for k, v in cast("dict[Any, Any]", value).items()
         }
     if isinstance(value, list | tuple):
         return [
-            _sanitize(value=v, depth=depth + 1, strip_ansi=strip_ansi)
-            for v in cast("list[Any]", value)
+            _to_json_safe(value=v, depth=depth + 1) for v in cast("list[Any]", value)
         ]
     return repr(value)
 
 
 def _is_json_passthrough(value: Any) -> bool:  # ruff: ignore[any-type]
-    """True if a value would pass through ``_sanitize`` unchanged.
+    """True if a value would pass through ``_to_json_safe`` unchanged.
 
     Returns:
         bool: True if ``value`` is JSON-safe as-is.
@@ -261,44 +237,44 @@ def _is_json_passthrough(value: Any) -> bool:  # ruff: ignore[any-type]
     return False
 
 
-def _sanitize_metadata(
+def _to_json_safe_metadata(
     *,
     metadata: dict[str, Any],
     nodeid: str,
     context: str,
 ) -> dict[str, Any]:
-    """Sanitize a metadata dict; log keys that required coercion.
+    """Convert a metadata dict to JSON-safe values and log coercions.
 
     Logs at warning level with the originating nodeid and the list of
     keys whose values were coerced so users can diagnose lossy fields
     without polluting the user-visible metadata payload.
 
     Args:
-        metadata (dict[str, Any]): The metadata to sanitize.
+        metadata (dict[str, Any]): The metadata to convert.
         nodeid (str): Originating test nodeid (for log context).
         context (str): Source context (e.g., ``"result"``, ``"payload"``).
 
     Returns:
-        dict[str, Any]: Sanitized metadata dict.
+        dict[str, Any]: JSON-safe metadata dict.
     """
-    sanitized: dict[str, Any] = {}
+    converted: dict[str, Any] = {}
     coerced: list[str] = []
     for key, value in metadata.items():
         key_str = str(key)
-        sanitized[key_str] = _sanitize(value=value)
+        converted[key_str] = _to_json_safe(value=value)
         passthrough = _is_json_passthrough(value)
         collection = isinstance(value, dict | list | tuple)
         if not passthrough and not collection:
             coerced.append(key_str)
     if coerced:
         logger.warning(
-            "Sanitized %d non-serializable metadata key(s) for %s in %s: %s",
+            "Converted %d non-serializable metadata key(s) for %s in %s: %s",
             len(coerced),
-            nodeid,
+            escape_terminal_controls(nodeid),
             context,
             coerced,
         )
-    return sanitized
+    return converted
 
 
 def _safe_float(*, value: float) -> float | None:
@@ -341,7 +317,7 @@ def _serialize_tool_call(*, tool_call: ToolCall, nodeid: str) -> dict[str, Any]:
     """
     return {
         "name": tool_call.name,
-        "arguments": _sanitize_metadata(
+        "arguments": _to_json_safe_metadata(
             metadata=tool_call.arguments,
             nodeid=nodeid,
             context="tool_call.arguments",
@@ -363,7 +339,7 @@ def _serialize_side_effect(
     """
     return {
         "kind": side_effect.kind,
-        "details": _sanitize_metadata(
+        "details": _to_json_safe_metadata(
             metadata=side_effect.details,
             nodeid=nodeid,
             context="side_effect.details",
@@ -385,7 +361,7 @@ def _serialize_payload(*, payload: Payload, nodeid: str) -> dict[str, Any]:
         "id": payload.id,
         "format": payload.format.value,
         "artifact": str(payload.artifact) if payload.artifact is not None else None,
-        "metadata": _sanitize_metadata(
+        "metadata": _to_json_safe_metadata(
             metadata=payload.metadata,
             nodeid=nodeid,
             context="payload.metadata",
@@ -423,7 +399,7 @@ def _serialize_response(*, response: Response, nodeid: str) -> dict[str, Any]:
             _serialize_side_effect(side_effect=se, nodeid=nodeid)
             for se in response.side_effects
         ],
-        "metadata": _sanitize_metadata(
+        "metadata": _to_json_safe_metadata(
             metadata=response.metadata,
             nodeid=nodeid,
             context="response.metadata",
@@ -470,7 +446,7 @@ def _serialize_result(*, result: Result, nodeid: str) -> dict[str, Any]:
     to a ``Result`` via :func:`_deserialize_result`, and intentionally
     differs from the flatter public report shape produced by
     ``JsonFileReportSink._serialize_result``. The two projections are
-    deliberately separate (different fields, sanitization, and size
+    deliberately separate (different fields, normalization, and size
     handling) and must not be naively merged into one serializer.
 
     Returns:
@@ -490,7 +466,7 @@ def _serialize_result(*, result: Result, nodeid: str) -> dict[str, Any]:
         "injections": [
             _serialize_injection_record(injection=i) for i in result.injections
         ],
-        "metadata": _sanitize_metadata(
+        "metadata": _to_json_safe_metadata(
             metadata=result.metadata,
             nodeid=nodeid,
             context="result.metadata",
@@ -683,8 +659,8 @@ def _deserialize_eval_result(*, data: object) -> EvalResult | None:
         "list[Any]",
         raw_evidence if isinstance(raw_evidence, list) else [],
     )
-    evidence: list[str] = [_strip_ansi(text=str(e)) for e in evidence_items]
-    rationale = _strip_ansi(text=str(typed.get("rationale", "")))
+    evidence: list[str] = [str(e) for e in evidence_items]
+    rationale = str(typed.get("rationale", ""))
     return EvalResult(
         outcome=outcome,
         confidence=confidence,
@@ -707,15 +683,12 @@ def _deserialize_tool_call(*, data: object) -> ToolCall:
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_args = typed.get("arguments", {})
-    arguments = _sanitize(
-        value=raw_args if isinstance(raw_args, dict) else {},
-        strip_ansi=True,
-    )
+    arguments = _to_json_safe(value=raw_args if isinstance(raw_args, dict) else {})
     raw_result = typed.get("result")
     return ToolCall(
         name=str(typed.get("name", "")),
         arguments=cast("dict[str, Any]", arguments),
-        result=_strip_ansi(text=str(raw_result)) if raw_result is not None else None,
+        result=str(raw_result) if raw_result is not None else None,
         timestamp=_deserialize_datetime(value=typed.get("timestamp")),
     )
 
@@ -734,10 +707,7 @@ def _deserialize_side_effect(*, data: object) -> SideEffect:
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_details = typed.get("details", {})
-    details = _sanitize(
-        value=raw_details if isinstance(raw_details, dict) else {},
-        strip_ansi=True,
-    )
+    details = _to_json_safe(value=raw_details if isinstance(raw_details, dict) else {})
     return SideEffect(
         kind=str(typed.get("kind", "")),
         details=cast("dict[str, Any]", details),
@@ -763,9 +733,8 @@ def _deserialize_payload(*, data: object) -> Payload:
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_metadata = typed.get("metadata", {})
-    metadata = _sanitize(
+    metadata = _to_json_safe(
         value=raw_metadata if isinstance(raw_metadata, dict) else {},
-        strip_ansi=True,
     )
     metadata_dict = cast("dict[str, Any]", metadata)
     original_format = str(typed.get("format", PayloadFormat.TEXT.value))
@@ -778,7 +747,7 @@ def _deserialize_payload(*, data: object) -> Payload:
             str(original_artifact),
         )
     return Payload(
-        content=_strip_ansi(text=str(typed.get("content", ""))),
+        content=str(typed.get("content", "")),
         id=str(typed.get("id", "")),
         format=PayloadFormat.TEXT,
         artifact=None,
@@ -800,9 +769,7 @@ def _deserialize_request(*, data: object) -> Request:
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_prompt = typed.get("prompt")
-    prompt: str | None = (
-        _strip_ansi(text=str(raw_prompt)) if raw_prompt is not None else None
-    )
+    prompt: str | None = str(raw_prompt) if raw_prompt is not None else None
     raw_attachments = typed.get("attachments", [])
     attachment_items = cast(
         "list[Any]",
@@ -832,12 +799,11 @@ def _deserialize_response(*, data: object) -> Response:
     raw_tcs = typed.get("tool_calls", [])
     raw_ses = typed.get("side_effects", [])
     raw_metadata = typed.get("metadata", {})
-    metadata = _sanitize(
+    metadata = _to_json_safe(
         value=raw_metadata if isinstance(raw_metadata, dict) else {},
-        strip_ansi=True,
     )
     return Response(
-        text=_strip_ansi(text=str(typed.get("text", ""))),
+        text=str(typed.get("text", "")),
         tool_calls=[
             _deserialize_tool_call(data=tc)
             for tc in cast("list[Any]", raw_tcs if isinstance(raw_tcs, list) else [])
@@ -870,7 +836,7 @@ def _deserialize_turn(*, data: object) -> Turn:
         eval_result=_deserialize_eval_result(data=typed.get("eval_result")),
         turn_number=int(raw_turn_number) if isinstance(raw_turn_number, int) else 0,
         timestamp=_deserialize_datetime(value=typed.get("timestamp")),
-        driver_reasoning=_strip_ansi(text=str(typed.get("driver_reasoning", ""))),
+        driver_reasoning=str(typed.get("driver_reasoning", "")),
     )
 
 
@@ -910,9 +876,8 @@ def _deserialize_result(*, data: object) -> Result:
     raw_turns = typed.get("turns", [])
     raw_injections = typed.get("injections", [])
     raw_metadata = typed.get("metadata", {})
-    metadata = _sanitize(
+    metadata = _to_json_safe(
         value=raw_metadata if isinstance(raw_metadata, dict) else {},
-        strip_ansi=True,
     )
     raw_duration = typed.get("duration_seconds", 0.0)
     duration = (
@@ -922,7 +887,7 @@ def _deserialize_result(*, data: object) -> Result:
     )
     return Result(
         status=_deserialize_safety_status(value=typed.get("status")),
-        summary=_strip_ansi(text=str(typed.get("summary", ""))),
+        summary=str(typed.get("summary", "")),
         turns=[
             _deserialize_turn(data=t)
             for t in cast("list[Any]", raw_turns if isinstance(raw_turns, list) else [])
@@ -1110,8 +1075,8 @@ def _safe_deserialize_trial_specs(
     except WorkerOutputError as exc:
         logger.warning(
             "Failed to deserialize trial specs from worker %s: %s",
-            worker_id_str,
-            exc,
+            escape_terminal_controls(worker_id_str),
+            escape_terminal_controls(str(exc)),
         )
         return {}
 
@@ -1156,11 +1121,12 @@ def handle_testnodedown(
     """
     worker_id = getattr(node, "gateway", None)
     worker_id_str = str(getattr(worker_id, "id", node)) if worker_id else str(node)
+    display_worker_id = escape_terminal_controls(worker_id_str)
     if error is not None:
         logger.warning(
             "Worker %s reported shutdown error; report will be incomplete: %s",
-            worker_id_str,
-            error,
+            display_worker_id,
+            escape_terminal_controls(str(error)),
         )
         session.mark_incomplete(reason=f"worker {worker_id_str} error: {error}")
         return
@@ -1168,7 +1134,7 @@ def handle_testnodedown(
     if not isinstance(workeroutput, dict):
         logger.warning(
             "Worker %s exited without workeroutput; report will be incomplete.",
-            worker_id_str,
+            display_worker_id,
         )
         session.mark_incomplete(reason=f"worker {worker_id_str} missing workeroutput")
         return
@@ -1176,7 +1142,7 @@ def handle_testnodedown(
     if payload is None:
         logger.warning(
             "Worker %s did not produce RAMPART output; report will be incomplete.",
-            worker_id_str,
+            display_worker_id,
         )
         session.mark_incomplete(reason=f"worker {worker_id_str} missing RAMPART output")
         return
@@ -1187,7 +1153,7 @@ def handle_testnodedown(
         logger.error(
             "Worker %s payload was truncated due to size cap; "
             "report will be incomplete.",
-            worker_id_str,
+            display_worker_id,
         )
         session.mark_incomplete(
             reason=f"worker {worker_id_str} payload truncated (size cap)",
@@ -1198,7 +1164,7 @@ def handle_testnodedown(
     except WorkerOutputError as exc:
         logger.exception(
             "Failed to deserialize worker %s output; report will be incomplete.",
-            worker_id_str,
+            display_worker_id,
         )
         session.mark_incomplete(
             reason=f"worker {worker_id_str} deserialization failed: {exc}",
@@ -1218,7 +1184,7 @@ def handle_testnodedown(
     logger.info(
         "Merged %d result group(s) from worker %s.",
         len(results_by_nodeid),
-        worker_id_str,
+        display_worker_id,
     )
 
 

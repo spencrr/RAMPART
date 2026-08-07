@@ -6,6 +6,10 @@
 Result, SafetyStatus, HarmCategory, resolve functions.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import pytest
 
 from rampart.core.result import (
@@ -24,6 +28,11 @@ from rampart.core.types import (
     Response,
     Turn,
 )
+
+if TYPE_CHECKING:
+    from _pytest.pytester import Pytester
+
+pytest_plugins = ["pytester"]
 
 
 def _er(outcome: EvalOutcome) -> EvalResult:
@@ -88,14 +97,14 @@ class TestResult:
 
     def test_assert_safe_pattern(self) -> None:
         safe_result = Result(status=SafetyStatus.SAFE, summary="ok")
-        assert safe_result, safe_result.summary
+        assert safe_result
 
         unsafe_result = Result(
             status=SafetyStatus.UNSAFE,
             summary="attack detected",
         )
         with pytest.raises(AssertionError):
-            assert unsafe_result, unsafe_result.summary
+            assert unsafe_result
 
     def test_repr(self) -> None:
         r = Result(status=SafetyStatus.SAFE, summary="Agent defended")
@@ -130,6 +139,55 @@ class TestResult:
             harm_category="custom_product_risk",
         )
         assert r.harm_category == "custom_product_risk"
+
+
+class TestResultAssertionRendering:
+    def test_bare_assert_does_not_emit_raw_controls(
+        self,
+        pytester: Pytester,
+    ) -> None:
+        pytester.makepyfile(
+            test_result_assertion="""
+            from rampart.core.result import Result, SafetyStatus
+
+
+            def test_result():
+                summary = (
+                    "ESC"
+                    + chr(0x1B)
+                    + "[31mNUL"
+                    + chr(0)
+                    + "TAB"
+                    + chr(9)
+                    + "LF"
+                    + chr(10)
+                    + "CR"
+                    + chr(13)
+                    + "DEL"
+                    + chr(0x7F)
+                    + "CSI"
+                    + chr(0x9B)
+                )
+                result = Result(
+                    status=SafetyStatus.UNSAFE,
+                    summary=summary,
+                )
+                assert result
+            """,
+        )
+
+        run = pytester.runpytest("--color=no", "--tb=short", "-q")
+
+        run.assert_outcomes(failed=1)
+        explanation = next(
+            line
+            for line in run.outlines
+            if line.startswith("E   AssertionError: assert Result(")
+        )
+        assert explanation == (
+            "E   AssertionError: assert Result(safe=False, status=unsafe, "
+            r"summary='ESC\x1b[31mNUL\x00TAB\tLF\nCR\rDEL\x7fCSI\x9b')"
+        )
 
 
 class TestResultEvalResultsProperty:

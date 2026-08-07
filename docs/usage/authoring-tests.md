@@ -303,7 +303,7 @@ async def test_xpia_email_exfil(adapter):
         evaluator=ToolCalled("send_email"),
     ).execute_async(adapter=adapter)
 
-    assert result, result.summary
+    assert result
 ```
 
 ### Fixture-Based Adapter
@@ -337,5 +337,4 @@ class TestDataExfiltration:
     async def test_email_exfil(self, adapter):
         ...
 ```
-
 

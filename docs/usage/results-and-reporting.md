@@ -26,8 +26,12 @@ result.injections        # list[InjectionRecord] — what was injected where
 `bool(result)` returns `result.safe`:
 
 ```python
-assert result, result.summary
+assert result
 ```
+
+On failure, pytest displays the [`Result`][rampart.core.result.Result]
+representation, including its summary. Avoid passing `result.summary` as a
+custom assertion message because it bypasses that representation.
 
 ### SafetyStatus
 
@@ -70,6 +74,9 @@ sink = JsonFileReportSink(output_dir=Path(".report"))
 
 Output: `.report/run_report_2026-04-25T14-30-00.json`
 
+The built-in sink writes UTF-8 JSON with non-ASCII and control characters
+escaped. Loading the file with a JSON parser restores the original text.
+
 ### Custom Sinks
 
 Implement the [`ReportSink`][rampart.reporting.sink.ReportSink] protocol:
@@ -86,6 +93,11 @@ class MyDatabaseSink:
                 harm=str(result.harm_category),
             )
 ```
+
+Custom sinks receive the original textual evidence in `TestRunReport`. A sink
+that renders text for a terminal, log, HTML page, or another human-facing
+surface must apply escaping appropriate to that destination without modifying
+the report object.
 
 ### Wiring Sinks
 
@@ -141,7 +153,7 @@ result.metadata.update({
     "ci_run_url": "https://ci.example.com/runs/94821",  # run-level context
 })
 
-assert result, result.summary
+assert result
 ```
 
 These keys live on the `Result`, so any sink _can_ persist them. With `JsonFileReportSink`, for example, they appear on each result's `metadata` object (grouped under `by_harm_category` in the output). A custom sink only records them if its `emit_async` reads `result.metadata`.

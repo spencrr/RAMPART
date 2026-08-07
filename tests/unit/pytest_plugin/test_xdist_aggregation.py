@@ -44,6 +44,53 @@ def rampart_sinks():
     return [JsonFileReportSink(output_dir=_OUT_DIR)]
 """
 
+_EVIDENCE_CONFTEST = """\
+import json
+from pathlib import Path
+
+
+_OUT_PATH = Path("evidence_snapshot.json").absolute()
+
+
+class SnapshotSink:
+    async def emit_async(self, *, report):
+        result = report.results[0]
+        turn = result.turns[0]
+        response = turn.response
+        snapshot = {
+            "summary": result.summary,
+            "harm_category": str(result.harm_category),
+            "strategy": result.strategy,
+            "nodeid": result.metadata["_pytest_nodeid"],
+            "test_name": result.metadata["_pytest_test_name"],
+            "result_metadata": result.metadata["user"],
+            "prompt": turn.request.prompt,
+            "payload_content": turn.request.attachments[0].content,
+            "payload_id": turn.request.attachments[0].id,
+            "payload_metadata": turn.request.attachments[0].metadata,
+            "response_text": response.text,
+            "response_metadata": response.metadata,
+            "tool_name": response.tool_calls[0].name,
+            "tool_arguments": response.tool_calls[0].arguments,
+            "tool_result": response.tool_calls[0].result,
+            "side_effect_kind": response.side_effects[0].kind,
+            "side_effect_details": response.side_effects[0].details,
+            "eval_evidence": turn.eval_result.evidence,
+            "eval_rationale": turn.eval_result.rationale,
+            "driver_reasoning": turn.driver_reasoning,
+            "injection_payload_id": result.injections[0].payload_id,
+            "injection_surface_name": result.injections[0].surface_name,
+        }
+        _OUT_PATH.write_text(
+            json.dumps(snapshot, ensure_ascii=True),
+            encoding="utf-8",
+        )
+
+
+def pytest_rampart_sinks(config):
+    return [SnapshotSink()]
+"""
+
 
 # Each ``pytester`` child session is configuration-isolated from the repository's
 # ``pyproject.toml``, so pytest-asyncio reads an empty
@@ -129,6 +176,11 @@ def _setup_simple_tests(configured_pytester: Pytester) -> None:
     )
 
 
+def _load_evidence_snapshot(configured_pytester: Pytester) -> dict[str, Any]:
+    path = configured_pytester.path / "evidence_snapshot.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 class TestSingleProcessBaseline:
     def test_baseline_emits_one_report(self, configured_pytester: Pytester) -> None:
         _setup_simple_tests(configured_pytester)
@@ -171,6 +223,111 @@ class TestXdistConsolidation:
         assert report["population_summary"]["total_runs"] == 4
         assert report["population_summary"]["safe_count"] == 3
         assert report["population_summary"]["unsafe_count"] == 1
+
+
+class TestEvidenceParity:
+    def test_serial_and_xdist_preserve_identical_textual_evidence(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makeconftest(_EVIDENCE_CONFTEST)
+        configured_pytester.makepyfile(
+            test_evidence=r"""
+            import pytest
+
+            from rampart import record_result
+            from rampart.core.result import InjectionRecord, Result, SafetyStatus
+            from rampart.core.types import (
+                EvalOutcome,
+                EvalResult,
+                Payload,
+                Request,
+                Response,
+                SideEffect,
+                ToolCall,
+                Turn,
+            )
+
+
+            def _text(label):
+                return f"{label}\x1b[31m\t\n\r\x7f\x9b雪"
+
+
+            @pytest.mark.harm(_text("category"))
+            def test_evidence():
+                payload = Payload(
+                    content=_text("payload-content"),
+                    id=_text("payload-id"),
+                    metadata={"nested": _text("payload-metadata")},
+                )
+                response = Response(
+                    text=_text("response"),
+                    tool_calls=[
+                        ToolCall(
+                            name=_text("tool-name"),
+                            arguments={"nested": _text("tool-arguments")},
+                            result=_text("tool-result"),
+                        ),
+                    ],
+                    side_effects=[
+                        SideEffect(
+                            kind=_text("side-effect-kind"),
+                            details={"nested": _text("side-effect-details")},
+                        ),
+                    ],
+                    metadata={"nested": _text("response-metadata")},
+                )
+                turn = Turn(
+                    request=Request(prompt=_text("prompt"), attachments=[payload]),
+                    response=response,
+                    eval_result=EvalResult(
+                        outcome=EvalOutcome.DETECTED,
+                        evidence=[_text("eval-evidence")],
+                        rationale=_text("eval-rationale"),
+                    ),
+                    driver_reasoning=_text("driver-reasoning"),
+                )
+                result = Result(
+                    status=SafetyStatus.SAFE,
+                    summary=_text("summary"),
+                    turns=[turn],
+                    harm_category=_text("result-category"),
+                    strategy=_text("strategy"),
+                    injections=[
+                        InjectionRecord(
+                            payload_id=_text("injection-payload-id"),
+                            surface_name=_text("injection-surface"),
+                        ),
+                    ],
+                    metadata={"user": {"nested": _text("result-metadata")}},
+                )
+                record_result(result)
+                assert result
+            """,
+        )
+
+        serial_run = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "--color=no",
+            "-q",
+        )
+        serial_run.assert_outcomes(passed=1)
+        serial_snapshot = _load_evidence_snapshot(configured_pytester)
+        (configured_pytester.path / "evidence_snapshot.json").unlink()
+
+        xdist_run = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "--color=no",
+            "-q",
+            "-n",
+            "2",
+        )
+        xdist_run.assert_outcomes(passed=1)
+        xdist_snapshot = _load_evidence_snapshot(configured_pytester)
+
+        assert xdist_snapshot == serial_snapshot
 
 
 class TestXdistTrialAggregation:

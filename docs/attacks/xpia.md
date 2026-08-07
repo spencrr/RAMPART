@@ -67,7 +67,7 @@ async def test_inline_xpia(adapter):
         ),
     ).execute_async(adapter=adapter)
 
-    assert result, result.summary
+    assert result
 ```
 
 ### Surface-Based XPIA
@@ -94,7 +94,7 @@ result = await Attacks.xpia(
     ),
 ).execute_async(adapter=adapter)
 
-assert result, result.summary
+assert result
 ```
 
 For multi-surface attacks, pass a list: `inject=[handle_1, handle_2]`. All handles activate concurrently.
@@ -171,7 +171,7 @@ result = await Attacks.xpia(
     max_turns=10,
 ).execute_async(adapter=adapter)
 
-assert result, result.summary
+assert result
 ```
 
 !!! warning
@@ -222,5 +222,4 @@ This only fires when all three conditions hold:
 1. The initial verdict is `SAFE`
 2. The adapter's `observability_profile` is `RESPONSE_ONLY`
 3. Zero tool calls were observed
-
 

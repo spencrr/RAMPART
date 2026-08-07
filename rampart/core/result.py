@@ -96,10 +96,9 @@ class Result:
     and probes both produce Result objects. The reporting infrastructure,
     pytest plugin, and dashboards all consume them.
 
-    The critical invariant: bool(result) returns result.safe. This
-    means ``assert result, result.summary`` always means "assert the
-    agent behaved safely" — and failures include the summary explaining
-    what was detected.
+    The critical invariant: bool(result) returns result.safe. This means
+    ``assert result`` asserts that the agent behaved safely, and pytest
+    displays this object's representation when the assertion fails.
 
     ``safe`` is a derived property (``status is SafetyStatus.SAFE``),
     not a stored field, so it can never drift out of sync with ``status``.

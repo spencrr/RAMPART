@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -29,7 +30,6 @@ from rampart.pytest_plugin.plugin import (
     _has_sink_hook_impl,
     _resolve_hook_sinks,
     _resolve_trial_n,
-    _sanitize_for_terminal,
     _write_result_line,
     _write_trial_group_lines,
     pytest_collection_modifyitems,
@@ -39,7 +39,7 @@ from rampart.pytest_plugin.plugin import (
     pytest_terminal_summary,
     pytest_unconfigure,
 )
-from rampart.reporting.sink import ReportSink
+from rampart.reporting.sink import ReportSink, TestRunReport
 
 if TYPE_CHECKING:
     from _pytest.terminal import TerminalReporter
@@ -463,30 +463,6 @@ class TestResolveTrialN:
             _resolve_trial_n(marker)
 
 
-class TestSanitizeForTerminal:
-    """ANSI escape sequences are stripped from terminal output."""
-
-    def test_strips_color_codes(self) -> None:
-        text = "\x1b[31mRED TEXT\x1b[0m"
-        assert _sanitize_for_terminal(text) == "RED TEXT"
-
-    def test_strips_cursor_movement(self) -> None:
-        text = "\x1b[2Ahidden"
-        assert _sanitize_for_terminal(text) == "hidden"
-
-    def test_passthrough_clean_text(self) -> None:
-        text = "normal summary line"
-        assert _sanitize_for_terminal(text) == "normal summary line"
-
-    def test_strips_clear_screen(self) -> None:
-        text = "\x1b[2J\x1b[Hinjected"
-        assert _sanitize_for_terminal(text) == "injected"
-
-    def test_strips_osc_hyperlink(self) -> None:
-        text = "\x1b]8;;http://evil\x07link\x1b]8;;\x07"
-        assert _sanitize_for_terminal(text) == "link"
-
-
 class TestWriteResultLine:
     """_write_result_line writes formatted status, summary, and observability level."""
 
@@ -534,19 +510,44 @@ class TestWriteResultLine:
             "  PASS  test_exfil -- SAFE (tool_only)",
         )
 
-    def test_ansi_stripped_from_summary(self) -> None:
+    def test_controls_escaped_in_summary(self) -> None:
         reporter = MagicMock()
         result = Result(
             status=SafetyStatus.SAFE,
-            summary="\x1b[31mevil\x1b[0m",
+            summary="\x1b[31mevil\x1b[0m\tline\nnext\r\x7f\x9b",
         )
         _write_result_line(
             terminalreporter=cast("TerminalReporter", reporter),
             result=result,
         )
         line = reporter.write_line.call_args[0][0]
-        assert "evil" in line
+        assert r"\x1b[31mevil\x1b[0m\x09line\x0anext\x0d\x7f\x9b" in line
         assert "\x1b" not in line
+        assert "\n" not in line
+
+    def test_controls_escaped_in_test_name(self) -> None:
+        reporter = MagicMock()
+        result = Result(status=SafetyStatus.SAFE, summary="ok")
+        _write_result_line(
+            terminalreporter=cast("TerminalReporter", reporter),
+            result=result,
+            test_name="test\x1b\nname\x9b",
+        )
+        line = reporter.write_line.call_args[0][0]
+        assert r"test\x1b\x0aname\x9b" in line
+        assert "\x1b" not in line
+        assert "\n" not in line
+
+    def test_literal_escape_text_is_not_double_escaped(self) -> None:
+        reporter = MagicMock()
+        result = Result(status=SafetyStatus.SAFE, summary=r"\x1b[31m")
+        _write_result_line(
+            terminalreporter=cast("TerminalReporter", reporter),
+            result=result,
+        )
+        line = reporter.write_line.call_args[0][0]
+        assert r"\x1b[31m" in line
+        assert r"\\x1b" not in line
 
 
 class TestTerminalSummary:
@@ -607,7 +608,8 @@ class TestTerminalSummary:
         from rampart.pytest_plugin.plugin import _rampart_key
 
         session = RampartSession()
-        session.mark_incomplete(reason="worker gw0 crashed \x1b[31mred")
+        reason = "worker gw0 crashed \x1b[31mred\nnext\x9b"
+        session.mark_incomplete(reason=reason)
         config.stash[_rampart_key] = session
         pytest_terminal_summary(terminalreporter=reporter, exitstatus=0, config=config)
 
@@ -620,6 +622,9 @@ class TestTerminalSummary:
         ]
         assert reason_args
         assert all("\x1b" not in arg for arg in reason_args)
+        assert all("\n" not in arg for arg in reason_args)
+        assert any(r"\x1b[31mred\x0anext\x9b" in arg for arg in reason_args)
+        assert session.build_report().metadata["incomplete_reasons"] == [reason]
 
     def test_writes_summary_header(self) -> None:
         reporter = MagicMock()
@@ -652,6 +657,37 @@ class TestTerminalSummary:
             c for c in reporter.write_line.call_args_list if "Population:" in str(c)
         ]
         assert len(population_calls) == 1
+
+    def test_controls_escaped_in_custom_harm_category(self) -> None:
+        reporter = MagicMock()
+        config = MagicMock()
+        config.stash = _StashStub()
+        from rampart.pytest_plugin.plugin import _rampart_key
+
+        session = RampartSession()
+        collector = ResultCollector()
+        collector.record(
+            result=Result(
+                status=SafetyStatus.SAFE,
+                summary="ok",
+                harm_category="custom\x1b\nrisk\x9b",
+            ),
+        )
+        node = MagicMock()
+        node.nodeid = "test_file.py::test_category"
+        session.absorb(node=node, collector=collector)
+        config.stash[_rampart_key] = session
+
+        pytest_terminal_summary(terminalreporter=reporter, exitstatus=0, config=config)
+
+        heading = next(
+            call.args[0]
+            for call in reporter.write_line.call_args_list
+            if "CUSTOM" in call.args[0]
+        )
+        assert r"CUSTOM\x1b\x0aRISK\x9b" in heading
+        assert "\x1b" not in heading
+        assert heading.count("\n") == 1
 
 
 class TestRampartSessionSinks:
@@ -822,11 +858,39 @@ class TestTrialGroupRendering:
         )
         reporter.write_line.assert_not_called()
 
+    def test_controls_escaped_in_trial_base_name(self) -> None:
+        session = RampartSession()
+        clone_nodeid = "test_file.py::test\x1b\ntrial\x9b[trial-0]"
+        collector = ResultCollector()
+        collector.record(result=Result(status=SafetyStatus.SAFE, summary="ok"))
+        node = MagicMock()
+        node.nodeid = clone_nodeid
+        session.absorb(node=node, collector=collector)
+        session.record_trial_group(
+            base_nodeid="test_file.py::test\x1b\ntrial\x9b",
+            clone_nodeids=[clone_nodeid],
+            threshold=1.0,
+        )
+        reporter = MagicMock()
+
+        _write_trial_group_lines(
+            terminalreporter=cast("TerminalReporter", reporter),
+            rampart_session=session,
+        )
+
+        line = reporter.write_line.call_args[0][0]
+        assert r"test\x1b\x0atrial\x9b" in line
+        assert "\x1b" not in line
+        assert "\n" not in line
+
 
 class TestEvaluateGates:
     """Gate evaluation logs when threshold is exceeded."""
 
-    def test_logs_when_rate_exceeds_threshold(self) -> None:
+    def test_logs_when_rate_exceeds_threshold(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         session = RampartSession()
         items: list[Any] = [MagicMock() for _ in range(4)]
         for idx, item in enumerate(items):
@@ -842,12 +906,18 @@ class TestEvaluateGates:
             session.absorb(node=item, collector=collector)
 
         session.record_trial_group(
-            base_nodeid="test.py::test_gate",
+            base_nodeid="test.py::test\x1b\ngate\x9b",
             clone_nodeids=[item.nodeid for item in items],
             threshold=0.1,
         )
 
-        _evaluate_gates(rampart_session=session)
+        with caplog.at_level(logging.INFO):
+            _evaluate_gates(rampart_session=session)
+
+        message = caplog.records[-1].getMessage()
+        assert r"test.py::test\x1b\x0agate\x9b" in message
+        assert "\x1b" not in message
+        assert "\n" not in message
 
 
 class TestEmitSinks:
@@ -871,6 +941,27 @@ class TestEmitSinks:
         session.absorb(node=node, collector=collector)
         # Should not raise
         _emit_sinks(rampart_session=session)
+
+    def test_custom_sink_receives_raw_evidence(self) -> None:
+        captured: list[str] = []
+
+        class CapturingSink:
+            async def emit_async(self, *, report: TestRunReport) -> None:
+                captured.append(report.results[0].summary)
+
+        raw_summary = "raw\x1b[31m\t\n\r\x7f\x9b雪"
+        session = RampartSession(sinks=[CapturingSink()])
+        collector = ResultCollector()
+        collector.record(
+            result=Result(status=SafetyStatus.UNSAFE, summary=raw_summary),
+        )
+        node = MagicMock()
+        node.nodeid = "test.py::test_sink"
+        session.absorb(node=node, collector=collector)
+
+        _emit_sinks(rampart_session=session)
+
+        assert captured == [raw_summary]
 
 
 class TestSessionFinishIntegration:

@@ -24,6 +24,7 @@ from rampart.core.types import (
     EvalOutcome,
     EvalResult,
     ObservabilityLevel,
+    Payload,
     PayloadFormat,
     Request,
     Response,
@@ -41,8 +42,7 @@ from rampart.pytest_plugin._xdist import (
     SchemaVersionError,
     SizeLimitError,
     WorkerOutputError,
-    _sanitize,
-    _strip_ansi,
+    _to_json_safe,
     deserialize_trial_specs,
     deserialize_worker_data,
     discover_sinks_from_conftest,
@@ -114,6 +114,10 @@ def _make_eval_result(
         evidence=evidence or [],
         rationale=rationale,
     )
+
+
+def _hostile_text(label: str) -> str:
+    return f"{label}\x1b[31m\t\n\r\x7f\x9b雪"
 
 
 def _make_config(
@@ -206,31 +210,31 @@ class TestDetection:
         assert get_worker_count(config=config) == 0
 
 
-class TestSanitize:
+class TestToJsonSafe:
     def test_passes_primitives_unchanged(self) -> None:
-        assert _sanitize(value=42) == 42
-        assert _sanitize(value="hello") == "hello"
-        assert _sanitize(value=True) is True
-        assert _sanitize(value=None) is None
-        assert _sanitize(value=31.4) == pytest.approx(31.4)
+        assert _to_json_safe(value=42) == 42
+        assert _to_json_safe(value="hello") == "hello"
+        assert _to_json_safe(value=True) is True
+        assert _to_json_safe(value=None) is None
+        assert _to_json_safe(value=31.4) == pytest.approx(31.4)
 
     def test_nan_coerced_to_none(self) -> None:
-        assert _sanitize(value=float("nan")) is None
+        assert _to_json_safe(value=float("nan")) is None
 
     def test_inf_coerced_to_none(self) -> None:
-        assert _sanitize(value=float("inf")) is None
-        assert _sanitize(value=float("-inf")) is None
+        assert _to_json_safe(value=float("inf")) is None
+        assert _to_json_safe(value=float("-inf")) is None
 
     def test_dict_recursed(self) -> None:
-        result = _sanitize(value={"a": 1, "b": {"c": "x"}})
+        result = _to_json_safe(value={"a": 1, "b": {"c": "x"}})
         assert result == {"a": 1, "b": {"c": "x"}}
 
     def test_list_recursed(self) -> None:
-        result = _sanitize(value=[1, "two", [3]])
+        result = _to_json_safe(value=[1, "two", [3]])
         assert result == [1, "two", [3]]
 
     def test_tuple_becomes_list(self) -> None:
-        result = _sanitize(value=(1, 2, 3))
+        result = _to_json_safe(value=(1, 2, 3))
         assert result == [1, 2, 3]
 
     def test_custom_object_coerced_via_repr(self) -> None:
@@ -238,31 +242,14 @@ class TestSanitize:
             def __repr__(self) -> str:
                 return "<Obj>"
 
-        assert _sanitize(value=Obj()) == "<Obj>"
+        assert _to_json_safe(value=Obj()) == "<Obj>"
 
     def test_depth_limit_coerces_to_repr(self) -> None:
         nested: dict[str, Any] = {"v": "leaf"}
         for _ in range(MAX_METADATA_DEPTH + 2):
             nested = {"v": nested}
-        result = _sanitize(value=nested)
+        result = _to_json_safe(value=nested)
         json.dumps(result)  # must be JSON-safe
-
-
-class TestStripAnsi:
-    def test_removes_color_codes(self) -> None:
-        text = "\x1b[31mred\x1b[0m"
-        assert _strip_ansi(text=text) == "red"
-
-    def test_preserves_plain_text(self) -> None:
-        assert _strip_ansi(text="hello world") == "hello world"
-
-    def test_strips_multiple_sequences(self) -> None:
-        text = "\x1b[1m\x1b[31mbold red\x1b[0m\x1b[0m"
-        assert _strip_ansi(text=text) == "bold red"
-
-    def test_strips_osc_hyperlink_via_shared_sanitizer(self) -> None:
-        text = "\x1b]8;;http://example.com\x07link\x1b]8;;\x07"
-        assert _strip_ansi(text=text) == "link"
 
 
 class TestSerializationRoundTrip:
@@ -386,6 +373,115 @@ class TestSerializationRoundTrip:
         assert recovered["n"][0].metadata["test_name"] == "t1"
         assert recovered["n"][0].metadata["tries"] == 3
 
+    def test_preserves_every_textual_evidence_field(  # ruff: ignore[too-many-locals]
+        self,
+    ) -> None:
+        argument_key = _hostile_text("argument-key")
+        detail_key = _hostile_text("detail-key")
+        payload_metadata_key = _hostile_text("payload-metadata-key")
+        response_metadata_key = _hostile_text("response-metadata-key")
+        result_metadata_key = _hostile_text("result-metadata-key")
+        attachment = Payload(
+            content=_hostile_text("payload-content"),
+            id=_hostile_text("payload-id"),
+            metadata={
+                payload_metadata_key: {"nested": _hostile_text("payload-metadata")}
+            },
+        )
+        tool_call = ToolCall(
+            name=_hostile_text("tool-name"),
+            arguments={
+                argument_key: {"nested": _hostile_text("argument-value")},
+            },
+            result=_hostile_text("tool-result"),
+        )
+        side_effect = SideEffect(
+            kind=_hostile_text("side-effect-kind"),
+            details={
+                detail_key: {"nested": _hostile_text("side-effect-detail")},
+            },
+        )
+        response = Response(
+            text=_hostile_text("response"),
+            tool_calls=[tool_call],
+            side_effects=[side_effect],
+            metadata={
+                response_metadata_key: {"nested": _hostile_text("response-metadata")}
+            },
+        )
+        eval_result = EvalResult(
+            outcome=EvalOutcome.DETECTED,
+            evidence=[_hostile_text("evidence")],
+            rationale=_hostile_text("rationale"),
+        )
+        turn = Turn(
+            request=Request(prompt=_hostile_text("prompt"), attachments=[attachment]),
+            response=response,
+            eval_result=eval_result,
+            driver_reasoning=_hostile_text("driver-reasoning"),
+        )
+        result = _make_result(
+            summary=_hostile_text("summary"),
+            harm_category=_hostile_text("harm-category"),
+            strategy=_hostile_text("strategy"),
+            turns=[turn],
+            injections=[
+                InjectionRecord(
+                    payload_id=_hostile_text("injection-payload-id"),
+                    surface_name=_hostile_text("injection-surface"),
+                ),
+            ],
+            metadata={
+                result_metadata_key: {"nested": _hostile_text("result-metadata")}
+            },
+        )
+        nodeid = _hostile_text("test.py::test-evidence")
+        session = _make_session_with_results(results_by_nodeid={nodeid: [result]})
+
+        payload = json.loads(json.dumps(serialize_worker_data(session=session)))
+        recovered = deserialize_worker_data(data=payload)[nodeid][0]
+
+        assert recovered.summary == result.summary
+        assert recovered.harm_category == result.harm_category
+        assert recovered.strategy == result.strategy
+        assert (
+            recovered.metadata[result_metadata_key]
+            == result.metadata[result_metadata_key]
+        )
+        assert recovered.metadata["_pytest_nodeid"] == nodeid
+        recovered_turn = recovered.turns[0]
+        assert recovered_turn.request.prompt == turn.request.prompt
+        recovered_attachment = recovered_turn.request.attachments[0]
+        assert recovered_attachment.content == attachment.content
+        assert recovered_attachment.id == attachment.id
+        assert (
+            recovered_attachment.metadata[payload_metadata_key]
+            == (attachment.metadata[payload_metadata_key])
+        )
+        assert recovered_turn.response.text == response.text
+        recovered_tool_call = recovered_turn.response.tool_calls[0]
+        assert recovered_tool_call.name == tool_call.name
+        assert (
+            recovered_tool_call.arguments[argument_key]
+            == tool_call.arguments[argument_key]
+        )
+        assert recovered_tool_call.result == tool_call.result
+        recovered_side_effect = recovered_turn.response.side_effects[0]
+        assert recovered_side_effect.kind == side_effect.kind
+        assert (
+            recovered_side_effect.details[detail_key] == side_effect.details[detail_key]
+        )
+        assert (
+            recovered_turn.response.metadata[response_metadata_key]
+            == (response.metadata[response_metadata_key])
+        )
+        assert recovered_turn.eval_result is not None
+        assert recovered_turn.eval_result.evidence == eval_result.evidence
+        assert recovered_turn.eval_result.rationale == eval_result.rationale
+        assert recovered_turn.driver_reasoning == turn.driver_reasoning
+        assert recovered.injections[0].payload_id == result.injections[0].payload_id
+        assert recovered.injections[0].surface_name == result.injections[0].surface_name
+
 
 class TestDeserializationValidation:
     def test_rejects_non_dict_payload(self) -> None:
@@ -439,48 +535,7 @@ class TestDeserializationValidation:
             deserialize_worker_data(data=payload)
 
 
-class TestDeserializationSecurity:
-    def test_strips_ansi_from_summary(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {
-                "n": [
-                    {
-                        "safe": False,
-                        "status": "unsafe",
-                        "summary": "\x1b[31mDANGER\x1b[0m",
-                        "observability_level": "response_only",
-                    },
-                ],
-            },
-        }
-        result = deserialize_worker_data(data=payload)["n"][0]
-        assert result.summary == "DANGER"
-        assert "\x1b" not in result.summary
-
-    def test_strips_ansi_from_response_text(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {
-                "n": [
-                    {
-                        "safe": True,
-                        "status": "safe",
-                        "summary": "x",
-                        "observability_level": "response_only",
-                        "turns": [
-                            {
-                                "request": {"prompt": "p"},
-                                "response": {"text": "\x1b[31mDANGER\x1b[0m"},
-                            },
-                        ],
-                    },
-                ],
-            },
-        }
-        result = deserialize_worker_data(data=payload)["n"][0]
-        assert result.turns[0].response.text == "DANGER"
-
+class TestTransportValidation:
     def test_nan_inf_in_duration_coerced_to_zero(self) -> None:
         session = _make_session_with_results(
             results_by_nodeid={
@@ -556,17 +611,22 @@ class TestDeserializationSecurity:
                 return "<Obj>"
 
         result = _make_result(metadata={"obj": Obj()})
+        nodeid = "my\x1b\n::node\x9b"
         session = _make_session_with_results(
-            results_by_nodeid={"my::node": [result]},
+            results_by_nodeid={nodeid: [result]},
         )
         with caplog.at_level(logging.WARNING):
             payload = serialize_worker_data(session=session)
         recovered = deserialize_worker_data(data=payload)
-        assert recovered["my::node"][0].metadata["obj"] == "<Obj>"
-        assert any(
-            "my::node" in record.getMessage() and "obj" in record.getMessage()
+        assert recovered[nodeid][0].metadata["obj"] == "<Obj>"
+        message = next(
+            record.getMessage()
             for record in caplog.records
+            if "Converted" in record.getMessage()
         )
+        assert r"my\x1b\x0a::node\x9b" in message
+        assert "\x1b" not in message
+        assert "\n" not in message
 
 
 class TestMerge:
@@ -643,6 +703,28 @@ class TestHandleTestnodedown:
             error="boom",
         )
         assert session.is_incomplete is True
+
+    def test_worker_error_log_is_escaped_but_report_reason_is_raw(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        session = RampartSession()
+        node = MagicMock()
+        worker_id = "gw\x1b\n0\x9b"
+        error = "boom\x1b\r\x7f\x9b"
+        node.gateway.id = worker_id
+
+        with caplog.at_level(logging.WARNING):
+            handle_testnodedown(session=session, node=node, error=error)
+
+        message = caplog.records[-1].getMessage()
+        assert r"gw\x1b\x0a0\x9b" in message
+        assert r"boom\x1b\x0d\x7f\x9b" in message
+        assert "\x1b" not in message
+        assert "\n" not in message
+        assert session.build_report().metadata["incomplete_reasons"] == [
+            f"worker {worker_id} error: {error}",
+        ]
 
     def test_records_incomplete_on_missing_workeroutput(self) -> None:
         session = RampartSession()

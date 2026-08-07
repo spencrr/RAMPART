@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 from rampart.common.deprecation import emit_deprecation_warning
-from rampart.common.text import strip_ansi
+from rampart.common.text import escape_terminal_controls
 from rampart.core.execution import (
     ExecutionEventHandler,
     clear_default_handler_factory,
@@ -93,22 +93,6 @@ _STATUS_LABELS: dict[SafetyStatus, str] = {
     SafetyStatus.UNDETERMINED: "WARN",
     SafetyStatus.ERROR: "ERR",
 }
-
-
-def _sanitize_for_terminal(text: str) -> str:
-    """Strip escape sequences and control bytes before terminal output.
-
-    Prevents terminal injection from attacker-controlled payload text
-    that may appear in result summaries or incomplete-run reasons.
-    Delegates to :func:`rampart.common.text.strip_ansi`.
-
-    Args:
-        text (str): The raw text to sanitize.
-
-    Returns:
-        str: Text with escape sequences and control bytes removed.
-    """
-    return strip_ansi(text)
 
 
 def _resolve_trial_n(marker: pytest.Mark) -> int:
@@ -291,7 +275,8 @@ def _create_trial_clones(
     callspec = getattr(item, "callspec", None)
     fixtureinfo = getattr(item, "_fixtureinfo", None)
     if parent is None:
-        msg = f"Cannot clone trial item with no parent: {item.nodeid}"
+        nodeid = escape_terminal_controls(item.nodeid)
+        msg = f"Cannot clone trial item with no parent: {nodeid}"
         raise pytest.UsageError(msg)
     clones: list[pytest.Item] = []
 
@@ -419,7 +404,7 @@ def _absorb_results(
     except Exception:
         logger.warning(
             "Failed to absorb results for %s — results may be incomplete.",
-            node.nodeid,
+            escape_terminal_controls(node.nodeid),
             exc_info=True,
         )
 
@@ -460,7 +445,7 @@ def _rampart_collect(  # pytest discovers this via autouse=True
         logger.warning(
             "Test %s is marked @harm but recorded no results — "
             "did you forget record_result() or assert result?",
-            node.nodeid,
+            escape_terminal_controls(node.nodeid),
         )
 
 
@@ -678,10 +663,11 @@ def _evaluate_gates(
         rampart_session (RampartSession): The RAMPART session state.
     """
     for base_nodeid, group in sorted(rampart_session.trial_groups.items()):
+        display_nodeid = escape_terminal_controls(base_nodeid)
         if group.passed:
             logger.info(
                 "Gate PASSED: %s — %d/%d safe (%.0f%% pass rate, threshold: %.0f%%)",
-                base_nodeid,
+                display_nodeid,
                 group.safe,
                 group.total,
                 group.pass_rate * 100,
@@ -690,14 +676,14 @@ def _evaluate_gates(
         elif group.has_unsafe:
             logger.info(
                 "Gate FAILED: %s — %d/%d runs were UNSAFE",
-                base_nodeid,
+                display_nodeid,
                 group.unsafe,
                 group.total,
             )
         else:
             logger.info(
                 "Gate FAILED: %s — pass rate %.0f%% below threshold %.0f%%",
-                base_nodeid,
+                display_nodeid,
                 group.pass_rate * 100,
                 group.threshold * 100,
             )
@@ -904,16 +890,17 @@ def _write_result_line(
         test_name (str): The test name to include in the line.
     """
     label = _STATUS_LABELS.get(result.status, "????").ljust(4)
-    sanitized_summary = _sanitize_for_terminal(result.summary)
+    display_summary = escape_terminal_controls(result.summary)
+    display_test_name = escape_terminal_controls(test_name)
     obs_level = result.observability_level.value
 
     if test_name:
         terminalreporter.write_line(
-            f"  {label}  {test_name} -- {sanitized_summary} ({obs_level})",
+            f"  {label}  {display_test_name} -- {display_summary} ({obs_level})",
         )
     else:
         terminalreporter.write_line(
-            f"  {label}  {sanitized_summary} ({obs_level})",
+            f"  {label}  {display_summary} ({obs_level})",
         )
 
 
@@ -932,8 +919,9 @@ def _write_trial_group_lines(
     """
     for base_nodeid, group in sorted(rampart_session.trial_groups.items()):
         test_name = base_nodeid.split("::")[-1] if "::" in base_nodeid else base_nodeid
+        display_test_name = escape_terminal_controls(test_name)
         terminalreporter.write_line(
-            f"  {group.terminal_label}  {test_name} "
+            f"  {group.terminal_label}  {display_test_name} "
             f"[{group.detail}, {group.pass_rate:.0%} pass rate, "
             f"threshold: {group.threshold:.0%}] -- {group.verdict}",
         )
@@ -959,7 +947,7 @@ def _write_incomplete_warning(
         "Results may be partial; the report does not reflect every test.",
     )
     for reason in rampart_session.incomplete_reasons:
-        terminalreporter.write_line(f"  - {_sanitize_for_terminal(reason)}")
+        terminalreporter.write_line(f"  - {escape_terminal_controls(reason)}")
 
 
 def pytest_terminal_summary(
@@ -1004,11 +992,12 @@ def pytest_terminal_summary(
 
     for category, results in report.by_harm_category().items():
         sorted_results = sorted(results, key=lambda r: status_order.get(r.status, 99))
+        display_category = escape_terminal_controls(category.upper())
         terminalreporter.write_line(
-            f"\n{category.upper()} ({len(sorted_results)} tests)",
+            f"\n{display_category} ({len(sorted_results)} tests)",
         )
         for result in sorted_results:
-            test_name = result.metadata.get("_pytest_test_name", "")
+            test_name = str(result.metadata.get("_pytest_test_name", ""))
             _write_result_line(
                 terminalreporter=terminalreporter,
                 result=result,

@@ -223,6 +223,53 @@ class TestEmitAsync:
             "page_url": "https://example.com/chat",
         }
 
+    async def test_file_escapes_controls_and_restores_original_text(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        raw = "raw\x1b\t\n\r\x7f\x9b雪"
+        turn = Turn(
+            request=Request(prompt=raw),
+            response=Response(text=raw, metadata={"nested": {"value": raw}}),
+            eval_result=EvalResult(
+                outcome=EvalOutcome.DETECTED,
+                rationale=raw,
+            ),
+            driver_reasoning=raw,
+        )
+        result = Result(
+            status=SafetyStatus.UNSAFE,
+            summary=raw,
+            turns=[turn],
+            harm_category="custom",
+            metadata={"value": raw},
+        )
+        sink = JsonFileReportSink(output_dir=tmp_path)
+
+        await sink.emit_async(report=TestRunReport(results=[result]))
+
+        [path] = list(tmp_path.glob("run_report_*.json"))
+        serialized = path.read_text(encoding="utf-8")
+        assert "\x1b" not in serialized
+        assert "\x7f" not in serialized
+        assert "\x9b" not in serialized
+        assert "雪" not in serialized
+        assert r"\u001b" in serialized
+        assert r"\u007f" in serialized
+        assert r"\u009b" in serialized
+        assert r"\u96ea" in serialized
+        restored = json.loads(serialized)
+        restored_result = restored["by_harm_category"]["custom"][0]
+        assert restored_result["summary"] == raw
+        assert restored_result["metadata"]["value"] == raw
+        assert restored_result["turns"][0]["prompt"] == raw
+        assert restored_result["turns"][0]["response_text"] == raw
+        assert (
+            restored_result["turns"][0]["response_metadata"]["nested"]["value"] == raw
+        )
+        assert restored_result["turns"][0]["eval_rationale"] == raw
+        assert restored_result["turns"][0]["driver_reasoning"] == raw
+
 
 class TestReportMetadata:
     """Run-level TestRunReport.metadata is projected into the JSON output."""

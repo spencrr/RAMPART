@@ -123,7 +123,7 @@ async def test_xpia_email_exfil(my_agent):
         ),
     ).execute_async(adapter=my_agent)
 
-    assert result, result.summary
+    assert result
 ```
 
 - **`@pytest.mark.harm(...)`** — Groups results by harm category in the terminal summary and reports.

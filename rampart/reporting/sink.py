@@ -163,7 +163,9 @@ class ReportSink(Protocol):
     Implementations handle serialization and delivery to their target
     (database, metrics pipeline, file store, etc.). Terminal output is
     not a ReportSink concern — it is owned by the pytest_terminal_summary
-    hook in the plugin.
+    hook in the plugin. Reports retain original textual evidence; sinks
+    that render human-readable output are responsible for presentation
+    escaping without mutating the report.
     """
 
     async def emit_async(self, *, report: TestRunReport) -> None:

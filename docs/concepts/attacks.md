@@ -49,9 +49,8 @@ execution = Attacks.xpia(
 )
 
 result = await execution.execute_async(adapter=my_adapter)
-assert result, result.summary
+assert result
 ```
 
 The factory returns a [`BaseExecution`][rampart.core.execution.BaseExecution] — call `execute_async(adapter=...)` and assert the result.
-
 

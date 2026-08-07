@@ -1,48 +1,44 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from rampart.common.text import strip_ansi
+import pytest
+
+from rampart.common.text import escape_terminal_controls
 
 
-class TestStripAnsi:
-    def test_preserves_plain_text(self) -> None:
-        assert strip_ansi("hello world") == "hello world"
+class TestEscapeTerminalControls:
+    @pytest.mark.parametrize(
+        "codepoint",
+        [*range(0x20), 0x7F, *range(0x80, 0xA0)],
+    )
+    def test_escapes_every_c0_del_and_c1_control(self, codepoint: int) -> None:
+        assert escape_terminal_controls(chr(codepoint)) == f"\\x{codepoint:02x}"
 
-    def test_removes_color_codes(self) -> None:
-        assert strip_ansi("\x1b[31mred\x1b[0m") == "red"
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("\x1b[31mred\x1b[0m", r"\x1b[31mred\x1b[0m"),
+            ("\x1b]0;title\x07", r"\x1b]0;title\x07"),
+            ("\x9b31mred", r"\x9b31mred"),
+            ("\x9dtitle\x9c", r"\x9dtitle\x9c"),
+            ("a\tb\nc\rd", r"a\x09b\x0ac\x0dd"),
+        ],
+    )
+    def test_escapes_sequence_constituents(self, text: str, expected: str) -> None:
+        assert escape_terminal_controls(text) == expected
 
-    def test_removes_cursor_movement(self) -> None:
-        assert strip_ansi("\x1b[2Ahidden") == "hidden"
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "hello world",
+            "not an escape [0m or [31m here",
+            "雪だるま ☃",
+            "\u202eformat policy deferred",
+        ],
+    )
+    def test_preserves_printable_text(self, text: str) -> None:
+        assert escape_terminal_controls(text) == text
 
-    def test_removes_clear_screen(self) -> None:
-        assert strip_ansi("\x1b[2J\x1b[Hinjected") == "injected"
-
-    def test_removes_osc_hyperlink_bel_terminated(self) -> None:
-        text = "\x1b]8;;http://example.com\x07link\x1b]8;;\x07"
-        assert strip_ansi(text) == "link"
-
-    def test_removes_osc_window_title_st_terminated(self) -> None:
-        text = "before\x1b]0;malicious title\x1b\\after"
-        assert strip_ansi(text) == "beforeafter"
-
-    def test_removes_dcs_block(self) -> None:
-        assert strip_ansi("\x1bPdevice-control\x1b\\tail") == "tail"
-
-    def test_removes_eight_bit_csi(self) -> None:
-        assert strip_ansi("\x9b31mred") == "red"
-
-    def test_removes_lone_c1_control(self) -> None:
-        assert strip_ansi("a\x84b") == "ab"
-
-    def test_preserves_whitespace_controls(self) -> None:
-        assert strip_ansi("a\tb\nc\rd") == "a\tb\nc\rd"
-
-    def test_strips_residual_c0_controls(self) -> None:
-        assert strip_ansi("a\x00b\x07c") == "abc"
-
-    def test_does_not_touch_bracket_text_without_escape(self) -> None:
-        text = "not an escape [0m or [31m here"
-        assert strip_ansi(text) == text
-
-    def test_strips_chained_sequences(self) -> None:
-        assert strip_ansi("\x1b[1m\x1b[31mbold red\x1b[0m\x1b[0m") == "bold red"
+    def test_is_idempotent(self) -> None:
+        escaped = escape_terminal_controls("\x1b[31mred\n")
+        assert escape_terminal_controls(escaped) == escaped

@@ -178,15 +178,25 @@ from `config` values or environment variables there.
 
 ---
 
-## Trust Boundary & Security
+## Transport Validation and Evidence Fidelity
 
-Worker payloads cross a process boundary via `execnet` and may contain attacker-controlled content (agent responses, payload text, evaluator rationale). RAMPART's serialization defends against:
+Worker results cross the process boundary through pytest-xdist's
+`config.workeroutput`. RAMPART projects result data to JSON-safe primitives and
+applies the following transport validation and normalization:
 
-- **Arbitrary code execution** — strict JSON-safe primitives only; no `pickle`, `marshal`, or custom `__reduce__`.
-- **Schema drift** — payloads with missing or unknown schema versions are rejected fail-closed.
-- **Memory exhaustion** — worker payloads are capped at 64 MB by default.
-- **Terminal/log injection** — ANSI escape sequences are stripped from free-form text at the deserialization boundary.
-- **Path traversal** — worker-local artifact paths are stored as opaque strings in metadata; the controller never accesses worker files.
+- **Schema version** — payloads with missing or unknown schema versions are rejected.
+- **Size** — worker payloads are capped at 64 MB by default.
+- **Value shape** — enum values, container depth, JSON-compatible metadata, and
+  finite numeric values are validated or normalized.
+- **Worker-local artifacts** — artifact paths are retained as opaque metadata
+  strings; the controller does not access worker files.
+
+Textual evidence is preserved through deserialization, so serial and xdist
+runs expose the same text to `Result`, `TestRunReport`, and report sinks.
+RAMPART escapes terminal controls only when it renders its own terminal summary
+or dynamic log fields. The built-in JSON sink represents those characters with
+JSON escapes, while parsing the file restores the original text. Custom sinks
+receive raw evidence and own the safety of any human-facing rendering.
 
 ### Size cap
 

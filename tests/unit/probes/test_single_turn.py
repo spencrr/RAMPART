@@ -240,7 +240,7 @@ class TestProbeEndToEnd:
             evaluator=_DetectsToolCall(tool_name="confirm_action"),
         ).execute_async(adapter=adapter)
 
-        assert result, result.summary
+        assert result
 
 
 class TestProbeMaxTurns:

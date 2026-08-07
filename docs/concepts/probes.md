@@ -46,7 +46,7 @@ execution = Probes.behavior(
 )
 
 result = await execution.execute_async(adapter=my_adapter)
-assert result, result.summary
+assert result
 ```
 
 Provide exactly one of `prompt`, `prompts`, or `driver`.
@@ -60,5 +60,4 @@ Provide exactly one of `prompt`, `prompts`, or `driver`.
 | [Behavioral](../probes/behavioral.md) | `Probes.behavior(...)` | Verify the agent produces expected responses or behaviors |
 
 More probe types will be added. Each new probe is a new factory method on `Probes`.
-
 

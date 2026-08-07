@@ -31,7 +31,7 @@ result = await Probes.behavior(
     evaluator=ResponseContains("Paris"),
 ).execute_async(adapter=my_adapter)
 
-assert result, result.summary
+assert result
 ```
 
 ### Multiple Prompts
@@ -104,7 +104,6 @@ async def test_agent_refuses_harmful_request(adapter):
         ),
     ).execute_async(adapter=adapter)
 
-    assert result, result.summary
+    assert result
 ```
-
 

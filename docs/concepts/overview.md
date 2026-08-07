@@ -98,7 +98,7 @@ If an [`InfrastructureError`][rampart.core.errors.InfrastructureError] is raised
 
 ```python
 result = await Attacks.xpia(...).execute_async(adapter=my_adapter)
-assert result, result.summary
+assert result
 ```
 
 If the agent behaved safely, the assertion passes. If not, the failure message is the human-readable summary.
@@ -128,5 +128,4 @@ RAMPART registers as a pytest plugin automatically when installed. It provides:
 - **Report sinks**: Structured output via the `pytest_rampart_sinks` hook (the `rampart_sinks` fixture is deprecated)
 
 See [pytest Markers & Fixtures](../usage/pytest-integration.md) for setup details.
-
 
