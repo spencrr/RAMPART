@@ -55,6 +55,7 @@ from rampart.pytest_plugin._xdist import (
     is_xdist_worker,
     serialize_worker_data,
 )
+from rampart.pytest_plugin.plugin import _enforce_incomplete_exit_status
 from rampart.reporting.sink import ReportSink, TestRunReport
 
 
@@ -840,6 +841,156 @@ class TestHandleTestnodedown:
         assert session.is_incomplete is True
         assert "transport validation failed" in session.incomplete_reasons[0]
 
+    def test_transport_error_does_not_bypass_result_validation(self) -> None:
+        session = RampartSession()
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {
+            WORKEROUTPUT_KEY: {
+                "schema": SCHEMA_VERSION,
+                "results_by_nodeid": {"n": [{"status": "invalid"}]},
+                "trial_specs": [],
+                "rampart_transport_error": "invalid trial threshold",
+            },
+        }
+
+        handle_testnodedown(session=session, node=node, error=None)
+
+        assert session.is_incomplete is True
+        assert "deserialization failed" in session.incomplete_reasons[0]
+        assert session.has_results is False
+
+    @pytest.mark.parametrize("field", ["duration", "confidence"])
+    def test_transport_error_numeric_overflow_uses_result_failure_path(
+        self,
+        field: str,
+    ) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={
+                "n": [
+                    _make_result(
+                        turns=[
+                            _make_turn(
+                                eval_result=_make_eval_result(),
+                            ),
+                        ],
+                    ),
+                ],
+            },
+        )
+        payload = serialize_worker_data(session=worker_session)
+        raw_result = payload["results_by_nodeid"]["n"][0]
+        if field == "duration":
+            raw_result["duration_seconds"] = 10**400
+        else:
+            raw_result["turns"][0]["eval_result"]["confidence"] = 10**400
+        payload["rampart_transport_error"] = "invalid trial threshold"
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        session = RampartSession()
+
+        handle_testnodedown(session=session, node=node, error=None)
+
+        assert session.is_incomplete is True
+        assert "deserialization failed" in session.incomplete_reasons[0]
+        assert session.has_results is False
+
+    def test_finalizer_trial_error_preserves_results_and_forces_nonzero(
+        self,
+    ) -> None:
+        config = _make_config(is_worker=True)
+        workeroutput: dict[str, Any] = {}
+        config.workeroutput = workeroutput
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        worker_session.register_trial_spec(
+            clone_nodeid="n",
+            base_nodeid="base",
+            threshold=0.0,
+        )
+
+        with pytest.raises(TrialSpecValidationError):
+            finalize_worker(config=config, session=worker_session)
+
+        payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
+        assert payload["trial_specs"] == []
+        assert payload["results_by_nodeid"]["n"][0]["summary"] == "kept"
+        assert "finite number in (0, 1]" in payload["rampart_transport_error"]
+
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = workeroutput
+        controller_session = RampartSession()
+        handle_testnodedown(session=controller_session, node=node, error=None)
+
+        flat_result = controller_session._results[0]
+        grouped_result = controller_session.results_by_nodeid["n"][0]
+        report_result = controller_session.build_report().results[0]
+        assert flat_result is grouped_result
+        assert flat_result is report_result
+        assert flat_result.summary == "kept"
+        assert controller_session.is_incomplete is True
+        assert "transport validation failed" in controller_session.incomplete_reasons[0]
+
+        pytest_session = MagicMock()
+        pytest_session.exitstatus = pytest.ExitCode.OK
+        _enforce_incomplete_exit_status(
+            session=pytest_session,
+            rampart_session=controller_session,
+        )
+        assert pytest_session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_missing_trial_specs_preserves_results_and_marks_incomplete(
+        self,
+    ) -> None:
+        config = _make_config(is_worker=True)
+        workeroutput: dict[str, Any] = {}
+        config.workeroutput = workeroutput
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        finalize_worker(config=config, session=worker_session)
+        payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
+        del payload["trial_specs"]
+
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = workeroutput
+        controller_session = RampartSession()
+        handle_testnodedown(session=controller_session, node=node, error=None)
+
+        assert controller_session.is_incomplete is True
+        assert (
+            "trial spec validation failed" in controller_session.incomplete_reasons[0]
+        )
+        assert controller_session.results_by_nodeid["n"][0].summary == "kept"
+        assert controller_session.build_report().total_runs == 1
+
+    def test_empty_trial_specs_preserves_results_without_incomplete(
+        self,
+    ) -> None:
+        config = _make_config(is_worker=True)
+        workeroutput: dict[str, Any] = {}
+        config.workeroutput = workeroutput
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        finalize_worker(config=config, session=worker_session)
+        payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
+        assert payload["trial_specs"] == []
+
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = workeroutput
+        controller_session = RampartSession()
+        handle_testnodedown(session=controller_session, node=node, error=None)
+
+        assert controller_session.is_incomplete is False
+        assert controller_session.results_by_nodeid["n"][0].summary == "kept"
+        assert controller_session.build_report().total_runs == 1
+
     def test_invalid_received_threshold_marks_incomplete_and_merges_results(
         self,
     ) -> None:
@@ -1022,9 +1173,10 @@ class TestTrialSpecs:
         payload = serialize_worker_data(session=session)
         assert deserialize_trial_specs(data=payload) == {}
 
-    def test_payload_without_trial_specs_field_returns_empty_dict(self) -> None:
+    def test_payload_without_trial_specs_field_raises(self) -> None:
         data = {"schema": SCHEMA_VERSION, "results_by_nodeid": {}}
-        assert deserialize_trial_specs(data=data) == {}
+        with pytest.raises(TrialSpecValidationError, match="missing required"):
+            deserialize_trial_specs(data=data)
 
     def test_serializes_explicit_default_threshold(self) -> None:
         session = RampartSession()
@@ -1160,7 +1312,9 @@ class TestFinalizeWorker:
         config = _make_config(is_worker=True)
         workeroutput: dict[str, Any] = {}
         config.workeroutput = workeroutput
-        session = RampartSession()
+        session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
         session.register_trial_spec(
             clone_nodeid="t.py::a[trial-0]",
             base_nodeid="t.py::a",
@@ -1172,6 +1326,7 @@ class TestFinalizeWorker:
 
         payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
         assert "finite number in (0, 1]" in payload["rampart_transport_error"]
+        assert payload["results_by_nodeid"]["n"][0]["summary"] == "kept"
 
 
 class TestSinkDiscovery:

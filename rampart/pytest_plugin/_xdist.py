@@ -83,7 +83,7 @@ class SizeLimitError(WorkerOutputError):
 
 
 class TrialSpecValidationError(WorkerOutputError):
-    """Raised when a trial threshold violates the current transport schema."""
+    """Raised when trial specifications violate the current transport schema."""
 
 
 def is_xdist_worker(*, config: pytest.Config) -> bool:
@@ -535,37 +535,88 @@ def _serialize_trial_spec(
     }
 
 
-def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
-    """Serialize a worker's RampartSession state for transport to the controller.
-
-    Produces a JSON-safe dict containing the schema version, the
-    package version (for cross-version diagnostics), the worker's
-    ``_results_by_nodeid`` mapping serialized to primitive types,
-    and trial specs registered during collection.
+def _serialize_results_by_nodeid(
+    *,
+    session: RampartSession,
+) -> dict[str, list[dict[str, Any]]]:
+    """Serialize all worker Results grouped by pytest node ID.
 
     Args:
-        session (RampartSession): The worker's session state.
+        session (RampartSession): The worker session state.
 
     Returns:
-        dict[str, Any]: A JSON-safe payload ready to write to
-            ``config.workeroutput``.
-
-    Raises:
-        TrialSpecValidationError: If an internal trial threshold is invalid.
+        dict[str, list[dict[str, Any]]]: Serialized Results keyed by node ID.
     """
     serialized: dict[str, list[dict[str, Any]]] = {}
     for nodeid, results in session.results_by_nodeid.items():
         serialized[nodeid] = [
             _serialize_result(result=r, nodeid=nodeid) for r in results
         ]
-    return {
+    return serialized
+
+
+def _serialize_trial_specs(*, session: RampartSession) -> list[dict[str, str | float]]:
+    """Serialize all worker trial specifications.
+
+    Args:
+        session (RampartSession): The worker session state.
+
+    Returns:
+        list[dict[str, str | float]]: Current-schema trial specifications.
+
+    Raises:
+        TrialSpecValidationError: If an internal trial threshold is invalid.
+    """
+    return [
+        _serialize_trial_spec(clone_nodeid=clone_nodeid, spec=spec)
+        for clone_nodeid, spec in session.trial_specs.items()
+    ]
+
+
+def _build_worker_payload(
+    *,
+    results_by_nodeid: dict[str, list[dict[str, Any]]],
+    trial_specs: list[dict[str, str | float]],
+    transport_error: TrialSpecValidationError | None = None,
+) -> dict[str, Any]:
+    """Build a payload from independently serialized sections.
+
+    Args:
+        results_by_nodeid (dict[str, list[dict[str, Any]]]): Serialized Results.
+        trial_specs (list[dict[str, str | float]]): Serialized trial specs.
+        transport_error (TrialSpecValidationError | None): Trial transport error.
+
+    Returns:
+        dict[str, Any]: The current-schema worker payload.
+    """
+    payload: dict[str, Any] = {
         "schema": SCHEMA_VERSION,
-        "results_by_nodeid": serialized,
-        "trial_specs": [
-            _serialize_trial_spec(clone_nodeid=clone_nodeid, spec=spec)
-            for clone_nodeid, spec in session.trial_specs.items()
-        ],
+        "results_by_nodeid": results_by_nodeid,
+        "trial_specs": trial_specs,
     }
+    if transport_error is not None:
+        payload[_TRANSPORT_ERROR_MARKER] = str(transport_error)
+    return payload
+
+
+def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
+    """Serialize a worker's RampartSession state for transport to the controller.
+
+    Args:
+        session (RampartSession): The worker's session state.
+
+    Returns:
+        dict[str, Any]: A current-schema, JSON-safe worker payload.
+
+    Raises:
+        TrialSpecValidationError: If an internal trial threshold is invalid.
+    """
+    results_by_nodeid = _serialize_results_by_nodeid(session=session)
+    trial_specs = _serialize_trial_specs(session=session)
+    return _build_worker_payload(
+        results_by_nodeid=results_by_nodeid,
+        trial_specs=trial_specs,
+    )
 
 
 def _validate_schema(*, data: object) -> dict[str, Any]:
@@ -694,6 +745,35 @@ def _deserialize_datetime(*, value: object) -> datetime | None:
         raise WorkerOutputError(msg) from exc
 
 
+def _deserialize_finite_float(
+    *,
+    value: object,
+    default: float,
+    context: str,
+) -> float:
+    """Deserialize a finite numeric value with an explicit default.
+
+    Args:
+        value (object): The worker-provided value.
+        default (float): Value to use for non-numeric or non-finite input.
+        context (str): Field name for validation errors.
+
+    Returns:
+        float: The finite value or default.
+
+    Raises:
+        WorkerOutputError: If numeric conversion fails.
+    """
+    if not isinstance(value, int | float):
+        return default
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        msg = f"Invalid numeric value for {context}: {value!r}."
+        raise WorkerOutputError(msg) from exc
+    return converted if math.isfinite(converted) else default
+
+
 def _deserialize_eval_result(*, data: object) -> EvalResult | None:
     """Deserialize an EvalResult, or None when input is None.
 
@@ -710,9 +790,10 @@ def _deserialize_eval_result(*, data: object) -> EvalResult | None:
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     outcome = _deserialize_eval_outcome(value=typed.get("outcome"))
-    raw_confidence = typed.get("confidence")
-    confidence = (
-        float(raw_confidence) if isinstance(raw_confidence, int | float) else 1.0
+    confidence = _deserialize_finite_float(
+        value=typed.get("confidence"),
+        default=1.0,
+        context="EvalResult.confidence",
     )
     raw_evidence = typed.get("evidence", [])
     evidence_items = cast(
@@ -939,11 +1020,10 @@ def _deserialize_result(*, data: object) -> Result:
     metadata = _to_json_safe(
         value=raw_metadata if isinstance(raw_metadata, dict) else {},
     )
-    raw_duration = typed.get("duration_seconds", 0.0)
-    duration = (
-        float(raw_duration)
-        if isinstance(raw_duration, int | float) and math.isfinite(float(raw_duration))
-        else 0.0
+    duration = _deserialize_finite_float(
+        value=typed.get("duration_seconds"),
+        default=0.0,
+        context="Result.duration_seconds",
     )
     return Result(
         status=_deserialize_safety_status(value=typed.get("status")),
@@ -1016,9 +1096,9 @@ def deserialize_worker_data(*, data: object) -> dict[str, list[Result]]:
 def deserialize_trial_specs(*, data: object) -> dict[str, TrialSpec]:
     """Deserialize the ``trial_specs`` section of a worker payload.
 
-    The block is optional for payloads without trials. Every present
-    current-schema block and entry must be structurally valid and contain
-    a valid threshold.
+    The current schema requires the block; an empty list represents a
+    worker with no trials. Every entry must be structurally valid and
+    contain a valid threshold.
 
     Args:
         data (object): The deserialized JSON object from
@@ -1034,7 +1114,8 @@ def deserialize_trial_specs(*, data: object) -> dict[str, TrialSpec]:
     """
     typed = _validate_schema(data=data)
     if "trial_specs" not in typed:
-        return {}
+        msg = f"Worker payload missing required 'trial_specs' for {SCHEMA_VERSION}."
+        raise TrialSpecValidationError(msg)
     raw_specs = typed["trial_specs"]
     if not isinstance(raw_specs, list):
         msg = f"Expected list for trial_specs, got {type(raw_specs).__name__}."
@@ -1089,14 +1170,18 @@ def finalize_worker(*, config: pytest.Config, session: RampartSession) -> None:
         "dict[str, Any]",
         config.workeroutput,  # ty: ignore[unresolved-attribute]
     )
+    results_by_nodeid = _serialize_results_by_nodeid(session=session)
+    trial_error: TrialSpecValidationError | None = None
     try:
-        payload = serialize_worker_data(session=session)
+        trial_specs = _serialize_trial_specs(session=session)
     except TrialSpecValidationError as exc:
-        workeroutput[WORKEROUTPUT_KEY] = {
-            "schema": SCHEMA_VERSION,
-            _TRANSPORT_ERROR_MARKER: str(exc),
-        }
-        raise
+        trial_specs = []
+        trial_error = exc
+    payload = _build_worker_payload(
+        results_by_nodeid=results_by_nodeid,
+        trial_specs=trial_specs,
+        transport_error=trial_error,
+    )
     encoded = json.dumps(payload, default=str)
     size = len(encoded.encode("utf-8"))
     limit = _size_limit(config=config)
@@ -1115,6 +1200,8 @@ def finalize_worker(*, config: pytest.Config, session: RampartSession) -> None:
         raise SizeLimitError(msg)
     logger.debug("Worker payload size: %d bytes", size)
     workeroutput[WORKEROUTPUT_KEY] = payload
+    if trial_error is not None:
+        raise trial_error
 
 
 def _safe_deserialize_trial_specs(
@@ -1125,9 +1212,8 @@ def _safe_deserialize_trial_specs(
 ) -> dict[str, TrialSpec]:
     """Deserialize trial specs from a worker payload without raising.
 
-    Trial specs are optional metadata: a corrupt block must not block
-    result merging, but it marks the controller run incomplete. An absent
-    block represents no trial specs.
+    A missing or corrupt block must not block result merging, but it marks
+    the controller run incomplete.
 
     Args:
         session (RampartSession): The controller session to mark incomplete.
@@ -1234,17 +1320,6 @@ def handle_testnodedown(
         if typed_payload_dict is not None
         else None
     )
-    if transport_error is not None:
-        reason = escape_terminal_controls(str(transport_error))
-        logger.error(
-            "Worker %s RAMPART transport validation failed: %s",
-            worker_id_str,
-            reason,
-        )
-        session.mark_incomplete(
-            reason=f"worker {worker_id_str} transport validation failed: {reason}",
-        )
-        return
     try:
         results_by_nodeid = deserialize_worker_data(data=cast("object", payload))
     except WorkerOutputError as exc:
@@ -1257,10 +1332,14 @@ def handle_testnodedown(
             reason=f"worker {worker_id_str} deserialization failed: {exc}",
         )
         return
-    trial_specs = _safe_deserialize_trial_specs(
-        session=session,
-        payload=cast("object", payload),
-        worker_id_str=worker_id_str,
+    trial_specs = (
+        {}
+        if transport_error is not None
+        else _safe_deserialize_trial_specs(
+            session=session,
+            payload=cast("object", payload),
+            worker_id_str=worker_id_str,
+        )
     )
     _tag_source_worker(
         results_by_nodeid=results_by_nodeid,
@@ -1269,6 +1348,16 @@ def handle_testnodedown(
     session.merge_worker_results(results_by_nodeid=results_by_nodeid)
     if trial_specs:
         session.merge_trial_specs(trial_specs=trial_specs)
+    if transport_error is not None:
+        reason = escape_terminal_controls(str(transport_error))
+        logger.error(
+            "Worker %s RAMPART transport validation failed: %s",
+            display_worker_id,
+            reason,
+        )
+        session.mark_incomplete(
+            reason=f"worker {worker_id_str} transport validation failed: {reason}",
+        )
     logger.info(
         "Merged %d result group(s) from worker %s.",
         len(results_by_nodeid),
