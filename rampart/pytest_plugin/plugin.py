@@ -178,7 +178,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     Args:
         parser (pytest.Parser): The pytest argument parser.
     """
-    group = parser.getgroup("rampart")
+    group = parser.getgroup(
+        "rampart",
+        "RAMPART safety testing",
+        after="general",
+    )
     group.addoption(
         f"--{SIZE_LIMIT_OPTION.replace('_', '-')}",
         dest=SIZE_LIMIT_OPTION,
