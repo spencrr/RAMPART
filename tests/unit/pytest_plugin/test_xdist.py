@@ -41,6 +41,7 @@ from rampart.pytest_plugin._xdist import (
     WORKEROUTPUT_KEY,
     SchemaVersionError,
     SizeLimitError,
+    TrialSpecValidationError,
     WorkerOutputError,
     _to_json_safe,
     deserialize_trial_specs,
@@ -650,6 +651,20 @@ class TestMerge:
         assert "n1" in session._results_by_nodeid
         assert "n2" in session._results_by_nodeid
 
+    def test_merge_extends_same_node_results(self) -> None:
+        session = RampartSession()
+        session.merge_worker_results(
+            results_by_nodeid={"n": [_make_result(summary="first")]},
+        )
+        session.merge_worker_results(
+            results_by_nodeid={"n": [_make_result(summary="second")]},
+        )
+        assert [result.summary for result in session.results_by_nodeid["n"]] == [
+            "first",
+            "second",
+        ]
+        assert session.build_report().total_runs == 2
+
     def test_merge_invalidates_cached_report(self) -> None:
         session = RampartSession()
         session.merge_worker_results(
@@ -811,6 +826,64 @@ class TestHandleTestnodedown:
         handle_testnodedown(session=session, node=node, error=None)
         assert session.is_incomplete is True
 
+    def test_records_incomplete_on_transport_validation_error(self) -> None:
+        session = RampartSession()
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {
+            WORKEROUTPUT_KEY: {
+                "schema": SCHEMA_VERSION,
+                "rampart_transport_error": "invalid trial threshold",
+            },
+        }
+        handle_testnodedown(session=session, node=node, error=None)
+        assert session.is_incomplete is True
+        assert "transport validation failed" in session.incomplete_reasons[0]
+
+    def test_invalid_received_threshold_marks_incomplete_and_merges_results(
+        self,
+    ) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        worker_session.register_trial_spec(
+            clone_nodeid="n",
+            base_nodeid="base",
+            threshold=0.5,
+        )
+        payload = serialize_worker_data(session=worker_session)
+        payload["trial_specs"][0]["threshold"] = float("nan")
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        session = RampartSession()
+
+        handle_testnodedown(session=session, node=node, error=None)
+
+        assert session.is_incomplete is True
+        assert "trial spec validation failed" in session.incomplete_reasons[0]
+        assert session.build_report().total_runs == 1
+        assert session.build_report().results[0].summary == "kept"
+
+    def test_malformed_trial_block_marks_incomplete_and_merges_results(
+        self,
+    ) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        payload = serialize_worker_data(session=worker_session)
+        payload["trial_specs"] = "corrupt"
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        session = RampartSession()
+
+        handle_testnodedown(session=session, node=node, error=None)
+
+        assert session.is_incomplete is True
+        assert "trial spec validation failed" in session.incomplete_reasons[0]
+        assert session.build_report().total_runs == 1
+
     def test_merges_results_on_success(self) -> None:
         session = RampartSession()
         worker_session = _make_session_with_results(
@@ -949,34 +1022,81 @@ class TestTrialSpecs:
         payload = serialize_worker_data(session=session)
         assert deserialize_trial_specs(data=payload) == {}
 
-    def test_skips_malformed_entries(self) -> None:
-        data: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {},
-            "trial_specs": [
-                {"clone_nodeid": "ok", "base_nodeid": "b", "threshold": 0.5},
-                "not-a-dict",
-                {"clone_nodeid": "", "base_nodeid": "b", "threshold": 0.5},
-                {"clone_nodeid": "x", "base_nodeid": 123, "threshold": 0.5},
-                {"clone_nodeid": "y", "base_nodeid": "b"},
-            ],
-        }
-        specs = deserialize_trial_specs(data=data)
-        assert set(specs) == {"ok", "y"}
-        assert specs["y"].threshold == pytest.approx(0.0)
+    def test_payload_without_trial_specs_field_returns_empty_dict(self) -> None:
+        data = {"schema": SCHEMA_VERSION, "results_by_nodeid": {}}
+        assert deserialize_trial_specs(data=data) == {}
 
-    def test_clamps_non_finite_threshold(self) -> None:
+    def test_serializes_explicit_default_threshold(self) -> None:
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="t.py::a[trial-0]",
+            base_nodeid="t.py::a",
+            threshold=TrialSpec.DEFAULT_THRESHOLD,
+        )
+        payload = serialize_worker_data(session=session)
+        assert payload["trial_specs"][0]["threshold"] == pytest.approx(1.0)
+
+    @pytest.mark.parametrize(
+        "trial_specs",
+        [
+            "not-a-list",
+            ["not-a-dict"],
+            [{"clone_nodeid": "", "base_nodeid": "b", "threshold": 0.5}],
+            [{"clone_nodeid": "x", "base_nodeid": 123, "threshold": 0.5}],
+        ],
+    )
+    def test_rejects_malformed_entries(self, trial_specs: object) -> None:
         data: dict[str, Any] = {
             "schema": SCHEMA_VERSION,
             "results_by_nodeid": {},
-            "trial_specs": [
-                {"clone_nodeid": "a", "base_nodeid": "b", "threshold": float("inf")},
-                {"clone_nodeid": "c", "base_nodeid": "d", "threshold": float("nan")},
-            ],
+            "trial_specs": trial_specs,
         }
-        specs = deserialize_trial_specs(data=data)
-        assert specs["a"].threshold == pytest.approx(0.0)
-        assert specs["c"].threshold == pytest.approx(0.0)
+        with pytest.raises(TrialSpecValidationError):
+            deserialize_trial_specs(data=data)
+
+    @pytest.mark.parametrize(
+        "threshold",
+        [
+            None,
+            "0.5",
+            True,
+            0.0,
+            -0.1,
+            1.1,
+            math.inf,
+            -math.inf,
+            math.nan,
+            10**400,
+        ],
+    )
+    def test_rejects_invalid_deserialized_threshold(self, threshold: object) -> None:
+        spec: dict[str, object] = {
+            "clone_nodeid": "a",
+            "base_nodeid": "b",
+        }
+        if threshold is not None:
+            spec["threshold"] = threshold
+        data: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "results_by_nodeid": {},
+            "trial_specs": [spec],
+        }
+        with pytest.raises(TrialSpecValidationError, match="finite number"):
+            deserialize_trial_specs(data=data)
+
+    @pytest.mark.parametrize(
+        "threshold",
+        [0.0, -0.1, 1.1, math.inf, -math.inf, math.nan, 10**400],
+    )
+    def test_rejects_invalid_serialized_threshold(self, threshold: float) -> None:
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="t.py::a[trial-0]",
+            base_nodeid="t.py::a",
+            threshold=threshold,
+        )
+        with pytest.raises(TrialSpecValidationError, match="finite number"):
+            serialize_worker_data(session=session)
 
     def test_merge_is_idempotent(self) -> None:
         session = RampartSession()
@@ -1035,6 +1155,23 @@ class TestFinalizeWorker:
             finalize_worker(config=config, session=session)
         payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
         assert payload.get("rampart_truncated") is True
+
+    def test_invalid_trial_threshold_writes_transport_error(self) -> None:
+        config = _make_config(is_worker=True)
+        workeroutput: dict[str, Any] = {}
+        config.workeroutput = workeroutput
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="t.py::a[trial-0]",
+            base_nodeid="t.py::a",
+            threshold=0.0,
+        )
+
+        with pytest.raises(TrialSpecValidationError):
+            finalize_worker(config=config, session=session)
+
+        payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
+        assert "finite number in (0, 1]" in payload["rampart_transport_error"]
 
 
 class TestSinkDiscovery:

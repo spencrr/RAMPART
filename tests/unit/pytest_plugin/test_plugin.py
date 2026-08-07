@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
@@ -27,10 +28,13 @@ from rampart.pytest_plugin.plugin import (
     _call_results_key,
     _emit_sinks,
     _enforce_incomplete_exit_status,
+    _enforce_trial_gate_exit_status,
     _evaluate_gates,
     _has_sink_hook_impl,
     _resolve_hook_sinks,
     _resolve_trial_n,
+    _resolve_trial_threshold,
+    _warn_trial_marker_deprecated,
     _write_result_line,
     _write_trial_group_lines,
     pytest_collection_modifyitems,
@@ -152,6 +156,38 @@ class TestRampartSession:
         assert report.total_runs == 1
         assert report.passed == 1
 
+    def test_absorb_retains_same_node_attempts_in_order(self) -> None:
+        session = RampartSession()
+        node = MagicMock()
+        node.nodeid = "test_file.py::test_repeat"
+        node.get_closest_marker.return_value = None
+        first_collector = ResultCollector()
+        first_original = Result(status=SafetyStatus.SAFE, summary="first")
+        first_collector.record(result=first_original)
+        second_collector = ResultCollector()
+        second_original = Result(status=SafetyStatus.ERROR, summary="second")
+        second_collector.record(result=second_original)
+
+        first = session.absorb(node=node, collector=first_collector)
+        second = session.absorb(node=node, collector=second_collector)
+
+        grouped = session.results_by_nodeid[node.nodeid]
+        report = session.build_report()
+        assert [result.summary for result in grouped] == ["first", "second"]
+        assert [result.summary for result in report.results] == ["first", "second"]
+        assert [result.metadata["_rampart_result_index"] for result in grouped] == [
+            0,
+            1,
+        ]
+        assert first == (grouped[0],)
+        assert second == (grouped[1],)
+        assert first[0] is grouped[0]
+        assert second[0] is grouped[1]
+        assert first[0] is not first_original
+        assert second[0] is not second_original
+        assert report.total_runs == 2
+        assert report.population_summary().total_runs == 2
+
     def test_has_results_false_when_empty(self) -> None:
         session = RampartSession()
         assert not session.has_results
@@ -268,14 +304,33 @@ class TestRampartSession:
         session.record_trial_group(
             base_nodeid="test_err",
             clone_nodeids=[item.nodeid for item in items],
-            threshold=0.0,
+            threshold=1.0,
         )
 
         group = session.trial_groups["test_err"]
         assert group.errors == 3
         assert group.unsafe == 0
         assert group.pass_rate == pytest.approx(0.0)
-        assert group.passed  # threshold=0.0 means any pass rate is acceptable
+        assert not group.passed
+
+    def test_record_trial_group_all_no_result_fails(self) -> None:
+        session = RampartSession()
+        clone_nodeids = [
+            "test_file.py::test_missing[trial-0]",
+            "test_file.py::test_missing[trial-1]",
+        ]
+
+        session.record_trial_group(
+            base_nodeid="test_missing",
+            clone_nodeids=clone_nodeids,
+            threshold=1.0,
+        )
+
+        group = session.trial_groups["test_missing"]
+        assert group.total == 2
+        assert group.no_result == 2
+        assert group.pass_rate == pytest.approx(0.0)
+        assert not group.passed
 
     def test_record_trial_group_fails_below_threshold(self) -> None:
         session = RampartSession()
@@ -337,12 +392,41 @@ class TestRampartSession:
         assert group.pass_rate == pytest.approx(1.0)
         assert group.passed  # all SAFE and at/above threshold
 
+    def test_trial_group_counts_clones_not_same_node_attempts(self) -> None:
+        session = RampartSession()
+        repeated = MagicMock()
+        repeated.nodeid = "test_file.py::test_repeat[trial-0]"
+        repeated.get_closest_marker.return_value = None
+        other = MagicMock()
+        other.nodeid = "test_file.py::test_repeat[trial-1]"
+        other.get_closest_marker.return_value = None
+        for status in (SafetyStatus.SAFE, SafetyStatus.UNSAFE):
+            collector = ResultCollector()
+            collector.record(result=Result(status=status, summary=status.value))
+            session.absorb(node=repeated, collector=collector)
+        collector = ResultCollector()
+        collector.record(result=Result(status=SafetyStatus.SAFE, summary="safe"))
+        session.absorb(node=other, collector=collector)
+
+        session.record_trial_group(
+            base_nodeid="test_file.py::test_repeat",
+            clone_nodeids=[repeated.nodeid, other.nodeid],
+            threshold=0.5,
+        )
+
+        group = session.trial_groups["test_file.py::test_repeat"]
+        assert group.total == 2
+        assert group.safe == 1
+        assert group.unsafe == 1
+        assert not group.passed
+        assert session.build_report().total_runs == 3
+
     def test_record_trial_group_empty_items_noop(self) -> None:
         session = RampartSession()
         session.record_trial_group(
             base_nodeid="test_empty",
             clone_nodeids=[],
-            threshold=0.0,
+            threshold=1.0,
         )
         assert "test_empty" not in session.trial_groups
 
@@ -350,7 +434,7 @@ class TestRampartSession:
 def _make_trial_item(
     *,
     n: int = 3,
-    threshold: float = 0.0,
+    threshold: float = 1.0,
     nodeid: str = "test_file.py::test_example",
     name: str = "test_example",
 ) -> MagicMock:
@@ -497,6 +581,45 @@ class TestResolveTrialN:
         marker = pytest.mark.trial(n=False).mark
         with pytest.raises(pytest.UsageError, match="must be an integer"):
             _resolve_trial_n(marker)
+
+
+class TestResolveTrialThreshold:
+    def test_defaults_to_one(self) -> None:
+        marker = pytest.mark.trial(n=3).mark
+        assert _resolve_trial_threshold(marker) == pytest.approx(1.0)
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(0.25, 0.25), (1, 1.0), ("0.75", 0.75)],
+    )
+    def test_accepts_finite_values_in_range(
+        self,
+        value: float | str,
+        expected: float,
+    ) -> None:
+        marker = pytest.mark.trial(threshold=value).mark
+        assert _resolve_trial_threshold(marker) == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            0.0,
+            -0.1,
+            1.1,
+            math.nan,
+            math.inf,
+            -math.inf,
+            True,
+            False,
+            "not-a-number",
+            None,
+            10**400,
+        ],
+    )
+    def test_rejects_invalid_values(self, value: object) -> None:
+        marker = pytest.mark.trial(threshold=value).mark
+        with pytest.raises(pytest.UsageError, match=r"finite number in \(0, 1\]"):
+            _resolve_trial_threshold(marker)
 
 
 class TestWriteResultLine:
@@ -954,6 +1077,84 @@ class TestEvaluateGates:
         assert r"test.py::test\x1b\x0agate\x9b" in message
         assert "\x1b" not in message
         assert "\n" not in message
+
+
+class TestTrialGateExitStatus:
+    def _failed_group(self) -> RampartSession:
+        rampart_session = RampartSession()
+        rampart_session.record_trial_group(
+            base_nodeid="test.py::test_gate",
+            clone_nodeids=["test.py::test_gate[trial-0]"],
+            threshold=1.0,
+        )
+        return rampart_session
+
+    def test_failed_trial_forces_tests_failed(self) -> None:
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+
+        _enforce_trial_gate_exit_status(
+            session=cast("pytest.Session", session),
+            rampart_session=self._failed_group(),
+        )
+
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    @pytest.mark.parametrize(
+        "exitstatus",
+        [
+            pytest.ExitCode.TESTS_FAILED,
+            pytest.ExitCode.INTERRUPTED,
+            pytest.ExitCode.INTERNAL_ERROR,
+            pytest.ExitCode.USAGE_ERROR,
+            pytest.ExitCode.NO_TESTS_COLLECTED,
+            pytest.ExitCode.MAX_WARNINGS_ERROR,
+        ],
+    )
+    def test_failed_trial_preserves_existing_nonzero_status(
+        self,
+        exitstatus: pytest.ExitCode,
+    ) -> None:
+        session = MagicMock()
+        session.exitstatus = exitstatus
+
+        _enforce_trial_gate_exit_status(
+            session=cast("pytest.Session", session),
+            rampart_session=self._failed_group(),
+        )
+
+        assert session.exitstatus == exitstatus
+
+    def test_no_trial_groups_preserves_ok_status(self) -> None:
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+
+        _enforce_trial_gate_exit_status(
+            session=cast("pytest.Session", session),
+            rampart_session=RampartSession(),
+        )
+
+        assert session.exitstatus == pytest.ExitCode.OK
+
+
+class TestTrialMarkerDeprecation:
+    def test_warns_with_visible_pytest_category(self) -> None:
+        rampart_session = RampartSession()
+        rampart_session.register_trial_spec(
+            clone_nodeid="test.py::test_x[trial-0]",
+            base_nodeid="test.py::test_x",
+            threshold=1.0,
+        )
+
+        with pytest.warns(
+            pytest.PytestDeprecationWarning,
+            match="forthcoming execution-domain trial API",
+        ):
+            _warn_trial_marker_deprecated(rampart_session=rampart_session)
+
+    def test_noop_without_trial_specs(self, recwarn: pytest.WarningsRecorder) -> None:
+        _warn_trial_marker_deprecated(rampart_session=RampartSession())
+        assert not recwarn
 
 
 class TestEmitSinks:

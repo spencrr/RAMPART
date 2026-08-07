@@ -67,6 +67,7 @@ DEFAULT_SIZE_LIMIT_BYTES: int = 64 * 1024 * 1024
 MAX_METADATA_DEPTH: int = 6
 
 _TRUNCATED_MARKER: str = "rampart_truncated"
+_TRANSPORT_ERROR_MARKER: str = "rampart_transport_error"
 
 
 class WorkerOutputError(Exception):
@@ -79,6 +80,10 @@ class SchemaVersionError(WorkerOutputError):
 
 class SizeLimitError(WorkerOutputError):
     """Raised when a worker payload exceeds the configured size cap."""
+
+
+class TrialSpecValidationError(WorkerOutputError):
+    """Raised when a trial threshold violates the current transport schema."""
 
 
 def is_xdist_worker(*, config: pytest.Config) -> bool:
@@ -478,6 +483,58 @@ def _serialize_result(*, result: Result, nodeid: str) -> dict[str, Any]:
     }
 
 
+def _validate_trial_threshold(*, value: object, context: str) -> float:
+    """Validate a threshold at the current-schema transport boundary.
+
+    Args:
+        value (object): The threshold value to validate.
+        context (str): Identifying context for the error message.
+
+    Returns:
+        float: The validated threshold.
+
+    Raises:
+        TrialSpecValidationError: If the threshold is invalid.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        msg = f"{context} must be a finite number in (0, 1], got {value!r}."
+        raise TrialSpecValidationError(msg)
+    try:
+        threshold = float(value)
+    except OverflowError:
+        msg = f"{context} must be a finite number in (0, 1], got {value!r}."
+        raise TrialSpecValidationError(msg) from None
+    if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
+        msg = f"{context} must be a finite number in (0, 1], got {value!r}."
+        raise TrialSpecValidationError(msg)
+    return threshold
+
+
+def _serialize_trial_spec(
+    *,
+    clone_nodeid: str,
+    spec: TrialSpec,
+) -> dict[str, str | float]:
+    """Serialize and validate one trial specification.
+
+    Args:
+        clone_nodeid (str): The cloned pytest node ID.
+        spec (TrialSpec): The trial specification.
+
+    Returns:
+        dict[str, str | float]: The current-schema wire representation.
+    """
+    threshold = _validate_trial_threshold(
+        value=spec.threshold,
+        context=f"Trial threshold for {clone_nodeid!r}",
+    )
+    return {
+        "clone_nodeid": clone_nodeid,
+        "base_nodeid": spec.base_nodeid,
+        "threshold": threshold,
+    }
+
+
 def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
     """Serialize a worker's RampartSession state for transport to the controller.
 
@@ -492,6 +549,9 @@ def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
     Returns:
         dict[str, Any]: A JSON-safe payload ready to write to
             ``config.workeroutput``.
+
+    Raises:
+        TrialSpecValidationError: If an internal trial threshold is invalid.
     """
     serialized: dict[str, list[dict[str, Any]]] = {}
     for nodeid, results in session.results_by_nodeid.items():
@@ -502,11 +562,7 @@ def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
         "schema": SCHEMA_VERSION,
         "results_by_nodeid": serialized,
         "trial_specs": [
-            {
-                "clone_nodeid": clone_nodeid,
-                "base_nodeid": spec.base_nodeid,
-                "threshold": _safe_float(value=spec.threshold) or 0.0,
-            }
+            _serialize_trial_spec(clone_nodeid=clone_nodeid, spec=spec)
             for clone_nodeid, spec in session.trial_specs.items()
         ],
     }
@@ -960,10 +1016,9 @@ def deserialize_worker_data(*, data: object) -> dict[str, list[Result]]:
 def deserialize_trial_specs(*, data: object) -> dict[str, TrialSpec]:
     """Deserialize the ``trial_specs`` section of a worker payload.
 
-    Missing or malformed entries are skipped rather than raised so
-    that a partially-corrupt payload still merges results. The
-    ``trial_specs`` field is optional: payloads without trials emit
-    an empty list and this function returns an empty dict.
+    The block is optional for payloads without trials. Every present
+    current-schema block and entry must be structurally valid and contain
+    a valid threshold.
 
     Args:
         data (object): The deserialized JSON object from
@@ -975,36 +1030,33 @@ def deserialize_trial_specs(*, data: object) -> dict[str, TrialSpec]:
     Raises:
         SchemaVersionError: Missing or unknown schema version.
         WorkerOutputError: ``data`` is not a dict payload.
+        TrialSpecValidationError: A current-schema threshold is invalid.
     """
     typed = _validate_schema(data=data)
-    raw_specs = typed.get("trial_specs", [])
-    if not isinstance(raw_specs, list):
+    if "trial_specs" not in typed:
         return {}
+    raw_specs = typed["trial_specs"]
+    if not isinstance(raw_specs, list):
+        msg = f"Expected list for trial_specs, got {type(raw_specs).__name__}."
+        raise TrialSpecValidationError(msg)
     out: dict[str, TrialSpec] = {}
-    for spec in cast("list[Any]", raw_specs):
+    for index, spec in enumerate(cast("list[Any]", raw_specs)):
         if not isinstance(spec, dict):
-            continue
+            msg = f"Expected dict for trial_specs[{index}], got {type(spec).__name__}."
+            raise TrialSpecValidationError(msg)
         spec_dict = cast("dict[str, Any]", spec)
         clone_nodeid = spec_dict.get("clone_nodeid")
         base_nodeid = spec_dict.get("base_nodeid")
         if not isinstance(clone_nodeid, str) or not isinstance(base_nodeid, str):
-            continue
+            msg = f"trial_specs[{index}] requires string clone_nodeid and base_nodeid."
+            raise TrialSpecValidationError(msg)
         if not clone_nodeid or not base_nodeid:
-            continue
-        raw_threshold = spec_dict.get("threshold", 0.0)
-        try:
-            threshold = (
-                float(raw_threshold)
-                if isinstance(
-                    raw_threshold,
-                    int | float,
-                )
-                else 0.0
-            )
-        except (TypeError, ValueError):
-            threshold = 0.0
-        if not math.isfinite(threshold):
-            threshold = 0.0
+            msg = f"trial_specs[{index}] node IDs must not be empty."
+            raise TrialSpecValidationError(msg)
+        threshold = _validate_trial_threshold(
+            value=spec_dict.get("threshold"),
+            context=f"Trial threshold for {clone_nodeid!r}",
+        )
         out[clone_nodeid] = TrialSpec(
             base_nodeid=base_nodeid,
             threshold=threshold,
@@ -1024,6 +1076,8 @@ def finalize_worker(*, config: pytest.Config, session: RampartSession) -> None:
         session (RampartSession): The worker's session state.
 
     Raises:
+        TrialSpecValidationError: If a trial threshold is invalid. An
+            explicit transport-error marker is written before raising.
         SizeLimitError: If the serialized payload exceeds the
             configured cap. The truncation marker is still written to
             ``workeroutput`` before the exception is raised so the
@@ -1031,14 +1085,21 @@ def finalize_worker(*, config: pytest.Config, session: RampartSession) -> None:
     """
     if not is_xdist_worker(config=config):
         return
-    payload = serialize_worker_data(session=session)
-    encoded = json.dumps(payload, default=str)
-    size = len(encoded.encode("utf-8"))
-    limit = _size_limit(config=config)
     workeroutput = cast(
         "dict[str, Any]",
         config.workeroutput,  # ty: ignore[unresolved-attribute]
     )
+    try:
+        payload = serialize_worker_data(session=session)
+    except TrialSpecValidationError as exc:
+        workeroutput[WORKEROUTPUT_KEY] = {
+            "schema": SCHEMA_VERSION,
+            _TRANSPORT_ERROR_MARKER: str(exc),
+        }
+        raise
+    encoded = json.dumps(payload, default=str)
+    size = len(encoded.encode("utf-8"))
+    limit = _size_limit(config=config)
     if size > limit:
         workeroutput[WORKEROUTPUT_KEY] = {
             "schema": SCHEMA_VERSION,
@@ -1058,16 +1119,18 @@ def finalize_worker(*, config: pytest.Config, session: RampartSession) -> None:
 
 def _safe_deserialize_trial_specs(
     *,
+    session: RampartSession,
     payload: object,
     worker_id_str: str,
 ) -> dict[str, TrialSpec]:
     """Deserialize trial specs from a worker payload without raising.
 
-    Trial specs are optional metadata: a corrupt or absent block must
-    never block result merging. Errors are logged at warning level and
-    return an empty dict.
+    Trial specs are optional metadata: a corrupt block must not block
+    result merging, but it marks the controller run incomplete. An absent
+    block represents no trial specs.
 
     Args:
+        session (RampartSession): The controller session to mark incomplete.
         payload (object): The deserialized worker payload.
         worker_id_str (str): Worker identifier for logging.
 
@@ -1081,6 +1144,9 @@ def _safe_deserialize_trial_specs(
             "Failed to deserialize trial specs from worker %s: %s",
             escape_terminal_controls(worker_id_str),
             escape_terminal_controls(str(exc)),
+        )
+        session.mark_incomplete(
+            reason=f"worker {worker_id_str} trial spec validation failed: {exc}",
         )
         return {}
 
@@ -1163,6 +1229,22 @@ def handle_testnodedown(
             reason=f"worker {worker_id_str} payload truncated (size cap)",
         )
         return
+    transport_error = (
+        typed_payload_dict.get(_TRANSPORT_ERROR_MARKER)
+        if typed_payload_dict is not None
+        else None
+    )
+    if transport_error is not None:
+        reason = escape_terminal_controls(str(transport_error))
+        logger.error(
+            "Worker %s RAMPART transport validation failed: %s",
+            worker_id_str,
+            reason,
+        )
+        session.mark_incomplete(
+            reason=f"worker {worker_id_str} transport validation failed: {reason}",
+        )
+        return
     try:
         results_by_nodeid = deserialize_worker_data(data=cast("object", payload))
     except WorkerOutputError as exc:
@@ -1176,6 +1258,7 @@ def handle_testnodedown(
         )
         return
     trial_specs = _safe_deserialize_trial_specs(
+        session=session,
         payload=cast("object", payload),
         worker_id_str=worker_id_str,
     )

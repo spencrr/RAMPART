@@ -39,9 +39,15 @@ Built-in categories:
 | `HALLUCINATION` | `"hallucination"` |
 | `BEHAVIORAL_REGRESSION` | `"behavioral_regression"` |
 
-### `@pytest.mark.trial(n=, threshold=)`
+### `@pytest.mark.trial(n=, threshold=1.0)`
 
 Run a test multiple times for statistical confidence. Each trial is an independent execution with a fresh session.
+
+!!! warning "Deprecated clone-based API"
+    The clone-based `@pytest.mark.trial` marker is a temporary compatibility
+    mechanism and emits a `pytest.PytestDeprecationWarning`. Migrate when the
+    forthcoming execution-domain trial API becomes available. That replacement
+    is not part of the current release.
 
 **Why use it:** LLM-based agents are non-deterministic — the same prompt can produce different behavior across runs. A single test execution may not be representative. Trials address this by running the same test `n` times independently and reporting aggregate statistics. The `threshold` parameter lets you set an acceptable pass rate, acknowledging that 100% consistency may be unrealistic while still catching regressions. For example, `threshold=0.8` means "this test should pass at least 80% of the time" — if your agent suddenly drops below that, something changed.
 
@@ -58,7 +64,7 @@ async def test_with_threshold(adapter):
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `n` | `int` | required | Number of trial repetitions |
-| `threshold` | `float` | `1.0` | Minimum fraction of trials that must be SAFE to pass |
+| `threshold` | `float` | `1.0` | Minimum fraction of trials that must be SAFE to pass; must be finite and in `(0, 1]` |
 
 **Trial semantics:**
 
@@ -66,7 +72,15 @@ async def test_with_threshold(adapter):
 - Any `UNSAFE` result in any trial → the group **fails**
 - `threshold` sets the minimum pass rate: `threshold=0.8` requires ≥ 80% SAFE
 - `ERROR` results count against the pass rate (they are not `SAFE`)
+- A clone that records no result counts against the pass rate
+- A failed aggregate forces a nonzero pytest exit status
 - The trial group aggregate appears in the terminal summary
+
+Each clone remains an ordinary pytest item. Its own assertions are evaluated
+independently, so `assert result` can fail a clone even when an aggregate
+threshold below `1.0` would otherwise tolerate that outcome. This stricter
+clone-level behavior is a limitation of the temporary cloning implementation.
+Invalid threshold values fail collection with a pytest usage error.
 
 !!! tip "Running trials in parallel"
     Under [`pytest-xdist`](xdist.md), aggregation is correct under any `--dist` mode. The default `--dist=load` spreads trial clones across all workers and is usually fastest; use `--dist=loadgroup` only when a trial group must stay on one worker (shared session fixture or per-group worker state). See [Choosing `loadgroup` vs `load`](xdist.md#choosing-loadgroup-vs-load).
@@ -205,5 +219,4 @@ Each result line shows:
 Trial group lines show aggregate stats: safe count, pass rate, threshold, and overall verdict.
 
 The **Population** line shows totals across all tests in the session, with the attack success rate excluding `ERROR` results from the denominator.
-
 

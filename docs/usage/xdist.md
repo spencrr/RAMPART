@@ -53,11 +53,14 @@ The result: **one** `JsonFileReportSink` output file, **one** call to `MyCustomS
 
 | `--dist` mode | Trial behavior |
 |---------------|----------------|
+| `each` | Every worker executes every trial clone |
 | `loadgroup` | All trial clones for one test pinned to the same worker |
 | `load` (default) | Trial clones distributed across all workers |
 | `loadscope` / `loadfile` | Grouped by class/module/file |
 
-**Correctness is preserved regardless of mode** — the controller aggregates trial groups from the merged result set and evaluates each group's threshold against the full population. You'll see a warning if you use `@trial` markers without `--dist=loadgroup`:
+**Correctness is preserved regardless of mode** — the controller retains the
+merged result population before evaluating logical trial-clone groups. You'll
+see a warning if you use `@trial` markers without `--dist=loadgroup`:
 
 ```text
 RAMPART @trial markers present with --dist=load. Trial clones may be
@@ -67,6 +70,14 @@ on one worker for better locality.
 ```
 
 This warning is **informational, not a correctness signal** — see below for when it's safe to ignore.
+
+`--dist=each` deliberately creates multiple genuine executions with the same
+node ID. Every execution is retained in `TestRunReport.results` and
+`total_runs`. The temporary clone-based trial gate still uses the number of
+logical clones as its denominator rather than multiplying it by worker count;
+multiple Results for one clone are evaluated fail-closed (`UNSAFE`, then
+`ERROR`, then `SAFE`). This distinction will be replaced by the forthcoming
+execution-domain trial API.
 
 ### Choosing `loadgroup` vs `load`
 

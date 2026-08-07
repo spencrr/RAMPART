@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
+import warnings
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -47,11 +49,12 @@ from rampart.pytest_plugin._collection import (
     deactivate_collector,
     get_active_collector,
 )
-from rampart.pytest_plugin._session import RampartSession
+from rampart.pytest_plugin._session import RampartSession, TrialSpec
 from rampart.pytest_plugin._xdist import (
     DEFAULT_SIZE_LIMIT_BYTES,
     SIZE_LIMIT_OPTION,
     SizeLimitError,
+    TrialSpecValidationError,
     discover_sinks_from_conftest,
     finalize_worker,
     get_dist_mode,
@@ -135,19 +138,33 @@ def _resolve_trial_n(marker: pytest.Mark) -> int:
 def _resolve_trial_threshold(marker: pytest.Mark) -> float:
     """Extract the threshold from a trial marker.
 
-    Returns 0.0 when no threshold is provided (the historical default).
+    Defaults to 1.0 and validates the collection-time marker value.
 
     Args:
         marker (pytest.Mark): The trial marker.
 
     Returns:
-        float: The pass-rate threshold in [0.0, 1.0].
+        float: The finite pass-rate threshold in (0.0, 1.0].
+
+    Raises:
+        pytest.UsageError: If the value is not a finite number in (0, 1].
     """
-    raw: Any = marker.kwargs.get("threshold", 0.0)
+    raw: Any = marker.kwargs.get("threshold", TrialSpec.DEFAULT_THRESHOLD)
+    if isinstance(raw, bool):
+        msg = f"trial(threshold=) must be a finite number in (0, 1], got bool: {raw!r}"
+        raise pytest.UsageError(msg)
     try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return 0.0
+        threshold = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        msg = (
+            "trial(threshold=) must be a finite number in (0, 1], "
+            f"got {type(raw).__name__}: {raw!r}"
+        )
+        raise pytest.UsageError(msg) from None
+    if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
+        msg = f"trial(threshold=) must be a finite number in (0, 1], got {raw!r}"
+        raise pytest.UsageError(msg)
+    return threshold
 
 
 def pytest_addhooks(pluginmanager: pytest.PytestPluginManager) -> None:
@@ -207,7 +224,10 @@ def pytest_configure(config: pytest.Config) -> None:
         config (pytest.Config): The pytest configuration object.
     """
     config.addinivalue_line("markers", "harm(*categories): categorize by harm type")
-    config.addinivalue_line("markers", "trial(n=, threshold=): statistical repetition")
+    config.addinivalue_line(
+        "markers",
+        "trial(n=, threshold=1.0): deprecated clone-based statistical repetition",
+    )
 
     register_default_handler_factory(_default_handler_factory)
 
@@ -392,7 +412,7 @@ def _absorb_results(
     rampart_session: RampartSession,
     node: pytest.Item,
     collector: ResultCollector,
-) -> None:
+) -> tuple[Result, ...] | None:
     """Safely absorb collected results into the session.
 
     Catches and logs any unexpected errors to prevent the plugin from
@@ -402,15 +422,20 @@ def _absorb_results(
         rampart_session (RampartSession): The session to absorb into.
         node (pytest.Item): The test item that produced the results.
         collector (ResultCollector): The test's result collector.
+
+    Returns:
+        tuple[Result, ...] | None: The exact Results absorbed for this
+            attempt, or None when absorption failed.
     """
     try:
-        rampart_session.absorb(node=node, collector=collector)
+        return rampart_session.absorb(node=node, collector=collector)
     except Exception as exc:  # ruff: ignore[blind-except] — plugin isolation
         logger.warning(
             "Failed to absorb results for %s — results may be incomplete: %s",
             escape_terminal_controls(node.nodeid),
             format_exception_for_terminal(exc),
         )
+        return None
 
 
 @pytest.fixture(autouse=True)
@@ -693,6 +718,29 @@ def _evaluate_gates(
             )
 
 
+def _enforce_trial_gate_exit_status(
+    *,
+    session: pytest.Session,
+    rampart_session: RampartSession,
+) -> None:
+    """Force a non-zero exit status when a trial aggregate fails.
+
+    This gate is limited to clone-based trial groups. Existing nonzero
+    pytest statuses are preserved.
+
+    Args:
+        session (pytest.Session): The active pytest session.
+        rampart_session (RampartSession): The merged RAMPART session state.
+    """
+    if not any(not group.passed for group in rampart_session.trial_groups.values()):
+        return
+    if session.exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        logger.warning(
+            "A RAMPART trial aggregate failed; forcing non-zero exit status."
+        )
+
+
 def _enforce_incomplete_exit_status(
     *,
     session: pytest.Session,
@@ -719,6 +767,24 @@ def _enforce_incomplete_exit_status(
         )
 
 
+def _warn_trial_marker_deprecated(*, rampart_session: RampartSession) -> None:
+    """Warn once when the temporary clone-based trial marker was collected.
+
+    Args:
+        rampart_session (RampartSession): The merged RAMPART session state.
+    """
+    if not rampart_session.trial_specs:
+        return
+    warnings.warn(
+        pytest.PytestDeprecationWarning(
+            "The clone-based @pytest.mark.trial marker is deprecated. "
+            "Migrate to the forthcoming execution-domain trial API when "
+            "it becomes available."
+        ),
+        stacklevel=2,
+    )
+
+
 def pytest_sessionfinish(
     session: pytest.Session,
     exitstatus: int,  # ruff: ignore[unused-function-argument]  — pytest hook signature
@@ -739,6 +805,8 @@ def pytest_sessionfinish(
 
     An incomplete run (a lost or crashed worker) is forced to a non-zero
     exit status so a dropped shard cannot pass silently.
+    Collection-only runs skip trial gate construction because their lack
+    of execution results is intentional.
 
     Args:
         session (pytest.Session): The pytest session.
@@ -755,13 +823,20 @@ def pytest_sessionfinish(
     if is_xdist_worker(config=session.config):
         try:
             finalize_worker(config=session.config, session=rampart_session)
-        except SizeLimitError as exc:
+        except (SizeLimitError, TrialSpecValidationError) as exc:
             logger.warning("%s", exc)
         return
 
-    _aggregate_trial_results(rampart_session=rampart_session)
-    _evaluate_gates(rampart_session=rampart_session)
+    collect_only = session.config.getoption("collectonly", default=False) is True
+    if not collect_only:
+        _aggregate_trial_results(rampart_session=rampart_session)
+        _evaluate_gates(rampart_session=rampart_session)
+        _enforce_trial_gate_exit_status(
+            session=session,
+            rampart_session=rampart_session,
+        )
     _enforce_incomplete_exit_status(session=session, rampart_session=rampart_session)
+    _warn_trial_marker_deprecated(rampart_session=rampart_session)
 
     if is_xdist_controller(config=session.config):
         _record_xdist_metadata(session=session, rampart_session=rampart_session)

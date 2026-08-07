@@ -435,6 +435,7 @@ class TestXdistTrialAggregation:
             "load",
         )
         result.assert_outcomes(passed=4)
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
         reports = _load_reports(configured_pytester)
         assert len(reports) == 1
         report = reports[0]
@@ -445,6 +446,174 @@ class TestXdistTrialAggregation:
             "FAIL  test_trial_mixed_load [3/4 safe, 75% pass rate, threshold: 50%]"
             in summary
         )
+
+
+class TestTrialExitStatus:
+    def test_default_threshold_fails_below_full_pass_rate(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_below_threshold="""
+            import pytest
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+            @pytest.mark.trial(n=2)
+            def test_below_threshold(request):
+                safe = request.node.name.endswith("[trial-0]")
+                record_result(Result(
+                    status=(
+                        SafetyStatus.SAFE if safe else SafetyStatus.UNDETERMINED
+                    ),
+                    summary="safe" if safe else "undetermined",
+                ))
+            """,
+        )
+
+        result = configured_pytester.runpytest("-p", "no:cacheprovider")
+
+        result.assert_outcomes(passed=2)
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
+        assert (
+            "FAIL  test_below_threshold "
+            "[1/2 safe, 50% pass rate, threshold: 100%]" in "\n".join(result.outlines)
+        )
+
+    def test_all_error_group_exits_nonzero(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_all_error="""
+            import pytest
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+            @pytest.mark.trial(n=2)
+            def test_all_error():
+                record_result(Result(
+                    status=SafetyStatus.ERROR,
+                    summary="infrastructure error",
+                ))
+            """,
+        )
+
+        result = configured_pytester.runpytest("-p", "no:cacheprovider")
+
+        result.assert_outcomes(passed=2)
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
+
+    def test_all_no_result_group_exits_nonzero(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_all_no_result="""
+            import pytest
+
+            @pytest.mark.trial(n=2)
+            def test_all_no_result():
+                pass
+            """,
+        )
+
+        result = configured_pytester.runpytest("-p", "no:cacheprovider")
+
+        result.assert_outcomes(passed=2)
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
+
+    def test_invalid_threshold_fails_collection_clearly(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_invalid_threshold="""
+            import pytest
+
+            @pytest.mark.trial(n=2, threshold=float("nan"))
+            def test_invalid_threshold():
+                pass
+            """,
+        )
+
+        result = configured_pytester.runpytest("-p", "no:cacheprovider")
+
+        assert result.ret == pytest.ExitCode.USAGE_ERROR
+        result.stderr.fnmatch_lines(["*trial(threshold=)*finite number in (0, 1]*"])
+
+
+class TestXdistEachAttempts:
+    def test_each_worker_execution_is_preserved(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_each="""
+            import pytest
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+            @pytest.mark.harm("test")
+            def test_each():
+                record_result(Result(status=SafetyStatus.SAFE, summary="kept"))
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "2",
+            "--dist",
+            "each",
+        )
+
+        result.assert_outcomes(passed=2)
+        assert result.ret == pytest.ExitCode.OK
+        reports = _load_reports(configured_pytester)
+        assert len(reports) == 1
+        assert reports[0]["total_runs"] == 2
+        assert reports[0]["population_summary"]["total_runs"] == 2
+
+
+class TestTrialMarkerDeprecation:
+    @pytest.mark.parametrize(
+        "args",
+        [(), ("-n", "2")],
+        ids=["serial", "xdist"],
+    )
+    def test_warning_is_visible_once(
+        self,
+        configured_pytester: Pytester,
+        args: tuple[str, ...],
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_deprecated_trial="""
+            import pytest
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+            @pytest.mark.trial(n=2)
+            def test_deprecated_trial():
+                record_result(Result(status=SafetyStatus.SAFE, summary="safe"))
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            *args,
+        )
+
+        result.assert_outcomes(passed=2)
+        warning_lines = [
+            line
+            for line in result.outlines
+            if "clone-based @pytest.mark.trial marker is deprecated" in line
+        ]
+        assert len(warning_lines) == 1
+        assert any("PytestDeprecationWarning" in line for line in warning_lines)
 
 
 class TestXdistMetadata:
@@ -528,6 +697,8 @@ class TestCloneIdDeterminism:
             "-n",
             "2",
         )
+        assert result_serial.ret == pytest.ExitCode.OK
+        assert result_parallel.ret == pytest.ExitCode.OK
 
         def _trial_ids(lines: list[str]) -> list[str]:
             return sorted(line.strip() for line in lines if "trial-" in line)

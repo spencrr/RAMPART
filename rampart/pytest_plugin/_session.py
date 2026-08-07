@@ -13,7 +13,7 @@ import copy
 import logging
 from collections import Counter
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from rampart.core.result import Result, SafetyStatus
 from rampart.reporting.sink import ReportSink, TestRunReport
@@ -60,6 +60,8 @@ class TrialSpec:
         base_nodeid (str): The original test's pytest node ID.
         threshold (float): Minimum pass rate required for the group.
     """
+
+    DEFAULT_THRESHOLD: ClassVar[float] = 1.0
 
     base_nodeid: str
     threshold: float
@@ -187,7 +189,12 @@ class RampartSession:
         """
         self._duration_seconds = duration_seconds
 
-    def absorb(self, *, node: pytest.Item, collector: ResultCollector) -> None:
+    def absorb(
+        self,
+        *,
+        node: pytest.Item,
+        collector: ResultCollector,
+    ) -> tuple[Result, ...]:
         """Absorb results from a completed test's collector.
 
         Tags each result with the short test name (extracted from the
@@ -202,6 +209,11 @@ class RampartSession:
         Args:
             node (pytest.Item): The test item that just completed.
             collector (ResultCollector): The test's result collector.
+
+        Returns:
+            tuple[Result, ...]: The exact tagged Result objects stored for
+                this call, in collector order. The objects are shared with
+                the session and must be treated as read-only.
         """
         test_name = node.nodeid.split("::")[-1] if "::" in node.nodeid else node.nodeid
         harm_marker = node.get_closest_marker("harm")
@@ -210,6 +222,8 @@ class RampartSession:
         )
 
         collected = collector.results
+        node_results = self._results_by_nodeid.setdefault(node.nodeid, [])
+        result_index_offset = len(node_results)
         tagged: list[Result] = []
         for result_index, original_result in enumerate(collected):
             # Shallow copy is sufficient because we reconstruct all
@@ -219,14 +233,15 @@ class RampartSession:
                 **result.metadata,
                 "_pytest_test_name": test_name,
                 "_pytest_nodeid": node.nodeid,
-                "_rampart_result_index": result_index,
+                "_rampart_result_index": result_index_offset + result_index,
             }
             if harm_category is not None and result.harm_category is None:
                 result.harm_category = harm_category
             tagged.append(result)
         self._results.extend(tagged)
-        self._results_by_nodeid[node.nodeid] = tagged
+        node_results.extend(tagged)
         self._cached_report = None
+        return tuple(tagged)
 
     def record_trial_group(
         self,
@@ -255,6 +270,7 @@ class RampartSession:
         if not clone_nodeids:
             return
 
+        # Trial gates remain per logical clone; raw reports retain every Result.
         total = len(clone_nodeids)
         unsafe_count = 0
         error_count = 0
