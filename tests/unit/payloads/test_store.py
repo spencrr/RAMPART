@@ -4,12 +4,17 @@
 """Tests for rampart.payloads._store — PayloadStore persistence."""
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
 from rampart.core.types import Payload, PayloadFormat
 from rampart.payloads._store import PayloadStore
+
+
+def _format_record(record: logging.LogRecord) -> str:
+    return logging.Formatter("%(levelname)s:%(message)s").format(record)
 
 
 @pytest.fixture
@@ -120,6 +125,32 @@ class TestPayloadStoreCollectionManagement:
         store.save("doomed", payloads=[Payload(content="x", id="p1")])
         store.delete("doomed")
         assert not store.exists("doomed")
+
+    def test_save_and_delete_logs_escape_collection_name(
+        self,
+        store: PayloadStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        name = "collection\x7f\x9b雪"
+
+        with caplog.at_level(logging.INFO):
+            store.save(name, payloads=[Payload(content="x", id="p1")])
+
+        save_log = _format_record(caplog.records[-1])
+        assert r"collection\x7f\x9b雪" in save_log
+        assert "\x7f" not in save_log
+        assert "\x9b" not in save_log
+        assert store.exists(name)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            store.delete(name)
+
+        delete_log = _format_record(caplog.records[-1])
+        assert r"collection\x7f\x9b雪" in delete_log
+        assert "\x7f" not in delete_log
+        assert "\x9b" not in delete_log
+        assert not store.exists(name)
 
     def test_manifest_roundtrip(self, store: PayloadStore) -> None:
         store.save(

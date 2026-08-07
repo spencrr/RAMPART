@@ -11,6 +11,7 @@ points (``create_prompt_target``, ``PromptNormalizer``, and
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
@@ -48,6 +49,10 @@ _TEST_LLM = LLMConfig(
     endpoint="https://api.openai.com/v1",
     api_key="sk-test",
 )
+
+
+def _format_record(record: logging.LogRecord) -> str:
+    return logging.Formatter("%(levelname)s:%(message)s").format(record)
 
 
 def _verdict_json(
@@ -474,6 +479,35 @@ class TestFailureTiers:
             judge = LLMJudge(objective="x", llm=_TEST_LLM)
             with pytest.raises(EvaluatorError, match="judge LLM"):
                 await judge.evaluate_async(context=_make_ctx())
+
+    def test_undetermined_log_escapes_dynamic_values(self, caplog) -> None:
+        raw_cause = "cause\x1b\t\n\r\x7f\x9b"
+        raw_persona = "persona\x1b\t\n\r\x7f\x9b"
+        raw_rationale = "rationale\x1b\t\n\r\x7f\x9b"
+        persona = Persona(name=raw_persona)
+        judge = LLMJudge(
+            objective="x",
+            llm=_TEST_LLM,
+            persona=persona,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = judge._undetermined(
+                rationale=raw_rationale,
+                cause=raw_cause,
+            )
+
+        formatted = _format_record(caplog.records[-1])
+        assert r"cause\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert r"persona\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
+        assert result.rationale == raw_rationale
+        assert judge._persona.name == raw_persona
 
 
 class TestComposition:

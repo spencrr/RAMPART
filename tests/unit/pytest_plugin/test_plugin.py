@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -23,6 +23,7 @@ from rampart.pytest_plugin._collection import (
 )
 from rampart.pytest_plugin._session import RampartSession
 from rampart.pytest_plugin.plugin import (
+    _absorb_results,
     _call_results_key,
     _emit_sinks,
     _enforce_incomplete_exit_status,
@@ -82,6 +83,10 @@ class _ConfigStub:
     def addinivalue_line(self, name: str, line: str) -> None:
         """Record marker registrations."""
         self._ini_lines.append((name, line))
+
+
+def _format_record(record: logging.LogRecord) -> str:
+    return logging.Formatter("%(levelname)s:%(message)s").format(record)
 
 
 class TestDefaultHandlerFactory:
@@ -150,6 +155,37 @@ class TestRampartSession:
     def test_has_results_false_when_empty(self) -> None:
         session = RampartSession()
         assert not session.has_results
+
+    def test_absorb_failure_log_escapes_complete_traceback(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        raw_error = "absorb\x1b\t\n\r\x7f\x9b"
+        raw_nodeid = "test\x1b\nnode\x9b"
+        error = RuntimeError(raw_error)
+        session = MagicMock()
+        session.absorb.side_effect = error
+        node = MagicMock()
+        node.nodeid = raw_nodeid
+
+        with caplog.at_level(logging.WARNING):
+            _absorb_results(
+                rampart_session=session,
+                node=node,
+                collector=ResultCollector(),
+            )
+
+        formatted = _format_record(caplog.records[-1])
+        assert r"test\x1b\x0anode\x9b" in formatted
+        assert r"RuntimeError: absorb\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert "Traceback (most recent call last):" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
+        assert str(error) == raw_error
 
     def test_build_report_counts(self) -> None:
         session = RampartSession()
@@ -927,20 +963,44 @@ class TestEmitSinks:
         session = RampartSession()
         _emit_sinks(rampart_session=session)
 
-    def test_sink_error_swallowed(self) -> None:
+    def test_sink_error_log_escapes_traceback_and_preserves_report(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """A failing sink does not raise."""
-        mock_sink = MagicMock()
-        mock_sink.emit_async = AsyncMock(side_effect=RuntimeError("Kusto down"))
-        session = RampartSession(sinks=[mock_sink])
+        raw_error = "Kusto\x1b\t\n\r\x7f\x9b down"
+        raw_summary = "summary\x1b\t\n\r\x7f\x9b"
+        captured: list[str] = []
+
+        class FailingSink:
+            async def emit_async(self, *, report: TestRunReport) -> None:
+                captured.append(report.results[0].summary)
+                raise RuntimeError(raw_error)
+
+        FailingSink.__name__ = "Sink\x1b\n\x9b"
+        session = RampartSession(sinks=[FailingSink()])
         collector = ResultCollector()
         collector.record(
-            result=Result(status=SafetyStatus.SAFE, summary="ok"),
+            result=Result(status=SafetyStatus.SAFE, summary=raw_summary),
         )
         node = MagicMock()
         node.nodeid = "test.py::test_sink"
         session.absorb(node=node, collector=collector)
-        # Should not raise
-        _emit_sinks(rampart_session=session)
+
+        with caplog.at_level(logging.WARNING):
+            _emit_sinks(rampart_session=session)
+
+        formatted = _format_record(caplog.records[-1])
+        assert r"Sink\x1b\x0a\x9b.emit_async failed" in formatted
+        assert r"RuntimeError: Kusto\x1b\x09\x0a\x0d\x7f\x9b down" in formatted
+        assert "Traceback (most recent call last):" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
+        assert captured == [raw_summary]
 
     def test_custom_sink_receives_raw_evidence(self) -> None:
         captured: list[str] = []
@@ -1023,6 +1083,59 @@ class TestSinkHookResolution:
         ]
         result = _resolve_hook_sinks(config=config)
         assert result == [sink_a]
+
+    def test_non_report_sink_repr_is_terminal_safe(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        class HostileRepr:
+            def __repr__(self) -> str:
+                return "sink\x1b\t\n\r\x7f\x9b"
+
+        config = MagicMock()
+        config.pluginmanager.hook.pytest_rampart_sinks.return_value = [
+            [HostileRepr()],
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            result = _resolve_hook_sinks(config=config)
+
+        assert result == []
+        formatted = _format_record(caplog.records[-1])
+        assert r"sink\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
+
+    def test_non_report_sink_raising_repr_does_not_abort_resolution(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        class BrokenRepr:
+            def __repr__(self) -> str:
+                raise RuntimeError("broken repr")
+
+        BrokenRepr.__name__ = "Broken\x1b\nType\x9b"
+        config = MagicMock()
+        config.pluginmanager.hook.pytest_rampart_sinks.return_value = [
+            [BrokenRepr()],
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            result = _resolve_hook_sinks(config=config)
+
+        assert result == []
+        formatted = _format_record(caplog.records[-1])
+        assert (
+            r"<unrepresentable Broken\x1b\x0aType\x9b; "
+            "RuntimeError raised by repr()>"
+        ) in formatted
+        assert "\x1b" not in formatted
+        assert "\n" not in formatted
+        assert "\x9b" not in formatted
 
     def test_resolve_hook_sinks_skips_non_list_results(self) -> None:
         sink_a = MagicMock(spec=ReportSink)

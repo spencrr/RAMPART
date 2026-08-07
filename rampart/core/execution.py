@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from rampart.common.text import escape_terminal_controls, format_exception_for_terminal
 from rampart.core.result import Result, SafetyStatus
 from rampart.core.types import EvalContext, Request, Response, Turn
 
@@ -239,12 +240,13 @@ class BaseExecution(ABC):
 
         try:
             result = await self._execute_async(adapter=adapter)
-        except Exception as exc:
+        except Exception as exc:  # ruff: ignore[blind-except] — converted to ERROR
             error_type = type(exc).__name__
-            logger.exception(
-                "%s during %s execution",
-                error_type,
-                self.strategy_name,
+            logger.error(  # ruff: ignore[error-instead-of-exception] — sanitized trace
+                "%s during %s execution: %s",
+                escape_terminal_controls(error_type),
+                escape_terminal_controls(self.strategy_name),
+                format_exception_for_terminal(exc),
             )
 
             await self._fire(
@@ -315,12 +317,12 @@ class BaseExecution(ABC):
         for handler in self._handlers:
             try:
                 await handler.on_event(event_data=event_data)
-            except Exception:
+            except Exception as exc:  # ruff: ignore[blind-except] — handler isolation
                 logger.warning(
-                    "ExecutionEventHandler %s raised on %s — ignored.",
-                    handler.__class__.__name__,
+                    "ExecutionEventHandler %s raised on %s — ignored: %s",
+                    escape_terminal_controls(handler.__class__.__name__),
                     event.value,
-                    exc_info=True,
+                    format_exception_for_terminal(exc),
                 )
 
 

@@ -28,7 +28,11 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 from rampart.common.deprecation import emit_deprecation_warning
-from rampart.common.text import escape_terminal_controls
+from rampart.common.text import (
+    escape_terminal_controls,
+    escape_terminal_repr,
+    format_exception_for_terminal,
+)
 from rampart.core.execution import (
     ExecutionEventHandler,
     clear_default_handler_factory,
@@ -401,11 +405,11 @@ def _absorb_results(
     """
     try:
         rampart_session.absorb(node=node, collector=collector)
-    except Exception:
+    except Exception as exc:  # ruff: ignore[blind-except] — plugin isolation
         logger.warning(
-            "Failed to absorb results for %s — results may be incomplete.",
+            "Failed to absorb results for %s — results may be incomplete: %s",
             escape_terminal_controls(node.nodeid),
-            exc_info=True,
+            format_exception_for_terminal(exc),
         )
 
 
@@ -527,7 +531,7 @@ def _resolve_hook_sinks(*, config: pytest.Config) -> list[ReportSink]:
             logger.warning(
                 "pytest_rampart_sinks implementation returned %s, "
                 "expected list[ReportSink]; ignoring.",
-                type(group).__name__,
+                escape_terminal_controls(type(group).__name__),
             )
             continue
         for sink in cast("list[object]", group):
@@ -535,8 +539,8 @@ def _resolve_hook_sinks(*, config: pytest.Config) -> list[ReportSink]:
                 sinks.append(sink)
             else:
                 logger.warning(
-                    "pytest_rampart_sinks yielded a non-ReportSink: %r; ignoring.",
-                    sink,
+                    "pytest_rampart_sinks yielded a non-ReportSink: %s; ignoring.",
+                    escape_terminal_repr(sink),
                 )
     return sinks
 
@@ -596,7 +600,7 @@ def _rampart_sink_bootstrap(  # pytest discovers this via autouse=True
     if not isinstance(user_sinks, list):
         logger.warning(
             "rampart_sinks fixture must return list[ReportSink], got %s. Ignoring.",
-            type(user_sinks).__name__,
+            escape_terminal_controls(type(user_sinks).__name__),
         )
         return
 
@@ -829,11 +833,11 @@ async def _emit_sinks_async(*, rampart_session: RampartSession) -> None:
     for sink in rampart_session.sinks:
         try:
             await sink.emit_async(report=report)
-        except Exception:
+        except Exception as exc:  # ruff: ignore[blind-except] — sink isolation
             logger.warning(
-                "Sink %s.emit_async failed — report may not be persisted.",
-                type(sink).__name__,
-                exc_info=True,
+                "Sink %s.emit_async failed — report may not be persisted: %s",
+                escape_terminal_controls(type(sink).__name__),
+                format_exception_for_terminal(exc),
             )
 
 

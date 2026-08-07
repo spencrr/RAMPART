@@ -31,6 +31,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from rampart.common.text import escape_terminal_controls
 from rampart.core.types import Payload, PayloadFormat
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,11 @@ class PayloadStore:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
 
-        logger.info("Saved %d payloads to '%s'", len(payloads), name)
+        logger.info(
+            "Saved %d payloads to '%s'",
+            len(payloads),
+            escape_terminal_controls(name),
+        )
         return collection_dir
 
     def load(
@@ -188,7 +193,7 @@ class PayloadStore:
         collection_dir = self._root / name
         if collection_dir.exists():
             shutil.rmtree(collection_dir)
-            logger.info("Deleted collection '%s'", name)
+            logger.info("Deleted collection '%s'", escape_terminal_controls(name))
 
     def manifest(self, name: str) -> dict[str, Any]:
         """Read the provenance manifest for a collection.

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -20,6 +21,10 @@ from rampart.surfaces.onedrive import (
 )
 
 _UNSET = object()
+
+
+def _format_record(record: logging.LogRecord) -> str:
+    return logging.Formatter("%(levelname)s:%(message)s").format(record)
 
 
 def _make_graph_client(
@@ -196,6 +201,43 @@ class TestOneDriveInjectionLifecycle:
         upload_call = by_drive_item_id.call_args_list[0]
         assert upload_call == call("root:/Documents/payloads/abc123.txt:")
 
+    async def test_upload_and_delete_logs_escape_dynamic_values_async(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        raw_item_id = "item\x1b\t\n\r\x7f\x9b"
+        raw_drive_id = "drive\x1b\t\n\r\x7f\x9b"
+        raw_folder = "folder\x1b\t\n\r\x7f\x9b"
+        raw_payload_id = "payload\x1b\t\n\r\x7f\x9b"
+        client = _make_graph_client(upload_item_id=raw_item_id)
+        surface = OneDriveSurface(
+            graph_client=client,
+            drive_id=raw_drive_id,
+            folder_path=raw_folder,
+        )
+        payload = Payload(content="content", id=raw_payload_id)
+
+        with caplog.at_level(logging.INFO):
+            item_id = await surface.upload_async(payload=payload)
+            await surface.delete_async(item_id=item_id)
+
+        formatted = [_format_record(record) for record in caplog.records]
+        combined = " ".join(formatted)
+        assert r"payload\x1b\x09\x0a\x0d\x7f\x9b" in combined
+        assert r"drive\x1b\x09\x0a\x0d\x7f\x9b" in combined
+        assert r"folder\x1b\x09\x0a\x0d\x7f\x9b" in combined
+        assert r"item\x1b\x09\x0a\x0d\x7f\x9b" in combined
+        assert "\x1b" not in combined
+        assert "\t" not in combined
+        assert "\n" not in combined
+        assert "\r" not in combined
+        assert "\x7f" not in combined
+        assert "\x9b" not in combined
+        assert item_id == raw_item_id
+        assert surface.drive_id == raw_drive_id
+        assert surface.folder_path == raw_folder
+        assert payload.id == raw_payload_id
+
     async def test_exit_deletes_with_correct_item_id(self) -> None:
         client = _make_graph_client(upload_item_id="item-to-delete")
         surface = OneDriveSurface(
@@ -231,22 +273,42 @@ class TestOneDriveInjectionLifecycle:
             async with handle:
                 pass
 
-    async def test_delete_failure_logs_warning_does_not_raise(self) -> None:
+    async def test_delete_failure_log_escapes_traceback_async(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        raw_item_id = "item\x1b\t\n\r\x7f\x9b"
+        raw_drive_id = "drive\x1b\t\n\r\x7f\x9b"
+        raw_error = "cleanup\x1b\t\n\r\x7f\x9b"
         client = _make_graph_client(
-            upload_item_id="item-1",
-            delete_error=ConnectionError("cleanup failed"),
+            upload_item_id=raw_item_id,
+            delete_error=ConnectionError(raw_error),
         )
         surface = OneDriveSurface(
             graph_client=client,
-            drive_id="drive-1",
+            drive_id=raw_drive_id,
             folder_path="test-folder",
         )
         payload = Payload(content="content")
         handle = surface.inject(payload=payload)
 
-        # Should not raise even though delete fails
-        async with handle:
-            pass
+        with caplog.at_level(logging.WARNING):
+            async with handle:
+                pass
+
+        formatted = _format_record(caplog.records[-1])
+        assert r"item\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert r"drive\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert r"ConnectionError: cleanup\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert "Traceback (most recent call last):" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
+        assert handle._item_id == raw_item_id
+        assert surface.drive_id == raw_drive_id
 
     async def test_exit_skips_delete_when_no_item_id(self) -> None:
         """If upload was never called, exit should be a no-op."""

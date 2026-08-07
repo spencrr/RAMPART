@@ -160,6 +160,10 @@ def _make_session_with_results(
     return session
 
 
+def _format_record(record: logging.LogRecord) -> str:
+    return logging.Formatter("%(levelname)s:%(message)s").format(record)
+
+
 class TestDetection:
     def test_is_xdist_worker_true_when_workerinput_present(self) -> None:
         config = _make_config(is_worker=True)
@@ -750,6 +754,50 @@ class TestHandleTestnodedown:
         handle_testnodedown(session=session, node=node, error=None)
         assert session.is_incomplete is True
 
+    def test_deserialization_log_escapes_traceback_but_reason_is_raw(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        raw_error = "deserialize\x1b\t\n\r\x7f\x9b"
+        raw_worker_id = "gw\x1b\n\x9b"
+        error = WorkerOutputError(raw_error)
+
+        def _raise_worker_output(*, data: object) -> dict[str, list[Result]]:
+            del data
+            raise error
+
+        monkeypatch.setattr(
+            "rampart.pytest_plugin._xdist.deserialize_worker_data",
+            _raise_worker_output,
+        )
+        session = RampartSession()
+        node = MagicMock()
+        node.gateway.id = raw_worker_id
+        node.workeroutput = {
+            WORKEROUTPUT_KEY: {
+                "schema": SCHEMA_VERSION,
+                "results_by_nodeid": {},
+            },
+        }
+
+        with caplog.at_level(logging.ERROR):
+            handle_testnodedown(session=session, node=node, error=None)
+
+        formatted = _format_record(caplog.records[-1])
+        assert r"gw\x1b\x0a\x9b" in formatted
+        assert r"WorkerOutputError: deserialize\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert "Traceback (most recent call last):" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
+        assert session.build_report().metadata["incomplete_reasons"] == [
+            f"worker {raw_worker_id} deserialization failed: {raw_error}",
+        ]
+
     def test_records_incomplete_on_truncated_payload(self) -> None:
         session = RampartSession()
         node = MagicMock()
@@ -1077,6 +1125,69 @@ class TestSinkDiscovery:
         assert result == []
         assert any("requires arguments" in r.getMessage() for r in caplog.records)
         assert any("pytest_rampart_sinks" in r.getMessage() for r in caplog.records)
+
+    def test_callable_exception_log_escapes_complete_traceback(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        raw_error = "legacy\x1b\t\n\r\x7f\x9b"
+        error = RuntimeError(raw_error)
+
+        def rampart_sinks() -> list[ReportSink]:
+            raise error
+
+        plugin = MagicMock(
+            spec=["rampart_sinks", "__name__"],
+            rampart_sinks=rampart_sinks,
+            __name__="plugin\x1b\n\x9b",
+        )
+        config = MagicMock()
+        config.pluginmanager.get_plugins.return_value = [plugin]
+
+        with caplog.at_level(logging.WARNING):
+            result = discover_sinks_from_conftest(config=config)
+
+        assert result == []
+        formatted = _format_record(caplog.records[-1])
+        assert r"plugin\x1b\x0a\x9b" in formatted
+        assert r"RuntimeError: legacy\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert "Traceback (most recent call last):" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
+        assert str(error) == raw_error
+
+    def test_non_report_sink_repr_is_terminal_safe(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        class HostileRepr:
+            def __repr__(self) -> str:
+                return "legacy-sink\x1b\t\n\r\x7f\x9b"
+
+        plugin = MagicMock(
+            spec=["rampart_sinks", "__name__"],
+            rampart_sinks=[HostileRepr()],
+            __name__="mod",
+        )
+        config = MagicMock()
+        config.pluginmanager.get_plugins.return_value = [plugin]
+
+        with caplog.at_level(logging.WARNING):
+            result = discover_sinks_from_conftest(config=config)
+
+        assert result == []
+        formatted = _format_record(caplog.records[-1])
+        assert r"legacy-sink\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
 
 
 class TestSinkDeprecationWarning:

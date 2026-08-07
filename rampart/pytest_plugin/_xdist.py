@@ -24,7 +24,11 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from rampart.common.deprecation import emit_deprecation_warning
-from rampart.common.text import escape_terminal_controls
+from rampart.common.text import (
+    escape_terminal_controls,
+    escape_terminal_repr,
+    format_exception_for_terminal,
+)
 from rampart.core.result import (
     HarmCategory,
     InjectionRecord,
@@ -165,9 +169,9 @@ def _size_limit(*, config: pytest.Config) -> int:
         parsed = int(cast("ConvertibleToInt", raw))
     except (TypeError, ValueError):
         logger.warning(
-            "Invalid %s=%r; falling back to default %d bytes.",
+            "Invalid %s=%s; falling back to default %d bytes.",
             SIZE_LIMIT_OPTION,
-            raw,
+            escape_terminal_repr(raw),
             DEFAULT_SIZE_LIMIT_BYTES,
         )
         return DEFAULT_SIZE_LIMIT_BYTES
@@ -1162,9 +1166,10 @@ def handle_testnodedown(
     try:
         results_by_nodeid = deserialize_worker_data(data=cast("object", payload))
     except WorkerOutputError as exc:
-        logger.exception(
-            "Failed to deserialize worker %s output; report will be incomplete.",
+        logger.error(  # ruff: ignore[error-instead-of-exception] — sanitized trace
+            "Failed to deserialize worker %s output; report will be incomplete: %s",
             display_worker_id,
+            format_exception_for_terminal(exc),
         )
         session.mark_incomplete(
             reason=f"worker {worker_id_str} deserialization failed: {exc}",
@@ -1229,11 +1234,19 @@ def discover_sinks_from_conftest(*, config: pytest.Config) -> list[ReportSink]:
                 discovered.append(sink)
             else:
                 logger.warning(
-                    "rampart_sinks in %s yielded a non-ReportSink: %r",
-                    getattr(plugin, "__name__", repr(plugin)),
-                    sink,
+                    "rampart_sinks in %s yielded a non-ReportSink: %s",
+                    _display_plugin_name(plugin),
+                    escape_terminal_repr(sink),
                 )
     return discovered
+
+
+def _display_plugin_name(plugin: object) -> str:
+    """Return a terminal-safe plugin name or representation."""
+    name = getattr(plugin, "__name__", None)
+    if isinstance(name, str):
+        return escape_terminal_controls(name)
+    return escape_terminal_repr(plugin)
 
 
 def _unwrap_fixture_function(candidate: object) -> Callable[..., object] | None:
@@ -1292,7 +1305,7 @@ def _resolve_sink_candidate(
     """
     import inspect  # ruff: ignore[import-outside-top-level]
 
-    plugin_name = getattr(plugin, "__name__", repr(plugin))
+    plugin_name = _display_plugin_name(plugin)
     if isinstance(candidate, list):
         return cast("list[object]", candidate)
 
@@ -1313,7 +1326,7 @@ def _resolve_sink_candidate(
             "cannot resolve. Register sinks via the pytest_rampart_sinks "
             "hook instead.",
             plugin_name,
-            type(candidate).__name__,
+            escape_terminal_controls(type(candidate).__name__),
         )
         return None
 
@@ -1336,7 +1349,7 @@ def _resolve_sink_candidate(
         logger.warning(
             "rampart_sinks in %s raised during controller-side discovery: %s",
             plugin_name,
-            exc,
+            format_exception_for_terminal(exc),
         )
         return None
 
@@ -1345,6 +1358,6 @@ def _resolve_sink_candidate(
     logger.warning(
         "rampart_sinks in %s returned %s instead of list[ReportSink].",
         plugin_name,
-        type(value).__name__,
+        escape_terminal_controls(type(value).__name__),
     )
     return None

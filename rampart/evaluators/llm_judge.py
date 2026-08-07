@@ -23,6 +23,7 @@ from pyrit.exceptions import (
 from pyrit.prompt_normalizer import PromptNormalizer
 
 from rampart.common.templates import PromptTemplate
+from rampart.common.text import escape_terminal_controls
 from rampart.core.errors import EvaluatorError
 from rampart.core.evaluator import BaseEvaluator
 from rampart.core.types import EvalContext, EvalOutcome, EvalResult
@@ -521,8 +522,8 @@ class LLMJudge(BaseEvaluator):
         """
         logger.warning(
             "LLMJudge: degrading to UNDETERMINED (cause=%s, persona=%s).",
-            cause,
-            self._persona.name,
+            escape_terminal_controls(cause),
+            escape_terminal_controls(self._persona.name),
         )
         return EvalResult(
             outcome=EvalOutcome.UNDETERMINED,

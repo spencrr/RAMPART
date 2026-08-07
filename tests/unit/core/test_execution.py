@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
+import logging
 import types
 from typing import Self
 
@@ -23,6 +24,13 @@ from rampart.core.types import (
     Request,
     Response,
 )
+
+_HOSTILE_ERROR = "failure\x1b\t\n\r\x7f\x9b"
+_HOSTILE_STRATEGY = "strategy\x1b\n\x9b"
+
+
+def _format_record(record: logging.LogRecord) -> str:
+    return logging.Formatter("%(levelname)s:%(message)s").format(record)
 
 
 class _StubSession:
@@ -115,6 +123,15 @@ class _DriverErrorExecution(BaseExecution):
         raise DriverError("LLM returned garbage")
 
 
+class _HostileErrorExecution(BaseExecution):
+    @property
+    def strategy_name(self) -> str:
+        return _HOSTILE_STRATEGY
+
+    async def _execute_async(self, *, adapter: AgentAdapter) -> Result:
+        raise RuntimeError(_HOSTILE_ERROR)
+
+
 class _RecordingHandler(ExecutionEventHandler):
     """Handler that records all events it receives."""
 
@@ -132,6 +149,14 @@ class _BrokenHandler(ExecutionEventHandler):
     async def on_event(self, *, event_data: ExecutionEventData) -> None:
         """Raise unconditionally to test handler safety."""
         raise ValueError("handler broke")
+
+
+class _HostileBrokenHandler(ExecutionEventHandler):
+    async def on_event(self, *, event_data: ExecutionEventData) -> None:
+        raise ValueError(_HOSTILE_ERROR)
+
+
+_HostileBrokenHandler.__name__ = "Handler\x1b\n\x9b"
 
 
 class TestBaseExecutionLifecycle:
@@ -248,6 +273,29 @@ class TestGenericErrorHandling:
         ]
         assert isinstance(error_event.error, RuntimeError)
 
+    async def test_error_log_escapes_traceback_but_result_remains_raw_async(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        execution = _HostileErrorExecution()
+
+        with caplog.at_level(logging.ERROR):
+            result = await execution.execute_async(adapter=_StubAdapter())
+
+        formatted = _format_record(caplog.records[-1])
+        assert r"strategy\x1b\x0a\x9b execution" in formatted
+        assert r"RuntimeError: failure\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert "Traceback (most recent call last):" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
+        assert result.summary == f"RuntimeError: {_HOSTILE_ERROR}"
+        assert result.metadata["error"] == _HOSTILE_ERROR
+        assert result.strategy == _HOSTILE_STRATEGY
+
 
 class TestHandlerSafety:
     async def test_broken_handler_does_not_abort_execution(self) -> None:
@@ -259,6 +307,27 @@ class TestHandlerSafety:
 
         assert result.safe is True
         assert len(recorder.events) == 2
+
+    async def test_broken_handler_log_escapes_complete_traceback_async(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        execution = _SuccessExecution(event_handlers=[_HostileBrokenHandler()])
+
+        with caplog.at_level(logging.WARNING):
+            result = await execution.execute_async(adapter=_StubAdapter())
+
+        formatted = _format_record(caplog.records[-1])
+        assert r"Handler\x1b\x0a\x9b raised" in formatted
+        assert r"ValueError: failure\x1b\x09\x0a\x0d\x7f\x9b" in formatted
+        assert "Traceback (most recent call last):" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
+        assert result.summary == "ok"
 
 
 class TestDefaultHandlerFactory:

@@ -3,7 +3,11 @@
 
 import pytest
 
-from rampart.common.text import escape_terminal_controls
+from rampart.common.text import (
+    escape_terminal_controls,
+    escape_terminal_repr,
+    format_exception_for_terminal,
+)
 
 
 class TestEscapeTerminalControls:
@@ -42,3 +46,47 @@ class TestEscapeTerminalControls:
     def test_is_idempotent(self) -> None:
         escaped = escape_terminal_controls("\x1b[31mred\n")
         assert escape_terminal_controls(escaped) == escaped
+
+
+class TestEscapeTerminalRepr:
+    def test_escapes_controls_from_custom_repr(self) -> None:
+        class HostileRepr:
+            def __repr__(self) -> str:
+                return "repr\x1b\t\n\r\x7f\x9b雪"
+
+        assert escape_terminal_repr(HostileRepr()) == (
+            r"repr\x1b\x09\x0a\x0d\x7f\x9b雪"
+        )
+
+    def test_falls_back_when_custom_repr_raises(self) -> None:
+        class BrokenRepr:
+            def __repr__(self) -> str:
+                raise RuntimeError("broken\x1b\nrepr")
+
+        BrokenRepr.__name__ = "Broken\x1b\nType\x9b"
+
+        assert escape_terminal_repr(BrokenRepr()) == (
+            r"<unrepresentable Broken\x1b\x0aType\x9b; "
+            "RuntimeError raised by repr()>"
+        )
+
+
+class TestFormatExceptionForTerminal:
+    def test_preserves_traceback_with_controls_escaped(self) -> None:
+        raw_message = "boom\x1b\t\n\r\x7f\x9b雪"
+        try:
+            raise RuntimeError(raw_message)
+        except RuntimeError as exc:
+            caught = exc
+            formatted = format_exception_for_terminal(exc)
+
+        assert "Traceback (most recent call last):" in formatted
+        assert "test_preserves_traceback_with_controls_escaped" in formatted
+        assert r"RuntimeError: boom\x1b\x09\x0a\x0d\x7f\x9b雪" in formatted
+        assert "\x1b" not in formatted
+        assert "\t" not in formatted
+        assert "\n" not in formatted
+        assert "\r" not in formatted
+        assert "\x7f" not in formatted
+        assert "\x9b" not in formatted
+        assert str(caught) == raw_message

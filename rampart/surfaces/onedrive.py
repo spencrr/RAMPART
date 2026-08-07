@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Self
 
+from rampart.common.text import escape_terminal_controls, format_exception_for_terminal
 from rampart.core.errors import InfrastructureError
 from rampart.core.injection import sleep_until_ready
 
@@ -156,10 +157,10 @@ class OneDriveSurface:
         item_id: str = drive_item.id
         logger.info(
             "Uploaded payload %s to OneDrive drive=%s path=%s (item=%s)",
-            payload.id,
-            self.drive_id,
-            upload_path,
-            item_id,
+            escape_terminal_controls(payload.id),
+            escape_terminal_controls(self.drive_id),
+            escape_terminal_controls(upload_path),
+            escape_terminal_controls(item_id),
         )
         return item_id
 
@@ -172,8 +173,8 @@ class OneDriveSurface:
         )
         logger.info(
             "Deleted OneDrive item %s from drive=%s",
-            item_id,
-            self.drive_id,
+            escape_terminal_controls(item_id),
+            escape_terminal_controls(self.drive_id),
         )
 
 
@@ -239,10 +240,10 @@ class _OneDriveInjection:
         if self._item_id is not None:
             try:
                 await self._surface.delete_async(item_id=self._item_id)
-            except Exception:
+            except Exception as exc:  # ruff: ignore[blind-except] — cleanup must not raise
                 logger.warning(
-                    "OneDrive cleanup failed for item %s in drive=%s",
-                    self._item_id,
-                    self._surface.drive_id,
-                    exc_info=True,
+                    "OneDrive cleanup failed for item %s in drive=%s: %s",
+                    escape_terminal_controls(self._item_id),
+                    escape_terminal_controls(self._surface.drive_id),
+                    format_exception_for_terminal(exc),
                 )
