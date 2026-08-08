@@ -531,7 +531,7 @@ class TestTrialExitStatus:
             test_invalid_threshold="""
             import pytest
 
-            @pytest.mark.trial(n=2, threshold=float("nan"))
+            @pytest.mark.trial(n=2, threshold=10**5000)
             def test_invalid_threshold():
                 pass
             """,

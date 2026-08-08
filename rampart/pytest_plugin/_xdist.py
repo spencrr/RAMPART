@@ -47,6 +47,7 @@ from rampart.core.types import (
     ToolCall,
     Turn,
 )
+from rampart.pytest_plugin._diagnostics import bounded_repr, bounded_text
 from rampart.pytest_plugin._session import TrialSpec
 from rampart.reporting.sink import ReportSink
 
@@ -84,6 +85,21 @@ class SizeLimitError(WorkerOutputError):
 
 class TrialSpecValidationError(WorkerOutputError):
     """Raised when trial specifications violate the current transport schema."""
+
+
+def _expected_type_message(*, expected: str, value: object) -> str:
+    """Build a bounded expected-type validation message.
+
+    Args:
+        expected (str): Description of the expected type.
+        value (object): The invalid value.
+
+    Returns:
+        str: The bounded validation message.
+    """
+    return bounded_text(
+        f"Expected {expected}, got {bounded_text(type(value).__name__)}."
+    )
 
 
 def is_xdist_worker(*, config: pytest.Config) -> bool:
@@ -497,15 +513,21 @@ def _validate_trial_threshold(*, value: object, context: str) -> float:
         TrialSpecValidationError: If the threshold is invalid.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
-        msg = f"{context} must be a finite number in (0, 1], got {value!r}."
+        msg = bounded_text(
+            f"{context} must be a finite number in (0, 1], got {bounded_repr(value)}."
+        )
         raise TrialSpecValidationError(msg)
     try:
         threshold = float(value)
     except OverflowError:
-        msg = f"{context} must be a finite number in (0, 1], got {value!r}."
+        msg = bounded_text(
+            f"{context} must be a finite number in (0, 1], got {bounded_repr(value)}."
+        )
         raise TrialSpecValidationError(msg) from None
     if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
-        msg = f"{context} must be a finite number in (0, 1], got {value!r}."
+        msg = bounded_text(
+            f"{context} must be a finite number in (0, 1], got {bounded_repr(value)}."
+        )
         raise TrialSpecValidationError(msg)
     return threshold
 
@@ -526,7 +548,7 @@ def _serialize_trial_spec(
     """
     threshold = _validate_trial_threshold(
         value=spec.threshold,
-        context=f"Trial threshold for {clone_nodeid!r}",
+        context=f"Trial threshold for {bounded_repr(clone_nodeid)}",
     )
     return {
         "clone_nodeid": clone_nodeid,
@@ -630,7 +652,7 @@ def _validate_schema(*, data: object) -> dict[str, Any]:
         WorkerOutputError: If ``data`` is not a dict.
     """
     if not isinstance(data, dict):
-        msg = f"Expected dict worker payload, got {type(data).__name__}."
+        msg = _expected_type_message(expected="dict worker payload", value=data)
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     schema = typed.get("schema")
@@ -638,9 +660,9 @@ def _validate_schema(*, data: object) -> dict[str, Any]:
         msg = "Worker payload missing required 'schema' key."
         raise SchemaVersionError(msg)
     if schema != SCHEMA_VERSION:
-        msg = (
-            f"Worker payload schema {schema!r} does not match "
-            f"controller schema {SCHEMA_VERSION!r}; rejecting to avoid "
+        msg = bounded_text(
+            f"Worker payload schema {bounded_repr(schema)} does not match "
+            f"controller schema {bounded_repr(SCHEMA_VERSION)}; rejecting to avoid "
             "best-effort parsing of an unknown format."
         )
         raise SchemaVersionError(msg)
@@ -657,13 +679,16 @@ def _deserialize_safety_status(*, value: object) -> SafetyStatus:
         WorkerOutputError: If ``value`` is not a valid SafetyStatus.
     """
     if not isinstance(value, str):
-        msg = f"Expected string for SafetyStatus, got {type(value).__name__}."
+        msg = _expected_type_message(
+            expected="string for SafetyStatus",
+            value=value,
+        )
         raise WorkerOutputError(msg)
     try:
         return SafetyStatus(value)
-    except ValueError as exc:
-        msg = f"Unknown SafetyStatus value: {value!r}."
-        raise WorkerOutputError(msg) from exc
+    except Exception:  # ruff: ignore[blind-except] — worker values are untrusted
+        msg = bounded_text(f"Unknown SafetyStatus value: {bounded_repr(value)}.")
+        raise WorkerOutputError(msg) from None
 
 
 def _deserialize_observability_level(*, value: object) -> ObservabilityLevel:
@@ -676,13 +701,16 @@ def _deserialize_observability_level(*, value: object) -> ObservabilityLevel:
         WorkerOutputError: If ``value`` is not a valid ObservabilityLevel.
     """
     if not isinstance(value, str):
-        msg = f"Expected string for ObservabilityLevel, got {type(value).__name__}."
+        msg = _expected_type_message(
+            expected="string for ObservabilityLevel",
+            value=value,
+        )
         raise WorkerOutputError(msg)
     try:
         return ObservabilityLevel(value)
-    except ValueError as exc:
-        msg = f"Unknown ObservabilityLevel value: {value!r}."
-        raise WorkerOutputError(msg) from exc
+    except Exception:  # ruff: ignore[blind-except] — worker values are untrusted
+        msg = bounded_text(f"Unknown ObservabilityLevel value: {bounded_repr(value)}.")
+        raise WorkerOutputError(msg) from None
 
 
 def _deserialize_eval_outcome(*, value: object) -> EvalOutcome:
@@ -695,13 +723,16 @@ def _deserialize_eval_outcome(*, value: object) -> EvalOutcome:
         WorkerOutputError: If ``value`` is not a valid EvalOutcome.
     """
     if not isinstance(value, str):
-        msg = f"Expected string for EvalOutcome, got {type(value).__name__}."
+        msg = _expected_type_message(
+            expected="string for EvalOutcome",
+            value=value,
+        )
         raise WorkerOutputError(msg)
     try:
         return EvalOutcome(value)
-    except ValueError as exc:
-        msg = f"Unknown EvalOutcome value: {value!r}."
-        raise WorkerOutputError(msg) from exc
+    except Exception:  # ruff: ignore[blind-except] — worker values are untrusted
+        msg = bounded_text(f"Unknown EvalOutcome value: {bounded_repr(value)}.")
+        raise WorkerOutputError(msg) from None
 
 
 def _deserialize_harm_category(*, value: object) -> HarmCategory | str | None:
@@ -716,7 +747,10 @@ def _deserialize_harm_category(*, value: object) -> HarmCategory | str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        msg = f"Expected string for harm_category, got {type(value).__name__}."
+        msg = _expected_type_message(
+            expected="string for harm_category",
+            value=value,
+        )
         raise WorkerOutputError(msg)
     try:
         return HarmCategory(value)
@@ -736,13 +770,13 @@ def _deserialize_datetime(*, value: object) -> datetime | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        msg = f"Expected string for datetime, got {type(value).__name__}."
+        msg = _expected_type_message(expected="string for datetime", value=value)
         raise WorkerOutputError(msg)
     try:
         return datetime.fromisoformat(value)
-    except ValueError as exc:
-        msg = f"Invalid ISO 8601 datetime: {value!r}."
-        raise WorkerOutputError(msg) from exc
+    except Exception:  # ruff: ignore[blind-except] — worker values are untrusted
+        msg = bounded_text(f"Invalid ISO 8601 datetime: {bounded_repr(value)}.")
+        raise WorkerOutputError(msg) from None
 
 
 def _deserialize_finite_float(
@@ -768,9 +802,11 @@ def _deserialize_finite_float(
         return default
     try:
         converted = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        msg = f"Invalid numeric value for {context}: {value!r}."
-        raise WorkerOutputError(msg) from exc
+    except (TypeError, ValueError, OverflowError):
+        msg = bounded_text(
+            f"Invalid numeric value for {context}: {bounded_repr(value)}."
+        )
+        raise WorkerOutputError(msg) from None
     return converted if math.isfinite(converted) else default
 
 
@@ -786,7 +822,7 @@ def _deserialize_eval_result(*, data: object) -> EvalResult | None:
     if data is None:
         return None
     if not isinstance(data, dict):
-        msg = f"Expected dict for EvalResult, got {type(data).__name__}."
+        msg = _expected_type_message(expected="dict for EvalResult", value=data)
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     outcome = _deserialize_eval_outcome(value=typed.get("outcome"))
@@ -820,7 +856,7 @@ def _deserialize_tool_call(*, data: object) -> ToolCall:
         WorkerOutputError: If ``data`` is not a dict.
     """
     if not isinstance(data, dict):
-        msg = f"Expected dict for ToolCall, got {type(data).__name__}."
+        msg = _expected_type_message(expected="dict for ToolCall", value=data)
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_args = typed.get("arguments", {})
@@ -844,7 +880,7 @@ def _deserialize_side_effect(*, data: object) -> SideEffect:
         WorkerOutputError: If ``data`` is not a dict.
     """
     if not isinstance(data, dict):
-        msg = f"Expected dict for SideEffect, got {type(data).__name__}."
+        msg = _expected_type_message(expected="dict for SideEffect", value=data)
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_details = typed.get("details", {})
@@ -870,7 +906,7 @@ def _deserialize_payload(*, data: object) -> Payload:
         WorkerOutputError: If ``data`` is not a dict.
     """
     if not isinstance(data, dict):
-        msg = f"Expected dict for Payload, got {type(data).__name__}."
+        msg = _expected_type_message(expected="dict for Payload", value=data)
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_metadata = typed.get("metadata", {})
@@ -906,7 +942,7 @@ def _deserialize_request(*, data: object) -> Request:
         WorkerOutputError: If ``data`` is not a dict.
     """
     if not isinstance(data, dict):
-        msg = f"Expected dict for Request, got {type(data).__name__}."
+        msg = _expected_type_message(expected="dict for Request", value=data)
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_prompt = typed.get("prompt")
@@ -934,7 +970,7 @@ def _deserialize_response(*, data: object) -> Response:
         WorkerOutputError: If ``data`` is not a dict.
     """
     if not isinstance(data, dict):
-        msg = f"Expected dict for Response, got {type(data).__name__}."
+        msg = _expected_type_message(expected="dict for Response", value=data)
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_tcs = typed.get("tool_calls", [])
@@ -967,7 +1003,7 @@ def _deserialize_turn(*, data: object) -> Turn:
         WorkerOutputError: If ``data`` is not a dict.
     """
     if not isinstance(data, dict):
-        msg = f"Expected dict for Turn, got {type(data).__name__}."
+        msg = _expected_type_message(expected="dict for Turn", value=data)
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_turn_number = typed.get("turn_number", 0)
@@ -991,7 +1027,10 @@ def _deserialize_injection_record(*, data: object) -> InjectionRecord:
         WorkerOutputError: If ``data`` is not a dict.
     """
     if not isinstance(data, dict):
-        msg = f"Expected dict for InjectionRecord, got {type(data).__name__}."
+        msg = _expected_type_message(
+            expected="dict for InjectionRecord",
+            value=data,
+        )
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_payload_id = typed.get("payload_id")
@@ -1011,7 +1050,7 @@ def _deserialize_result(*, data: object) -> Result:
         WorkerOutputError: If ``data`` is not a dict.
     """
     if not isinstance(data, dict):
-        msg = f"Expected dict for Result, got {type(data).__name__}."
+        msg = _expected_type_message(expected="dict for Result", value=data)
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
     raw_turns = typed.get("turns", [])
@@ -1076,7 +1115,10 @@ def deserialize_worker_data(*, data: object) -> dict[str, list[Result]]:
     typed = _validate_schema(data=data)
     raw_results = typed.get("results_by_nodeid", {})
     if not isinstance(raw_results, dict):
-        msg = f"Expected dict for results_by_nodeid, got {type(raw_results).__name__}."
+        msg = _expected_type_message(
+            expected="dict for results_by_nodeid",
+            value=raw_results,
+        )
         raise WorkerOutputError(msg)
     out: dict[str, list[Result]] = {}
     for nodeid, results_data in cast("dict[Any, Any]", raw_results).items():
@@ -1118,12 +1160,18 @@ def deserialize_trial_specs(*, data: object) -> dict[str, TrialSpec]:
         raise TrialSpecValidationError(msg)
     raw_specs = typed["trial_specs"]
     if not isinstance(raw_specs, list):
-        msg = f"Expected list for trial_specs, got {type(raw_specs).__name__}."
+        msg = _expected_type_message(
+            expected="list for trial_specs",
+            value=raw_specs,
+        )
         raise TrialSpecValidationError(msg)
     out: dict[str, TrialSpec] = {}
     for index, spec in enumerate(cast("list[Any]", raw_specs)):
         if not isinstance(spec, dict):
-            msg = f"Expected dict for trial_specs[{index}], got {type(spec).__name__}."
+            msg = _expected_type_message(
+                expected=f"dict for trial_specs[{index}]",
+                value=spec,
+            )
             raise TrialSpecValidationError(msg)
         spec_dict = cast("dict[str, Any]", spec)
         clone_nodeid = spec_dict.get("clone_nodeid")
@@ -1136,7 +1184,7 @@ def deserialize_trial_specs(*, data: object) -> dict[str, TrialSpec]:
             raise TrialSpecValidationError(msg)
         threshold = _validate_trial_threshold(
             value=spec_dict.get("threshold"),
-            context=f"Trial threshold for {clone_nodeid!r}",
+            context=f"Trial threshold for {bounded_repr(clone_nodeid)}",
         )
         out[clone_nodeid] = TrialSpec(
             base_nodeid=base_nodeid,
@@ -1349,7 +1397,7 @@ def handle_testnodedown(
     if trial_specs:
         session.merge_trial_specs(trial_specs=trial_specs)
     if transport_error is not None:
-        reason = escape_terminal_controls(str(transport_error))
+        reason = bounded_text(transport_error)
         logger.error(
             "Worker %s RAMPART transport validation failed: %s",
             display_worker_id,

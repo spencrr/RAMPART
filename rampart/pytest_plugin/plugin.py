@@ -49,6 +49,7 @@ from rampart.pytest_plugin._collection import (
     deactivate_collector,
     get_active_collector,
 )
+from rampart.pytest_plugin._diagnostics import bounded_repr, bounded_text
 from rampart.pytest_plugin._session import RampartSession, TrialSpec
 from rampart.pytest_plugin._xdist import (
     DEFAULT_SIZE_LIMIT_BYTES,
@@ -127,10 +128,13 @@ def _resolve_trial_n(marker: pytest.Mark) -> int:
         return 1
 
     if not isinstance(raw, int) or isinstance(raw, bool):
-        msg = f"trial(n=) must be an integer, got {type(raw).__name__}: {raw!r}"
+        msg = bounded_text(
+            "trial(n=) must be an integer, "
+            f"got {bounded_text(type(raw).__name__)}: {bounded_repr(raw)}"
+        )
         raise pytest.UsageError(msg)
     if raw < 1:
-        msg = f"trial(n=) must be >= 1, got {raw}"
+        msg = bounded_text(f"trial(n=) must be >= 1, got {bounded_repr(raw)}")
         raise pytest.UsageError(msg)
     return raw
 
@@ -151,18 +155,24 @@ def _resolve_trial_threshold(marker: pytest.Mark) -> float:
     """
     raw: Any = marker.kwargs.get("threshold", TrialSpec.DEFAULT_THRESHOLD)
     if isinstance(raw, bool):
-        msg = f"trial(threshold=) must be a finite number in (0, 1], got bool: {raw!r}"
+        msg = bounded_text(
+            "trial(threshold=) must be a finite number in (0, 1], "
+            f"got bool: {bounded_repr(raw)}"
+        )
         raise pytest.UsageError(msg)
     try:
         threshold = float(raw)
     except (TypeError, ValueError, OverflowError):
-        msg = (
+        msg = bounded_text(
             "trial(threshold=) must be a finite number in (0, 1], "
-            f"got {type(raw).__name__}: {raw!r}"
+            f"got {bounded_text(type(raw).__name__)}: {bounded_repr(raw)}"
         )
         raise pytest.UsageError(msg) from None
     if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
-        msg = f"trial(threshold=) must be a finite number in (0, 1], got {raw!r}"
+        msg = bounded_text(
+            "trial(threshold=) must be a finite number in (0, 1], "
+            f"got {bounded_repr(raw)}"
+        )
         raise pytest.UsageError(msg)
     return threshold
 

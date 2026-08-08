@@ -50,6 +50,32 @@ if TYPE_CHECKING:
     from _pytest.terminal import TerminalReporter
 
 
+class _HostileRepr:
+    def __repr__(self) -> str:
+        raise RuntimeError("repr failed")
+
+
+class _HostileString(str):  # ruff: ignore[subclass-builtin]
+    __slots__ = ()
+
+    def __len__(self) -> int:
+        raise RuntimeError("len failed")
+
+    def __getitem__(self, key: object) -> str:
+        del key
+        raise RuntimeError("getitem failed")
+
+
+class _ReprReturnsHostileString:
+    def __repr__(self) -> str:
+        return _HostileString("x" * 10_000)
+
+
+def _raise_repr(value: object) -> str:
+    del value
+    raise RuntimeError("repr failed")
+
+
 class _StashStub:
     """Minimal pytest.Stash test double backed by a dict."""
 
@@ -582,6 +608,17 @@ class TestResolveTrialN:
         with pytest.raises(pytest.UsageError, match="must be an integer"):
             _resolve_trial_n(marker)
 
+    def test_hostile_repr_raises_usage_error(self) -> None:
+        marker = pytest.mark.trial(n=_HostileRepr()).mark
+        with pytest.raises(pytest.UsageError, match="must be an integer"):
+            _resolve_trial_n(marker)
+
+    def test_huge_negative_integer_raises_usage_error(self) -> None:
+        marker = pytest.mark.trial(n=-(10**5000)).mark
+        with pytest.raises(pytest.UsageError, match="must be >= 1") as exc_info:
+            _resolve_trial_n(marker)
+        assert len(str(exc_info.value)) < 200
+
 
 class TestResolveTrialThreshold:
     def test_defaults_to_one(self) -> None:
@@ -620,6 +657,50 @@ class TestResolveTrialThreshold:
         marker = pytest.mark.trial(threshold=value).mark
         with pytest.raises(pytest.UsageError, match=r"finite number in \(0, 1\]"):
             _resolve_trial_threshold(marker)
+
+    def test_huge_integer_raises_bounded_usage_error(self) -> None:
+        marker = pytest.mark.trial(threshold=10**5000).mark
+        with pytest.raises(pytest.UsageError) as exc_info:
+            _resolve_trial_threshold(marker)
+        assert "finite number in (0, 1]" in str(exc_info.value)
+        assert len(str(exc_info.value)) < 200
+
+    def test_hostile_repr_raises_usage_error(self) -> None:
+        marker = pytest.mark.trial(threshold=_HostileRepr()).mark
+        with pytest.raises(pytest.UsageError) as exc_info:
+            _resolve_trial_threshold(marker)
+        assert "finite number in (0, 1]" in str(exc_info.value)
+        assert len(str(exc_info.value)) < 200
+
+    def test_nested_huge_integer_diagnostic_is_bounded(self) -> None:
+        value: object = 10**5000
+        for _ in range(6):
+            value = [value] * 6
+        marker = pytest.mark.trial(threshold=value).mark
+        with pytest.raises(pytest.UsageError) as exc_info:
+            _resolve_trial_threshold(marker)
+        assert len(str(exc_info.value)) < 200
+
+    def test_long_type_name_diagnostic_is_bounded(self) -> None:
+        hostile_type = type("X" * 10_000, (), {"__repr__": _raise_repr})
+        marker = pytest.mark.trial(threshold=hostile_type()).mark
+        with pytest.raises(pytest.UsageError) as exc_info:
+            _resolve_trial_threshold(marker)
+        assert len(str(exc_info.value)) < 200
+
+    def test_repr_returned_string_subclass_cannot_bypass_bound(self) -> None:
+        marker = pytest.mark.trial(
+            threshold=_ReprReturnsHostileString(),
+        ).mark
+        with pytest.raises(pytest.UsageError) as exc_info:
+            _resolve_trial_threshold(marker)
+        assert len(str(exc_info.value)) < 200
+
+    def test_ordinary_invalid_value_remains_helpful(self) -> None:
+        marker = pytest.mark.trial(threshold="not-a-number").mark
+        with pytest.raises(pytest.UsageError) as exc_info:
+            _resolve_trial_threshold(marker)
+        assert "'not-a-number'" in str(exc_info.value)
 
 
 class TestWriteResultLine:

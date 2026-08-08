@@ -59,6 +59,25 @@ from rampart.pytest_plugin.plugin import _enforce_incomplete_exit_status
 from rampart.reporting.sink import ReportSink, TestRunReport
 
 
+class _HostileRepr:
+    def __repr__(self) -> str:
+        raise RuntimeError("repr failed")
+
+
+class _HostileString(str):  # ruff: ignore[subclass-builtin]
+    __slots__ = ()
+
+    def __len__(self) -> int:
+        raise RuntimeError("len failed")
+
+    def __getitem__(self, key: object) -> str:
+        del key
+        raise RuntimeError("getitem failed")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr failed")
+
+
 def _make_result(
     *,
     status: SafetyStatus = SafetyStatus.SAFE,
@@ -506,6 +525,15 @@ class TestDeserializationValidation:
         with pytest.raises(SchemaVersionError, match="does not match"):
             deserialize_worker_data(data=payload)
 
+    def test_hostile_schema_repr_does_not_escape_validation(self) -> None:
+        payload: dict[str, Any] = {
+            "schema": _HostileRepr(),
+            "results_by_nodeid": {},
+        }
+        with pytest.raises(SchemaVersionError) as exc_info:
+            deserialize_worker_data(data=payload)
+        assert len(str(exc_info.value)) < 200
+
     def test_rejects_malformed_safety_status(self) -> None:
         payload: dict[str, Any] = {
             "schema": SCHEMA_VERSION,
@@ -523,6 +551,24 @@ class TestDeserializationValidation:
         with pytest.raises(WorkerOutputError, match="Unknown SafetyStatus"):
             deserialize_worker_data(data=payload)
 
+    def test_hostile_enum_repr_does_not_escape_or_chain(self) -> None:
+        payload: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "results_by_nodeid": {
+                "n": [
+                    {
+                        "status": _HostileString("not-a-status"),
+                        "observability_level": "response_only",
+                    },
+                ],
+            },
+        }
+        with pytest.raises(WorkerOutputError) as exc_info:
+            deserialize_worker_data(data=payload)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+        assert len(str(exc_info.value)) < 200
+
     def test_rejects_malformed_observability_level(self) -> None:
         payload: dict[str, Any] = {
             "schema": SCHEMA_VERSION,
@@ -539,6 +585,46 @@ class TestDeserializationValidation:
         }
         with pytest.raises(WorkerOutputError, match="Unknown ObservabilityLevel"):
             deserialize_worker_data(data=payload)
+
+    def test_long_enum_diagnostic_is_bounded(self) -> None:
+        payload: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "results_by_nodeid": {
+                "n": [
+                    {
+                        "status": "x" * 10_000,
+                        "observability_level": "response_only",
+                    },
+                ],
+            },
+        }
+        with pytest.raises(WorkerOutputError) as exc_info:
+            deserialize_worker_data(data=payload)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+        assert len(str(exc_info.value)) < 200
+
+    def test_long_datetime_diagnostic_is_bounded(self) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={
+                "n": [
+                    _make_result(
+                        turns=[
+                            _make_turn(
+                                timestamp=datetime.now(tz=UTC),
+                            ),
+                        ],
+                    ),
+                ],
+            },
+        )
+        payload = serialize_worker_data(session=worker_session)
+        payload["results_by_nodeid"]["n"][0]["turns"][0]["timestamp"] = "x" * 10_000
+        with pytest.raises(WorkerOutputError) as exc_info:
+            deserialize_worker_data(data=payload)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+        assert len(str(exc_info.value)) < 200
 
 
 class TestTransportValidation:
@@ -841,6 +927,57 @@ class TestHandleTestnodedown:
         assert session.is_incomplete is True
         assert "transport validation failed" in session.incomplete_reasons[0]
 
+    def test_huge_transport_error_marker_is_bounded_and_incomplete(self) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        payload = serialize_worker_data(session=worker_session)
+        payload["rampart_transport_error"] = 10**5000
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        session = RampartSession()
+
+        handle_testnodedown(session=session, node=node, error=None)
+
+        assert session.is_incomplete is True
+        assert len(session.incomplete_reasons[0]) < 300
+        assert session.results_by_nodeid["n"][0].summary == "kept"
+
+    def test_hostile_transport_error_repr_is_bounded_and_incomplete(self) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        payload = serialize_worker_data(session=worker_session)
+        payload["rampart_transport_error"] = _HostileRepr()
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        session = RampartSession()
+
+        handle_testnodedown(session=session, node=node, error=None)
+
+        assert session.is_incomplete is True
+        assert len(session.incomplete_reasons[0]) < 300
+        assert session.results_by_nodeid["n"][0].summary == "kept"
+
+    def test_hostile_transport_error_string_is_bounded_and_incomplete(self) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        payload = serialize_worker_data(session=worker_session)
+        payload["rampart_transport_error"] = _HostileString("x" * 10_000)
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        session = RampartSession()
+
+        handle_testnodedown(session=session, node=node, error=None)
+
+        assert session.is_incomplete is True
+        assert len(session.incomplete_reasons[0]) < 300
+        assert session.results_by_nodeid["n"][0].summary == "kept"
+
     def test_transport_error_does_not_bypass_result_validation(self) -> None:
         session = RampartSession()
         node = MagicMock()
@@ -881,9 +1018,9 @@ class TestHandleTestnodedown:
         payload = serialize_worker_data(session=worker_session)
         raw_result = payload["results_by_nodeid"]["n"][0]
         if field == "duration":
-            raw_result["duration_seconds"] = 10**400
+            raw_result["duration_seconds"] = 10**5000
         else:
-            raw_result["turns"][0]["eval_result"]["confidence"] = 10**400
+            raw_result["turns"][0]["eval_result"]["confidence"] = 10**5000
         payload["rampart_transport_error"] = "invalid trial threshold"
         node = MagicMock()
         node.gateway.id = "gw1"
@@ -894,6 +1031,7 @@ class TestHandleTestnodedown:
 
         assert session.is_incomplete is True
         assert "deserialization failed" in session.incomplete_reasons[0]
+        assert len(session.incomplete_reasons[0]) < 300
         assert session.has_results is False
 
     def test_finalizer_trial_error_preserves_results_and_forces_nonzero(
@@ -908,7 +1046,7 @@ class TestHandleTestnodedown:
         worker_session.register_trial_spec(
             clone_nodeid="n",
             base_nodeid="base",
-            threshold=0.0,
+            threshold=10**5000,
         )
 
         with pytest.raises(TrialSpecValidationError):
@@ -918,6 +1056,7 @@ class TestHandleTestnodedown:
         assert payload["trial_specs"] == []
         assert payload["results_by_nodeid"]["n"][0]["summary"] == "kept"
         assert "finite number in (0, 1]" in payload["rampart_transport_error"]
+        assert len(payload["rampart_transport_error"]) < 200
 
         node = MagicMock()
         node.gateway.id = "gw1"
@@ -1249,6 +1388,41 @@ class TestTrialSpecs:
         )
         with pytest.raises(TrialSpecValidationError, match="finite number"):
             serialize_worker_data(session=session)
+
+    def test_rejects_huge_serialized_threshold_with_bounded_error(self) -> None:
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="t.py::a[trial-0]",
+            base_nodeid="t.py::a",
+            threshold=10**5000,
+        )
+        with pytest.raises(TrialSpecValidationError) as exc_info:
+            serialize_worker_data(session=session)
+        assert len(str(exc_info.value)) < 200
+
+    def test_hostile_threshold_repr_does_not_escape_validation(self) -> None:
+        threshold: Any = _HostileRepr()
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="t.py::a[trial-0]",
+            base_nodeid="t.py::a",
+            threshold=threshold,
+        )
+        with pytest.raises(TrialSpecValidationError) as exc_info:
+            serialize_worker_data(session=session)
+        assert len(str(exc_info.value)) < 200
+
+    def test_nested_huge_threshold_diagnostic_is_bounded(self) -> None:
+        threshold: Any = [10**5000]
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="t.py::a[trial-0]",
+            base_nodeid="t.py::a",
+            threshold=threshold,
+        )
+        with pytest.raises(TrialSpecValidationError) as exc_info:
+            serialize_worker_data(session=session)
+        assert len(str(exc_info.value)) < 200
 
     def test_merge_is_idempotent(self) -> None:
         session = RampartSession()
