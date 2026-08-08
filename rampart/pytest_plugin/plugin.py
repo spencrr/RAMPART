@@ -32,7 +32,6 @@ import pytest
 from rampart.common.deprecation import emit_deprecation_warning
 from rampart.common.text import (
     escape_terminal_controls,
-    escape_terminal_repr,
     format_exception_for_terminal,
 )
 from rampart.core.execution import (
@@ -49,7 +48,11 @@ from rampart.pytest_plugin._collection import (
     deactivate_collector,
     get_active_collector,
 )
-from rampart.pytest_plugin._diagnostics import bounded_repr, bounded_text
+from rampart.pytest_plugin._diagnostics import (
+    bounded_repr,
+    bounded_text,
+    safe_type_name,
+)
 from rampart.pytest_plugin._session import RampartSession, TrialSpec
 from rampart.pytest_plugin._xdist import (
     DEFAULT_SIZE_LIMIT_BYTES,
@@ -127,10 +130,10 @@ def _resolve_trial_n(marker: pytest.Mark) -> int:
     else:
         return 1
 
-    if not isinstance(raw, int) or isinstance(raw, bool):
+    if type(raw) is not int:
         msg = bounded_text(
             "trial(n=) must be an integer, "
-            f"got {bounded_text(type(raw).__name__)}: {bounded_repr(raw)}"
+            f"got {safe_type_name(raw)}: {bounded_repr(raw)}"
         )
         raise pytest.UsageError(msg)
     if raw < 1:
@@ -154,10 +157,17 @@ def _resolve_trial_threshold(marker: pytest.Mark) -> float:
         pytest.UsageError: If the value is not a finite number in (0, 1].
     """
     raw: Any = marker.kwargs.get("threshold", TrialSpec.DEFAULT_THRESHOLD)
-    if isinstance(raw, bool):
+    raw_type = type(raw)
+    if raw_type is bool:
         msg = bounded_text(
             "trial(threshold=) must be a finite number in (0, 1], "
             f"got bool: {bounded_repr(raw)}"
+        )
+        raise pytest.UsageError(msg)
+    if raw_type is not int and raw_type is not float and raw_type is not str:
+        msg = bounded_text(
+            "trial(threshold=) must be a finite number in (0, 1], "
+            f"got {safe_type_name(raw)}: {bounded_repr(raw)}"
         )
         raise pytest.UsageError(msg)
     try:
@@ -165,7 +175,7 @@ def _resolve_trial_threshold(marker: pytest.Mark) -> float:
     except (TypeError, ValueError, OverflowError):
         msg = bounded_text(
             "trial(threshold=) must be a finite number in (0, 1], "
-            f"got {bounded_text(type(raw).__name__)}: {bounded_repr(raw)}"
+            f"got {safe_type_name(raw)}: {bounded_repr(raw)}"
         )
         raise pytest.UsageError(msg) from None
     if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
@@ -562,11 +572,11 @@ def _resolve_hook_sinks(*, config: pytest.Config) -> list[ReportSink]:
     impl_results = cast("list[object]", hook(config=config))
     sinks: list[ReportSink] = []
     for group in impl_results:
-        if not isinstance(group, list):
+        if type(group) is not list:
             logger.warning(
                 "pytest_rampart_sinks implementation returned %s, "
                 "expected list[ReportSink]; ignoring.",
-                escape_terminal_controls(type(group).__name__),
+                safe_type_name(group),
             )
             continue
         for sink in cast("list[object]", group):
@@ -575,7 +585,7 @@ def _resolve_hook_sinks(*, config: pytest.Config) -> list[ReportSink]:
             else:
                 logger.warning(
                     "pytest_rampart_sinks yielded a non-ReportSink: %s; ignoring.",
-                    escape_terminal_repr(sink),
+                    bounded_repr(sink),
                 )
     return sinks
 
@@ -632,10 +642,10 @@ def _rampart_sink_bootstrap(  # pytest discovers this via autouse=True
         removed_in="0.3.0",
     )
 
-    if not isinstance(user_sinks, list):
+    if type(user_sinks) is not list:
         logger.warning(
             "rampart_sinks fixture must return list[ReportSink], got %s. Ignoring.",
-            escape_terminal_controls(type(user_sinks).__name__),
+            safe_type_name(user_sinks),
         )
         return
 
@@ -921,7 +931,7 @@ async def _emit_sinks_async(*, rampart_session: RampartSession) -> None:
         except Exception as exc:  # ruff: ignore[blind-except] — sink isolation
             logger.warning(
                 "Sink %s.emit_async failed — report may not be persisted: %s",
-                escape_terminal_controls(type(sink).__name__),
+                safe_type_name(sink),
                 format_exception_for_terminal(exc),
             )
 

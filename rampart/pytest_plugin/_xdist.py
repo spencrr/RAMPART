@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, cast
 from rampart.common.deprecation import emit_deprecation_warning
 from rampart.common.text import (
     escape_terminal_controls,
-    escape_terminal_repr,
     format_exception_for_terminal,
 )
 from rampart.core.result import (
@@ -47,7 +46,11 @@ from rampart.core.types import (
     ToolCall,
     Turn,
 )
-from rampart.pytest_plugin._diagnostics import bounded_repr, bounded_text
+from rampart.pytest_plugin._diagnostics import (
+    bounded_repr,
+    bounded_text,
+    safe_type_name,
+)
 from rampart.pytest_plugin._session import TrialSpec
 from rampart.reporting.sink import ReportSink
 
@@ -97,9 +100,7 @@ def _expected_type_message(*, expected: str, value: object) -> str:
     Returns:
         str: The bounded validation message.
     """
-    return bounded_text(
-        f"Expected {expected}, got {bounded_text(type(value).__name__)}."
-    )
+    return bounded_text(f"Expected {expected}, got {safe_type_name(value)}.")
 
 
 def is_xdist_worker(*, config: pytest.Config) -> bool:
@@ -192,7 +193,7 @@ def _size_limit(*, config: pytest.Config) -> int:
         logger.warning(
             "Invalid %s=%s; falling back to default %d bytes.",
             SIZE_LIMIT_OPTION,
-            escape_terminal_repr(raw),
+            bounded_repr(raw),
             DEFAULT_SIZE_LIMIT_BYTES,
         )
         return DEFAULT_SIZE_LIMIT_BYTES
@@ -512,13 +513,14 @@ def _validate_trial_threshold(*, value: object, context: str) -> float:
     Raises:
         TrialSpecValidationError: If the threshold is invalid.
     """
-    if isinstance(value, bool) or not isinstance(value, int | float):
+    value_type = type(value)
+    if value_type is not int and value_type is not float:
         msg = bounded_text(
             f"{context} must be a finite number in (0, 1], got {bounded_repr(value)}."
         )
         raise TrialSpecValidationError(msg)
     try:
-        threshold = float(value)
+        threshold = float(cast("int | float", value))
     except OverflowError:
         msg = bounded_text(
             f"{context} must be a finite number in (0, 1], got {bounded_repr(value)}."
@@ -651,7 +653,7 @@ def _validate_schema(*, data: object) -> dict[str, Any]:
         SchemaVersionError: If the ``schema`` key is missing or unknown.
         WorkerOutputError: If ``data`` is not a dict.
     """
-    if not isinstance(data, dict):
+    if type(data) is not dict:
         msg = _expected_type_message(expected="dict worker payload", value=data)
         raise WorkerOutputError(msg)
     typed = cast("dict[str, Any]", data)
@@ -659,7 +661,7 @@ def _validate_schema(*, data: object) -> dict[str, Any]:
     if schema is None:
         msg = "Worker payload missing required 'schema' key."
         raise SchemaVersionError(msg)
-    if schema != SCHEMA_VERSION:
+    if type(schema) is not str or schema != SCHEMA_VERSION:
         msg = bounded_text(
             f"Worker payload schema {bounded_repr(schema)} does not match "
             f"controller schema {bounded_repr(SCHEMA_VERSION)}; rejecting to avoid "
@@ -678,7 +680,7 @@ def _deserialize_safety_status(*, value: object) -> SafetyStatus:
     Raises:
         WorkerOutputError: If ``value`` is not a valid SafetyStatus.
     """
-    if not isinstance(value, str):
+    if type(value) is not str:
         msg = _expected_type_message(
             expected="string for SafetyStatus",
             value=value,
@@ -700,7 +702,7 @@ def _deserialize_observability_level(*, value: object) -> ObservabilityLevel:
     Raises:
         WorkerOutputError: If ``value`` is not a valid ObservabilityLevel.
     """
-    if not isinstance(value, str):
+    if type(value) is not str:
         msg = _expected_type_message(
             expected="string for ObservabilityLevel",
             value=value,
@@ -722,7 +724,7 @@ def _deserialize_eval_outcome(*, value: object) -> EvalOutcome:
     Raises:
         WorkerOutputError: If ``value`` is not a valid EvalOutcome.
     """
-    if not isinstance(value, str):
+    if type(value) is not str:
         msg = _expected_type_message(
             expected="string for EvalOutcome",
             value=value,
@@ -746,7 +748,7 @@ def _deserialize_harm_category(*, value: object) -> HarmCategory | str | None:
     """
     if value is None:
         return None
-    if not isinstance(value, str):
+    if type(value) is not str:
         msg = _expected_type_message(
             expected="string for harm_category",
             value=value,
@@ -769,7 +771,7 @@ def _deserialize_datetime(*, value: object) -> datetime | None:
     """
     if value is None:
         return None
-    if not isinstance(value, str):
+    if type(value) is not str:
         msg = _expected_type_message(expected="string for datetime", value=value)
         raise WorkerOutputError(msg)
     try:
@@ -798,10 +800,11 @@ def _deserialize_finite_float(
     Raises:
         WorkerOutputError: If numeric conversion fails.
     """
-    if not isinstance(value, int | float):
+    value_type = type(value)
+    if value_type is not int and value_type is not float:
         return default
     try:
-        converted = float(value)
+        converted = float(cast("int | float", value))
     except (TypeError, ValueError, OverflowError):
         msg = bounded_text(
             f"Invalid numeric value for {context}: {bounded_repr(value)}."
@@ -1176,7 +1179,7 @@ def deserialize_trial_specs(*, data: object) -> dict[str, TrialSpec]:
         spec_dict = cast("dict[str, Any]", spec)
         clone_nodeid = spec_dict.get("clone_nodeid")
         base_nodeid = spec_dict.get("base_nodeid")
-        if not isinstance(clone_nodeid, str) or not isinstance(base_nodeid, str):
+        if type(clone_nodeid) is not str or type(base_nodeid) is not str:
             msg = f"trial_specs[{index}] requires string clone_nodeid and base_nodeid."
             raise TrialSpecValidationError(msg)
         if not clone_nodeid or not base_nodeid:
@@ -1455,18 +1458,10 @@ def discover_sinks_from_conftest(*, config: pytest.Config) -> list[ReportSink]:
             else:
                 logger.warning(
                     "rampart_sinks in %s yielded a non-ReportSink: %s",
-                    _display_plugin_name(plugin),
-                    escape_terminal_repr(sink),
+                    safe_type_name(plugin),
+                    bounded_repr(sink),
                 )
     return discovered
-
-
-def _display_plugin_name(plugin: object) -> str:
-    """Return a terminal-safe plugin name or representation."""
-    name = getattr(plugin, "__name__", None)
-    if isinstance(name, str):
-        return escape_terminal_controls(name)
-    return escape_terminal_repr(plugin)
 
 
 def _unwrap_fixture_function(candidate: object) -> Callable[..., object] | None:
@@ -1525,8 +1520,8 @@ def _resolve_sink_candidate(
     """
     import inspect  # ruff: ignore[import-outside-top-level]
 
-    plugin_name = _display_plugin_name(plugin)
-    if isinstance(candidate, list):
+    plugin_name = safe_type_name(plugin)
+    if type(candidate) is list:
         return cast("list[object]", candidate)
 
     func: Callable[..., object] | None
@@ -1546,7 +1541,7 @@ def _resolve_sink_candidate(
             "cannot resolve. Register sinks via the pytest_rampart_sinks "
             "hook instead.",
             plugin_name,
-            escape_terminal_controls(type(candidate).__name__),
+            safe_type_name(candidate),
         )
         return None
 
@@ -1573,11 +1568,11 @@ def _resolve_sink_candidate(
         )
         return None
 
-    if isinstance(value, list):
+    if type(value) is list:
         return cast("list[object]", value)
     logger.warning(
         "rampart_sinks in %s returned %s instead of list[ReportSink].",
         plugin_name,
-        escape_terminal_controls(type(value).__name__),
+        safe_type_name(value),
     )
     return None

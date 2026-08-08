@@ -9,7 +9,7 @@ import json
 import logging
 import math
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Never
 from unittest.mock import MagicMock
 
 import pytest
@@ -63,6 +63,15 @@ class _HostileRepr:
     def __repr__(self) -> str:
         raise RuntimeError("repr failed")
 
+    def __str__(self) -> str:
+        raise RuntimeError("str failed")
+
+    def __iter__(self) -> Never:
+        raise RuntimeError("iter failed")
+
+    def __len__(self) -> int:
+        raise RuntimeError("len failed")
+
 
 class _HostileString(str):  # ruff: ignore[subclass-builtin]
     __slots__ = ()
@@ -76,6 +85,55 @@ class _HostileString(str):  # ruff: ignore[subclass-builtin]
 
     def __repr__(self) -> str:
         raise RuntimeError("repr failed")
+
+
+class _HostileList(list):  # ruff: ignore[subclass-builtin]
+    def __repr__(self) -> str:
+        raise RuntimeError("repr failed")
+
+    def __str__(self) -> str:
+        raise RuntimeError("str failed")
+
+    def __iter__(self) -> Never:
+        raise RuntimeError("iter failed")
+
+    def __len__(self) -> int:
+        raise RuntimeError("len failed")
+
+
+class _HostileMeta(type):
+    def __getattribute__(cls, name: str) -> object:
+        if name == "__name__":
+            raise RuntimeError("name failed")
+        return type.__getattribute__(
+            cls,
+            name,
+        )
+
+
+class _HostileTypeName(metaclass=_HostileMeta):
+    pass
+
+
+class _HostilePlugin:
+    rampart_sinks: object = object()
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr failed")
+
+
+class _HostileError(Exception):
+    def __str__(self) -> str:
+        raise SystemExit("str invoked")
+
+
+def _assert_no_terminal_controls(value: str) -> None:
+    assert all(
+        ord(character) >= 0x20
+        and ord(character) != 0x7F
+        and not 0x80 <= ord(character) <= 0x9F
+        for character in value
+    )
 
 
 def _make_result(
@@ -527,12 +585,22 @@ class TestDeserializationValidation:
 
     def test_hostile_schema_repr_does_not_escape_validation(self) -> None:
         payload: dict[str, Any] = {
-            "schema": _HostileRepr(),
+            "schema": _HostileTypeName(),
             "results_by_nodeid": {},
         }
         with pytest.raises(SchemaVersionError) as exc_info:
             deserialize_worker_data(data=payload)
         assert len(str(exc_info.value)) < 200
+
+    def test_schema_type_name_controls_are_escaped(self) -> None:
+        controlled_type = type("Bad\r\n\x1b]0;name\x07\x80", (), {})
+        payload: dict[str, Any] = {
+            "schema": controlled_type(),
+            "results_by_nodeid": {},
+        }
+        with pytest.raises(SchemaVersionError) as exc_info:
+            deserialize_worker_data(data=payload)
+        _assert_no_terminal_controls(str(exc_info.value))
 
     def test_rejects_malformed_safety_status(self) -> None:
         payload: dict[str, Any] = {
@@ -566,7 +634,6 @@ class TestDeserializationValidation:
         with pytest.raises(WorkerOutputError) as exc_info:
             deserialize_worker_data(data=payload)
         assert exc_info.value.__cause__ is None
-        assert exc_info.value.__suppress_context__ is True
         assert len(str(exc_info.value)) < 200
 
     def test_rejects_malformed_observability_level(self) -> None:
@@ -927,6 +994,8 @@ class TestHandleTestnodedown:
         assert session.is_incomplete is True
         assert "transport validation failed" in session.incomplete_reasons[0]
 
+
+class TestHandleTestnodedownTransportDiagnostics:
     def test_huge_transport_error_marker_is_bounded_and_incomplete(self) -> None:
         worker_session = _make_session_with_results(
             results_by_nodeid={"n": [_make_result(summary="kept")]},
@@ -976,6 +1045,23 @@ class TestHandleTestnodedown:
 
         assert session.is_incomplete is True
         assert len(session.incomplete_reasons[0]) < 300
+        assert session.results_by_nodeid["n"][0].summary == "kept"
+
+    def test_transport_error_controls_are_escaped(self) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        payload = serialize_worker_data(session=worker_session)
+        payload["rampart_transport_error"] = "\r\n\x1b[31m\x1b]0;bad\x07\x80"
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        session = RampartSession()
+
+        handle_testnodedown(session=session, node=node, error=None)
+
+        assert session.is_incomplete is True
+        _assert_no_terminal_controls(session.incomplete_reasons[0])
         assert session.results_by_nodeid["n"][0].summary == "kept"
 
     def test_transport_error_does_not_bypass_result_validation(self) -> None:
@@ -1412,6 +1498,42 @@ class TestTrialSpecs:
             serialize_worker_data(session=session)
         assert len(str(exc_info.value)) < 200
 
+    def test_hostile_container_hooks_are_not_invoked(self) -> None:
+        threshold: Any = _HostileList([_HostileRepr()])
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="n",
+            base_nodeid="b",
+            threshold=threshold,
+        )
+        with pytest.raises(TrialSpecValidationError) as exc_info:
+            serialize_worker_data(session=session)
+        assert "_HostileList" in str(exc_info.value)
+
+    def test_exact_container_diagnostic_does_not_traverse(self) -> None:
+        threshold: Any = [_HostileRepr()]
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="n",
+            base_nodeid="b",
+            threshold=threshold,
+        )
+        with pytest.raises(TrialSpecValidationError) as exc_info:
+            serialize_worker_data(session=session)
+        assert "<list len=1>" in str(exc_info.value)
+
+    def test_threshold_controls_are_escaped(self) -> None:
+        threshold: Any = "\r\n\x1b[31m\x1b]0;bad\x07\x80"
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="n",
+            base_nodeid="b",
+            threshold=threshold,
+        )
+        with pytest.raises(TrialSpecValidationError) as exc_info:
+            serialize_worker_data(session=session)
+        _assert_no_terminal_controls(str(exc_info.value))
+
     def test_nested_huge_threshold_diagnostic_is_bounded(self) -> None:
         threshold: Any = [10**5000]
         session = RampartSession()
@@ -1528,6 +1650,50 @@ class TestSinkDiscovery:
         result = discover_sinks_from_conftest(config=config)
         assert sink in result
 
+    def test_invalid_candidate_does_not_repr_plugin(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = MagicMock()
+        config.pluginmanager.get_plugins.return_value = [_HostilePlugin()]
+        with caplog.at_level(logging.WARNING):
+            result = discover_sinks_from_conftest(config=config)
+        assert result == []
+        assert any(
+            "controller-side discovery" in r.getMessage() for r in caplog.records
+        )
+
+    def test_list_subclass_candidate_is_not_iterated(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = MagicMock()
+        plugin.rampart_sinks = _HostileList()
+        config = MagicMock()
+        config.pluginmanager.get_plugins.return_value = [plugin]
+        with caplog.at_level(logging.WARNING):
+            result = discover_sinks_from_conftest(config=config)
+        assert result == []
+
+    def test_sink_factory_exception_uses_traceback_fallback(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        def failing_sinks() -> list[ReportSink]:
+            raise _HostileError
+
+        plugin = MagicMock()
+        plugin.rampart_sinks = failing_sinks
+        config = MagicMock()
+        config.pluginmanager.get_plugins.return_value = [plugin]
+        with caplog.at_level(logging.WARNING):
+            result = discover_sinks_from_conftest(config=config)
+
+        assert result == []
+        formatted = _format_record(caplog.records[-1])
+        assert "Traceback (most recent call last):" in formatted
+        assert "_HostileError: <exception str() failed>" in formatted
+
     def test_returns_empty_when_no_rampart_sinks(self) -> None:
         plugin = MagicMock(spec=["__name__"], __name__="mod")
         config = MagicMock()
@@ -1615,7 +1781,7 @@ class TestSinkDiscovery:
 
         assert result == []
         formatted = _format_record(caplog.records[-1])
-        assert r"plugin\x1b\x0a\x9b" in formatted
+        assert "MagicMock" in formatted
         assert r"RuntimeError: legacy\x1b\x09\x0a\x0d\x7f\x9b" in formatted
         assert "Traceback (most recent call last):" in formatted
         assert "\x1b" not in formatted
@@ -1626,17 +1792,13 @@ class TestSinkDiscovery:
         assert "\x9b" not in formatted
         assert str(error) == raw_error
 
-    def test_non_report_sink_repr_is_terminal_safe(
+    def test_non_report_sink_repr_is_not_invoked(
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        class HostileRepr:
-            def __repr__(self) -> str:
-                return "legacy-sink\x1b\t\n\r\x7f\x9b"
-
         plugin = MagicMock(
             spec=["rampart_sinks", "__name__"],
-            rampart_sinks=[HostileRepr()],
+            rampart_sinks=[_HostileRepr()],
             __name__="mod",
         )
         config = MagicMock()
@@ -1647,13 +1809,7 @@ class TestSinkDiscovery:
 
         assert result == []
         formatted = _format_record(caplog.records[-1])
-        assert r"legacy-sink\x1b\x09\x0a\x0d\x7f\x9b" in formatted
-        assert "\x1b" not in formatted
-        assert "\t" not in formatted
-        assert "\n" not in formatted
-        assert "\r" not in formatted
-        assert "\x7f" not in formatted
-        assert "\x9b" not in formatted
+        assert "<_HostileRepr>" in formatted
 
 
 class TestSinkDeprecationWarning:

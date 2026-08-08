@@ -1,170 +1,194 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-"""Bounded diagnostic rendering for pytest plugin validation boundaries."""
+"""Bounded diagnostics for pytest plugin validation boundaries."""
 
 from __future__ import annotations
 
-from itertools import islice
-from typing import Any
+from typing import ClassVar, cast
 
 __all__ = [
     "bounded_repr",
     "bounded_text",
+    "safe_type_name",
 ]
 
 
 class _DiagnosticRenderer:
-    MAX_DEPTH: int = 3
+    CONTROL_TRANSLATION: ClassVar[dict[int, str]] = {
+        codepoint: f"\\x{codepoint:02x}"
+        for codepoint in (*range(0x20), *range(0x7F, 0xA0))
+    }
     MAX_INT_BITS: int = 512
-    MAX_ITEMS: int = 4
-    MAX_LENGTH: int = 96
+    MAX_LENGTH: int = 192
+    PREVIEW_LENGTH: int = 48
 
     def render(self, value: object) -> str:
-        """Render a value within a strict character budget.
+        """Render exact safe builtins or a fixed type placeholder.
 
         Args:
             value (object): The value to render.
 
         Returns:
-            str: The bounded representation.
+            str: The escaped, bounded diagnostic representation.
         """
         try:
-            rendered = self._render(value=value, depth=0)
-            return self._truncate(rendered)
+            rendered = self._render_exact(value)
         except Exception:  # ruff: ignore[blind-except] — diagnostics cannot mask errors
-            rendered = f"<unrepresentable {self._type_name(value)}>"
-            return self._truncate(rendered)
+            rendered = "<object>"
+        return self._finish(rendered)
 
     def render_text(self, value: object) -> str:
-        """Render strings without quotes and other values diagnostically.
+        """Render exact strings without quotes and other values opaquely.
 
         Args:
             value (object): The value to render.
 
         Returns:
-            str: The bounded text.
+            str: The escaped, bounded diagnostic text.
         """
-        if not isinstance(value, str):
+        if type(value) is not str:
             return self.render(value)
         try:
-            return self._truncate(value)
+            value_length = str.__len__(  # ruff: ignore[unnecessary-dunder-call]
+                value,
+            )
+            preview = str.__getitem__(  # ruff: ignore[unnecessary-dunder-call]
+                value,
+                slice(0, self.MAX_LENGTH),
+            )
+            if value_length > self.MAX_LENGTH:
+                preview = f"{preview}..."
+            return self._finish(preview)
         except Exception:  # ruff: ignore[blind-except] — diagnostics cannot mask errors
-            return self.render(value)
+            return "<str>"
 
-    def _render(  # ruff: ignore[too-many-return-statements]
+    def type_name(self, value: object) -> str:
+        """Return an escaped, bounded non-polymorphic type name.
+
+        Args:
+            value (object): The value whose exact type should be named.
+
+        Returns:
+            str: The safe type name or a constant fallback.
+        """
+        try:
+            value_type = type(value)
+            if type(value_type) is not type:
+                return "object"
+            name = type.__getattribute__(  # ruff: ignore[unnecessary-dunder-call]
+                value_type,
+                "__name__",
+            )
+            if type(name) is not str:
+                return "object"
+            return self._finish(name)
+        except Exception:  # ruff: ignore[blind-except] — hostile metaclasses
+            return "object"
+
+    def _render_exact(  # ruff: ignore[too-many-return-statements]
         self,
-        *,
         value: object,
-        depth: int,
     ) -> str:
-        if depth >= self.MAX_DEPTH:
-            return f"<{self._type_name(value)} ...>"
-        if value is None or isinstance(value, bool):
-            return repr(value)
-        if isinstance(value, int):
-            return self._render_int(value)
-        if isinstance(value, float):
-            return repr(value)
-        if isinstance(value, str | bytes):
-            return self._render_string(value)
-        if isinstance(value, list | tuple | set | frozenset):
-            return self._render_collection(value=value, depth=depth)
-        if isinstance(value, dict):
-            return self._render_mapping(value=value, depth=depth)
-        return repr(value)
+        value_type = type(value)
+        if value_type is type(None):
+            return "None"
+        if value_type is bool:
+            return "True" if value is True else "False"
+        if value_type is int:
+            return self._render_int(cast("int", value))
+        if value_type is float:
+            return float.__repr__(value)  # ruff: ignore[unnecessary-dunder-call]
+        if value_type is str:
+            return self._render_str(cast("str", value))
+        if value_type is bytes:
+            return self._render_bytes(cast("bytes", value))
+        container_length = self._exact_container_length(value)
+        if container_length is not None:
+            return (
+                f"<{self.type_name(value)} "
+                f"len={int.__repr__(container_length)}>"  # ruff: ignore[unnecessary-dunder-call]
+            )
+        return f"<{self.type_name(value)}>"
 
     def _render_int(self, value: int) -> str:
         bit_length = int.bit_length(value)
         if bit_length > self.MAX_INT_BITS:
             return f"<int with {bit_length} bits>"
-        return repr(value)
+        return int.__repr__(value)  # ruff: ignore[unnecessary-dunder-call]
 
-    def _render_string(self, value: str | bytes) -> str:
-        preview_length = self.MAX_LENGTH // 2
-        if isinstance(value, str):
-            value_length = str.__len__(value)  # ruff: ignore[unnecessary-dunder-call]
-            preview = str.__getitem__(  # ruff: ignore[unnecessary-dunder-call]
-                value,
-                slice(0, preview_length),
-            )
-        else:
-            value_length = bytes.__len__(  # ruff: ignore[unnecessary-dunder-call]
-                value,
-            )
-            preview = bytes.__getitem__(  # ruff: ignore[unnecessary-dunder-call]
-                value,
-                slice(0, preview_length),
-            )
-        rendered = repr(preview)
-        if value_length > preview_length:
-            rendered = f"{rendered}..."
-        return rendered
-
-    def _render_collection(
-        self,
-        *,
-        value: list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any],
-        depth: int,
-    ) -> str:
-        opening, closing = self._collection_delimiters(value)
-        parts = [
-            self._render(value=item, depth=depth + 1)
-            for item in islice(value, self.MAX_ITEMS)
-        ]
-        if len(value) > self.MAX_ITEMS:
-            parts.append("...")
-        return self._truncate(f"{opening}{', '.join(parts)}{closing}")
-
-    def _render_mapping(self, *, value: dict[Any, Any], depth: int) -> str:
-        parts = [
-            (
-                f"{self._render(value=key, depth=depth + 1)}: "
-                f"{self._render(value=item, depth=depth + 1)}"
-            )
-            for key, item in islice(value.items(), self.MAX_ITEMS)
-        ]
-        if len(value) > self.MAX_ITEMS:
-            parts.append("...")
-        return self._truncate(f"{{{', '.join(parts)}}}")
-
-    def _type_name(self, value: object) -> str:
-        return self._truncate(type(value).__name__)
-
-    def _truncate(self, value: str) -> str:
+    def _render_str(self, value: str) -> str:
         value_length = str.__len__(value)  # ruff: ignore[unnecessary-dunder-call]
-        if value_length <= self.MAX_LENGTH:
-            return str.__getitem__(  # ruff: ignore[unnecessary-dunder-call]
-                value,
-                slice(0, value_length),
-            )
         preview = str.__getitem__(  # ruff: ignore[unnecessary-dunder-call]
             value,
+            slice(0, self.PREVIEW_LENGTH),
+        )
+        rendered = str.__repr__(preview)  # ruff: ignore[unnecessary-dunder-call]
+        return f"{rendered}..." if value_length > self.PREVIEW_LENGTH else rendered
+
+    def _render_bytes(self, value: bytes) -> str:
+        value_length = bytes.__len__(value)  # ruff: ignore[unnecessary-dunder-call]
+        preview = bytes.__getitem__(  # ruff: ignore[unnecessary-dunder-call]
+            value,
+            slice(0, self.PREVIEW_LENGTH),
+        )
+        rendered = bytes.__repr__(preview)  # ruff: ignore[unnecessary-dunder-call]
+        return f"{rendered}..." if value_length > self.PREVIEW_LENGTH else rendered
+
+    @staticmethod
+    def _exact_container_length(value: object) -> int | None:
+        value_type = type(value)
+        if value_type is list:
+            return list.__len__(  # ruff: ignore[unnecessary-dunder-call]
+                cast("list[object]", value),
+            )
+        if value_type is tuple:
+            return tuple.__len__(  # ruff: ignore[unnecessary-dunder-call]
+                cast("tuple[object, ...]", value),
+            )
+        if value_type is dict:
+            return dict.__len__(  # ruff: ignore[unnecessary-dunder-call]
+                cast("dict[object, object]", value),
+            )
+        if value_type is set:
+            return set.__len__(  # ruff: ignore[unnecessary-dunder-call]
+                cast("set[object]", value),
+            )
+        if value_type is frozenset:
+            return frozenset.__len__(  # ruff: ignore[unnecessary-dunder-call]
+                cast("frozenset[object]", value),
+            )
+        return None
+
+    def _finish(self, value: str) -> str:
+        raw_length = str.__len__(value)  # ruff: ignore[unnecessary-dunder-call]
+        raw_preview = str.__getitem__(  # ruff: ignore[unnecessary-dunder-call]
+            value,
+            slice(0, self.MAX_LENGTH),
+        )
+        escaped = str.translate(raw_preview, self.CONTROL_TRANSLATION)
+        if raw_length > self.MAX_LENGTH:
+            escaped = f"{escaped}..."
+        escaped_length = str.__len__(  # ruff: ignore[unnecessary-dunder-call]
+            escaped,
+        )
+        if escaped_length <= self.MAX_LENGTH:
+            return escaped
+        preview = str.__getitem__(  # ruff: ignore[unnecessary-dunder-call]
+            escaped,
             slice(0, self.MAX_LENGTH - 3),
         )
         return f"{preview}..."
 
-    @staticmethod
-    def _collection_delimiters(
-        value: list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any],
-    ) -> tuple[str, str]:
-        if isinstance(value, list):
-            return ("[", "]")
-        if isinstance(value, tuple):
-            return ("(", ")")
-        if isinstance(value, set):
-            return ("{", "}")
-        return ("frozenset({", "})")
-
 
 def bounded_repr(value: object) -> str:
-    """Return a bounded, exception-safe representation of a value.
+    """Return a bounded exact-builtins-only representation.
 
     Args:
         value (object): The value to represent.
 
     Returns:
-        str: The bounded representation.
+        str: The escaped, bounded representation.
     """
     return _DiagnosticRenderer().render(value)
 
@@ -176,6 +200,18 @@ def bounded_text(value: object) -> str:
         value (object): The value to render as text.
 
     Returns:
-        str: The bounded text.
+        str: The escaped, bounded text.
     """
     return _DiagnosticRenderer().render_text(value)
+
+
+def safe_type_name(value: object) -> str:
+    """Return a non-polymorphic escaped and bounded type name.
+
+    Args:
+        value (object): The value whose exact type should be named.
+
+    Returns:
+        str: The safe type name.
+    """
+    return _DiagnosticRenderer().type_name(value)

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import math
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Never, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,26 +54,58 @@ class _HostileRepr:
     def __repr__(self) -> str:
         raise RuntimeError("repr failed")
 
+    def __str__(self) -> str:
+        raise RuntimeError("str failed")
 
-class _HostileString(str):  # ruff: ignore[subclass-builtin]
-    __slots__ = ()
+    def __iter__(self) -> Never:
+        raise RuntimeError("iter failed")
 
     def __len__(self) -> int:
         raise RuntimeError("len failed")
 
-    def __getitem__(self, key: object) -> str:
-        del key
-        raise RuntimeError("getitem failed")
+
+class _HostileList(list):  # ruff: ignore[subclass-builtin]
+    def __iter__(self) -> Never:
+        raise RuntimeError("iter failed")
 
 
-class _ReprReturnsHostileString:
-    def __repr__(self) -> str:
-        return _HostileString("x" * 10_000)
+class _HostileMeta(type):
+    def __getattribute__(cls, name: str) -> object:
+        if name == "__name__":
+            raise RuntimeError("name failed")
+        return type.__getattribute__(
+            cls,
+            name,
+        )
+
+
+class _HostileTypeName(metaclass=_HostileMeta):
+    pass
+
+
+class _DescriptorMeta(type):
+    @property
+    def __name__(cls) -> str:  # ruff: ignore[bad-dunder-method-name]
+        del cls
+        raise SystemExit("name descriptor invoked")
+
+
+class _DescriptorTypeName(metaclass=_DescriptorMeta):
+    pass
 
 
 def _raise_repr(value: object) -> str:
     del value
     raise RuntimeError("repr failed")
+
+
+def _assert_no_terminal_controls(value: str) -> None:
+    assert all(
+        ord(character) >= 0x20
+        and ord(character) != 0x7F
+        and not 0x80 <= ord(character) <= 0x9F
+        for character in value
+    )
 
 
 class _StashStub:
@@ -672,6 +704,12 @@ class TestResolveTrialThreshold:
         assert "finite number in (0, 1]" in str(exc_info.value)
         assert len(str(exc_info.value)) < 200
 
+    def test_exact_container_diagnostic_does_not_traverse(self) -> None:
+        marker = pytest.mark.trial(threshold=[_HostileRepr()]).mark
+        with pytest.raises(pytest.UsageError) as exc_info:
+            _resolve_trial_threshold(marker)
+        assert "<list len=1>" in str(exc_info.value)
+
     def test_nested_huge_integer_diagnostic_is_bounded(self) -> None:
         value: object = 10**5000
         for _ in range(6):
@@ -688,13 +726,29 @@ class TestResolveTrialThreshold:
             _resolve_trial_threshold(marker)
         assert len(str(exc_info.value)) < 200
 
-    def test_repr_returned_string_subclass_cannot_bypass_bound(self) -> None:
-        marker = pytest.mark.trial(
-            threshold=_ReprReturnsHostileString(),
-        ).mark
+    def test_hostile_metaclass_name_hook_is_not_invoked(self) -> None:
+        marker = pytest.mark.trial(threshold=_HostileTypeName()).mark
         with pytest.raises(pytest.UsageError) as exc_info:
             _resolve_trial_threshold(marker)
         assert len(str(exc_info.value)) < 200
+
+    def test_metaclass_name_descriptor_is_not_invoked(self) -> None:
+        marker = pytest.mark.trial(threshold=_DescriptorTypeName()).mark
+        with pytest.raises(pytest.UsageError) as exc_info:
+            _resolve_trial_threshold(marker)
+        assert "<object>" in str(exc_info.value)
+
+    def test_value_and_type_name_controls_are_escaped(self) -> None:
+        controlled_type = type("Bad\r\n\x1b]0;name\x07\x80", (), {})
+        values = [
+            "\r\n\x1b[31m\x1b]0;value\x07\x80",
+            controlled_type(),
+        ]
+        for value in values:
+            marker = pytest.mark.trial(threshold=value).mark
+            with pytest.raises(pytest.UsageError) as exc_info:
+                _resolve_trial_threshold(marker)
+            _assert_no_terminal_controls(str(exc_info.value))
 
     def test_ordinary_invalid_value_remains_helpful(self) -> None:
         marker = pytest.mark.trial(threshold="not-a-number").mark
@@ -1366,58 +1420,23 @@ class TestSinkHookResolution:
         result = _resolve_hook_sinks(config=config)
         assert result == [sink_a]
 
-    def test_non_report_sink_repr_is_terminal_safe(
+    def test_resolve_hook_sinks_rejects_list_subclass_without_iteration(
         self,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        class HostileRepr:
-            def __repr__(self) -> str:
-                return "sink\x1b\t\n\r\x7f\x9b"
-
         config = MagicMock()
         config.pluginmanager.hook.pytest_rampart_sinks.return_value = [
-            [HostileRepr()],
+            _HostileList(),
         ]
-
-        with caplog.at_level(logging.WARNING):
-            result = _resolve_hook_sinks(config=config)
-
+        result = _resolve_hook_sinks(config=config)
         assert result == []
-        formatted = _format_record(caplog.records[-1])
-        assert r"sink\x1b\x09\x0a\x0d\x7f\x9b" in formatted
-        assert "\x1b" not in formatted
-        assert "\t" not in formatted
-        assert "\n" not in formatted
-        assert "\r" not in formatted
-        assert "\x7f" not in formatted
-        assert "\x9b" not in formatted
 
-    def test_non_report_sink_raising_repr_does_not_abort_resolution(
-        self,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        class BrokenRepr:
-            def __repr__(self) -> str:
-                raise RuntimeError("broken repr")
-
-        BrokenRepr.__name__ = "Broken\x1b\nType\x9b"
+    def test_resolve_hook_sinks_does_not_repr_invalid_sink(self) -> None:
         config = MagicMock()
         config.pluginmanager.hook.pytest_rampart_sinks.return_value = [
-            [BrokenRepr()],
+            [_HostileRepr()],
         ]
-
-        with caplog.at_level(logging.WARNING):
-            result = _resolve_hook_sinks(config=config)
-
+        result = _resolve_hook_sinks(config=config)
         assert result == []
-        formatted = _format_record(caplog.records[-1])
-        assert (
-            r"<unrepresentable Broken\x1b\x0aType\x9b; "
-            "RuntimeError raised by repr()>"
-        ) in formatted
-        assert "\x1b" not in formatted
-        assert "\n" not in formatted
-        assert "\x9b" not in formatted
 
     def test_resolve_hook_sinks_skips_non_list_results(self) -> None:
         sink_a = MagicMock(spec=ReportSink)
