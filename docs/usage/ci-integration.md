@@ -31,7 +31,7 @@ RAMPART aggregates results across worker processes and emits a single unified re
 
 ## Trial Markers for Statistical Confidence
 
-Use `@pytest.mark.trial(n=, threshold=)` for tests where a single run is not conclusive:
+Use `@pytest.mark.trial(n=, threshold=1.0)` for tests where a single run is not conclusive:
 
 ```python
 @pytest.mark.trial(n=10, threshold=0.8)
@@ -48,6 +48,8 @@ This runs 10 independent trials. The test group passes only if ≥ 80% of trials
 - The aggregate verdict appears in the RAMPART terminal summary
 - Any `UNSAFE` trial → the group fails
 - `ERROR` trials count against the pass rate
+- A clone that records no Result counts against the pass rate
+- A failed aggregate changes an otherwise-successful pytest exit status to `1`
 
 ---
 
@@ -133,12 +135,14 @@ llm = LLMConfig(
 
 ## Exit Codes
 
-RAMPART does not alter pytest's exit codes:
+RAMPART preserves existing nonzero pytest exit codes. If pytest would otherwise
+exit successfully, RAMPART changes the status to `1` when a trial aggregate
+fails or an xdist run is incomplete. Collect-only runs do not evaluate trial
+gates.
 
 | Exit Code | Meaning |
 |-----------|---------|
 | `0` | All tests passed |
-| `1` | Some tests failed |
+| `1` | Tests failed, a RAMPART trial gate failed, or the run was incomplete |
 | `2` | Test execution interrupted |
 | `5` | No tests collected |
-

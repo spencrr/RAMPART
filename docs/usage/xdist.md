@@ -49,7 +49,7 @@ The result: **one** `JsonFileReportSink` output file, **one** call to `MyCustomS
 
 ## Trial Tests with xdist
 
-`@pytest.mark.trial(n=, threshold=)` clones a test into N independent runs. Under xdist, clones may be distributed across workers depending on the `--dist` mode.
+`@pytest.mark.trial(n=, threshold=1.0)` clones a test into N independent runs. Under xdist, clones may be distributed across workers depending on the `--dist` mode.
 
 | `--dist` mode | Trial behavior |
 |---------------|----------------|
@@ -196,6 +196,10 @@ Worker results cross the process boundary through pytest-xdist's
 applies the following transport validation and normalization:
 
 - **Schema version** — payloads with missing or unknown schema versions are rejected.
+- **Trial metadata** — the current `rampart.xdist.v1` schema requires
+  `trial_specs`; an empty list means the worker collected no trials. Missing or
+  malformed trial metadata marks the run incomplete without discarding Results
+  that already passed strict Result validation.
 - **Size** — worker payloads are capped at 64 MB by default.
 - **Value shape** — enum values, container depth, JSON-compatible metadata, and
   finite numeric values are validated or normalized.
@@ -237,7 +241,9 @@ report.metadata["incomplete"]            # True if any worker failed
 report.metadata["incomplete_reasons"]    # list[str] — one per failure
 ```
 
-Reports are still emitted with whatever data was collected. For safety-critical CI, sinks or post-processing should check the `incomplete` flag and fail the build accordingly.
+Reports are still emitted with whatever data was collected, and RAMPART changes
+an otherwise-successful pytest exit status to `TESTS_FAILED`. Sinks and
+post-processing can also inspect the `incomplete` flag for diagnostics.
 
 ---
 

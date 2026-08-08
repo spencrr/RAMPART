@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, cast
+from typing import cast
+
+from rampart.common.text import escape_terminal_controls
 
 __all__ = [
     "bounded_repr",
@@ -15,10 +17,6 @@ __all__ = [
 
 
 class _DiagnosticRenderer:
-    CONTROL_TRANSLATION: ClassVar[dict[int, str]] = {
-        codepoint: f"\\x{codepoint:02x}"
-        for codepoint in (*range(0x20), *range(0x7F, 0xA0))
-    }
     MAX_INT_BITS: int = 512
     MAX_LENGTH: int = 192
     PREVIEW_LENGTH: int = 48
@@ -166,7 +164,7 @@ class _DiagnosticRenderer:
             value,
             slice(0, self.MAX_LENGTH),
         )
-        escaped = str.translate(raw_preview, self.CONTROL_TRANSLATION)
+        escaped = escape_terminal_controls(raw_preview)
         if raw_length > self.MAX_LENGTH:
             escaped = f"{escaped}..."
         escaped_length = str.__len__(  # ruff: ignore[unnecessary-dunder-call]

@@ -668,6 +668,29 @@ class TestCollectOnly:
                 reports = list(out_dir.glob("run_report_*.json"))
                 assert reports == []
 
+    def test_collect_only_trial_skips_failed_gate(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_collect_trial="""
+            import pytest
+
+            @pytest.mark.trial(n=2)
+            def test_no_result():
+                pass
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "--collect-only",
+        )
+
+        assert result.ret == pytest.ExitCode.OK
+        assert "forcing non-zero exit status" not in "\n".join(result.outlines)
+
 
 class TestCloneIdDeterminism:
     def test_trial_clone_ids_deterministic_across_processes(
