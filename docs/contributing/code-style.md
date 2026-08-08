@@ -76,7 +76,7 @@ def __init__(self, *, client: ServiceClient, config: Config) -> None: ...
 def __init__(self, client: ServiceClient, config: Config) -> None: ...
 ```
 
-Dunder methods with Python-defined signatures (`__or__`, `__eq__`, etc.) are exempt.
+Enforced by Ruff's `too-many-positional-arguments` with `max-positional-args = 1`. `self`/`cls` are not counted, and `@overload`/`@override` are exempt. Dunders are **not** exempt, which is intentional for `__init__`, but dunders whose signature Python dictates (`__aexit__`, `__setitem__`) need `# ruff: ignore[too-many-positional-arguments]`. The rule is relaxed for tests, where pytest dictates signatures via fixtures and `parametrize`.
 
 ### Type Annotations
 
@@ -159,11 +159,10 @@ Before committing, run pre-commit — it covers everything the automated tooling
 uv run pre-commit run --all-files
 ```
 
-This runs Ruff (linting + formatting), ty (type checking), and flake8 (`RMP` codes), which together enforce the copyright header, type annotations, log formatting, import organization, the `_async` suffix, and most other conventions on this page.
+This runs Ruff (linting + formatting), ty (type checking), and flake8 (`RMP` codes), which together enforce the copyright header, type annotations, log formatting, import organization, the `_async` suffix, keyword-only arguments, and most other conventions on this page.
 
 A few rules are **not** caught by tooling and still need a human eye:
 
-- [ ] Functions with more than one parameter use keyword-only arguments (`*`)
 - [ ] `Enum` / `StrEnum` is used instead of `Literal` for predefined choices
 - [ ] PyRIT imports are lazy (inside functions), not module-level
 

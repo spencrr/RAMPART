@@ -101,6 +101,7 @@ def process_items(self, items, limit=10): ...
 - Functions with more than 1 parameter MUST use `*` after self/cls to enforce keyword-only arguments
 - This prevents positional argument errors and improves API clarity
 - **Exception**: Dunder methods with Python-defined signatures (`__or__`, `__and__`, `__eq__`, `__contains__`, etc.) are exempt since Python calls them with positional arguments
+- Enforced by `PLR0917` (see [Automated Enforcement](#automated-enforcement))
 
 ```python
 # CORRECT
@@ -609,6 +610,29 @@ Before committing code, ensure:
 | Convention | Code | Enforced by |
 |---|---|---|
 | Async `_async` suffix | `RMP001` | `tools/flake8_rampart.py`, a flake8 local plugin |
+| Keyword-only arguments | `PLR0917` | ruff, natively |
+
+### Keyword-only arguments (`PLR0917`)
+
+The rule is ruff's `too-many-positional-arguments` with
+`max-positional-args = 1`: allowing at most one positional parameter means any
+function taking more must separate them with `*`. It needs no plugin code.
+Its precise semantics differ slightly from a literal reading of the
+convention, and the ruff behaviour wins:
+
+- `self`/`cls` are not counted. Ruff ignores the first parameter of a method
+  whatever it is named, and correctly *does* count it for `@staticmethod`.
+- `@overload` declarations and `@typing.override` methods are exempt. The
+  implementation behind a set of overloads is still checked.
+- Parameters matching ruff's `dummy-variable-rgx` (e.g. `_unused`) are not counted.
+- Dunder methods are **not** exempt. This is deliberate for `__init__`, which
+  should take keyword-only arguments. Protocol dunders whose signature Python
+  dictates, such as `__aexit__` and `__setitem__`, need
+  `# ruff: ignore[too-many-positional-arguments]`.
+
+The rule is relaxed for `tests/**`, because pytest dictates test signatures
+through fixtures and `parametrize`. It still applies to `scripts/` and
+`tools/`.
 
 ### Async naming (`RMP001`)
 

@@ -16,6 +16,10 @@ The project intentionally disables several lint rules for test files (configured
 - **Private member access allowed** — tests may access `_private` members directly
 - **Unused arguments allowed** — fixture parameters and stubs may appear unused
 - **Local imports allowed** — imports inside test functions for isolation are acceptable
+- **Keyword-only arguments not required** (`too-many-positional-arguments`): pytest dictates test signatures through fixtures and `parametrize`, so the keyword-only convention is not enforced in tests
+
+The async `_async` naming convention is **not** relaxed. It is enforced in
+tests too, by `RMP001`. See [Async Tests](#async-tests).
 
 ## Test Organization
 

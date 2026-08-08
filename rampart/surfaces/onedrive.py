@@ -229,7 +229,7 @@ class _OneDriveInjection:
             raise InfrastructureError(msg) from exc
         return self
 
-    async def __aexit__(
+    async def __aexit__(  # ruff: ignore[too-many-positional-arguments]  (protocol signature)
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,

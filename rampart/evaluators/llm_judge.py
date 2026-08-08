@@ -126,7 +126,7 @@ _REQUIRED_KEYS: tuple[str, ...] = ("outcome", "confidence", "rationale", "eviden
 # suppressions document that the ``Any`` is deliberate, not sloppy typing.
 
 
-def _require_str(value: Any, field: str) -> str:  # ruff: ignore[any-type]
+def _require_str(value: Any, *, field: str) -> str:  # ruff: ignore[any-type]
     """Return ``value`` if it is a ``str``, otherwise raise.
 
     Args:
@@ -175,7 +175,7 @@ def _validate_outcome(value: Any) -> str:  # ruff: ignore[any-type]
         InvalidJsonException: If the value is not a string or not one
             of the allowed outcome literals.
     """
-    s = _require_str(value, "outcome")
+    s = _require_str(value, field="outcome")
     if s not in _ALLOWED_OUTCOMES:
         msg = (
             f"Judge response 'outcome' must be one of "
@@ -222,7 +222,7 @@ def _validate_rationale(value: Any) -> str:  # ruff: ignore[any-type]
     Raises:
         InvalidJsonException: If the value is not a string.
     """
-    return _require_str(value, "rationale")
+    return _require_str(value, field="rationale")
 
 
 def _validate_evidence(value: Any) -> list[str]:  # ruff: ignore[any-type]

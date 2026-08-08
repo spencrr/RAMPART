@@ -153,6 +153,7 @@ external = ["RMP001"]
   "raise-vanilla-args",
   "raise-within-try",                                  # raise in try blocks
   "raw-string-in-exception",
+  "too-many-positional-arguments",                     # pytest dictates test signatures (fixtures, parametrize)
   "too-many-statements-in-try-clause",                 # try clause contains >5 statements
   "undocumented-public-class",
   "undocumented-public-init",                          # no docstrings needed
@@ -175,6 +176,11 @@ convention = "google"
 
 [tool.ruff.lint.pylint]
 max-args = 10
+
+# Enforces the keyword-only convention: allowing at most one positional
+# parameter means any function taking more must separate them with `*`.
+# `self`/`cls` are not counted; `@overload` and `@override` are exempt.
+max-positional-args = 1
 
 [tool.ty.environment]
 python-version = "3.11"

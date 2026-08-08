@@ -320,7 +320,7 @@ def _create_trial_clones(
 
 
 @pytest.hookimpl(trylast=True)
-def pytest_collection_modifyitems(
+def pytest_collection_modifyitems(  # ruff: ignore[too-many-positional-arguments]  (pytest hook signature)
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
@@ -461,7 +461,7 @@ def _rampart_collect(  # pytest discovers this via autouse=True
 
 
 @pytest.hookimpl(wrapper=True)
-def pytest_runtest_makereport(
+def pytest_runtest_makereport(  # ruff: ignore[too-many-positional-arguments]  (pytest hook signature)
     item: pytest.Item,
     call: pytest.CallInfo[None],
 ) -> Generator[None, pytest.TestReport, pytest.TestReport]:
@@ -725,9 +725,9 @@ def _enforce_incomplete_exit_status(
         )
 
 
-def pytest_sessionfinish(
+def pytest_sessionfinish(  # ruff: ignore[too-many-positional-arguments]  (pytest hook signature)
     session: pytest.Session,
-    exitstatus: int,  # ruff: ignore[unused-function-argument]  — pytest hook signature
+    exitstatus: int,  # ruff: ignore[unused-function-argument]  (pytest hook signature)
 ) -> None:
     """Aggregate trial results, evaluate gates, and emit sinks.
 
@@ -786,7 +786,7 @@ def pytest_sessionfinish(
 
 
 @pytest.hookimpl(optionalhook=True)
-def pytest_testnodedown(node: object, error: object) -> None:
+def pytest_testnodedown(node: object, error: object) -> None:  # ruff: ignore[too-many-positional-arguments]  (pytest hook signature)
     """Merge a finished xdist worker's results into the controller session.
 
     Thin delegate to ``_xdist.handle_testnodedown`` so plugin.py stays
@@ -958,9 +958,9 @@ def _write_incomplete_warning(
         terminalreporter.write_line(f"  - {_sanitize_for_terminal(reason)}")
 
 
-def pytest_terminal_summary(
+def pytest_terminal_summary(  # ruff: ignore[too-many-positional-arguments]  (pytest hook signature)
     terminalreporter: TerminalReporter,
-    exitstatus: int,  # ruff: ignore[unused-function-argument]  — pytest hook signature
+    exitstatus: int,  # ruff: ignore[unused-function-argument]  (pytest hook signature)
     config: pytest.Config,
 ) -> None:
     """Append RAMPART harm-category summary after pytest's standard output.
