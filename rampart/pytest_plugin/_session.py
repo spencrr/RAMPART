@@ -3,8 +3,8 @@
 
 """Session-scoped state for the RAMPART pytest plugin.
 
-Accumulates Result objects, computes trial group aggregates, and
-builds the final TestRunReport.
+Accumulates Result objects, computes deprecated clone aggregates, reconstructs
+execution-domain trial summaries, and builds the final TestRunReport.
 """
 
 from __future__ import annotations
@@ -16,8 +16,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from rampart.core.result import Result, SafetyStatus
-from rampart.pytest_plugin._diagnostics import safe_type_name
+from rampart.pytest_plugin._diagnostics import bounded_text, safe_type_name
 from rampart.reporting.sink import ReportSink, TestRunReport
+from rampart.reporting.trial_batch import _summarize_trial_batches
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -440,6 +441,14 @@ class RampartSession:
         if self._cached_report is not None:
             return self._cached_report
         sorted_results = sorted(self._results, key=_result_sort_key)
+        trial_batches, trial_diagnostics = _summarize_trial_batches(
+            results=sorted_results,
+        )
+        for diagnostic in trial_diagnostics:
+            logger.warning(
+                "Invalid RAMPART trial batch metadata: %s",
+                bounded_text(diagnostic),
+            )
         counts = Counter(r.status for r in sorted_results)
         metadata: dict[str, Any] = dict(self._report_metadata)
         if self._incomplete:
@@ -454,5 +463,6 @@ class RampartSession:
             errors=counts[SafetyStatus.ERROR],
             duration_seconds=self._duration_seconds,
             metadata=metadata,
+            trial_batches=trial_batches,
         )
         return self._cached_report

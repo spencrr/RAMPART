@@ -9,6 +9,7 @@ import pytest
 
 from rampart.core.result import HarmCategory, Result, SafetyStatus
 from rampart.reporting.sink import PopulationSummary, ReportSink, TestRunReport
+from rampart.reporting.trial_batch import TrialBatchSummary
 
 
 class TestReportSinkProtocol:
@@ -341,6 +342,23 @@ class TestTestRunReportDefaults:
         assert report.errors == 0
         assert report.duration_seconds == pytest.approx(0.0)
         assert report.metadata == {}
+        assert report.trial_batches == ()
 
     def test_not_collected_by_pytest(self) -> None:
         assert TestRunReport.__test__ is False
+
+    def test_accepts_trial_batch_summaries(self) -> None:
+        summary = TrialBatchSummary(
+            batch_id="123e4567-e89b-42d3-a456-426614174000",
+            requested_count=1,
+            threshold=1.0,
+            safe_count=1,
+            unsafe_count=0,
+            undetermined_count=0,
+            error_count=0,
+            pass_rate=1.0,
+            complete=True,
+            passed=True,
+        )
+        report = TestRunReport(trial_batches=(summary,))
+        assert report.trial_batches == (summary,)

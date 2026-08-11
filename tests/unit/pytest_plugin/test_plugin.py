@@ -13,6 +13,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from rampart.core import (
+    TRIAL_BATCH_COUNT_KEY,
+    TRIAL_BATCH_ID_KEY,
+    TRIAL_BATCH_INDEX_KEY,
+    TRIAL_BATCH_SCHEMA,
+    TRIAL_BATCH_SCHEMA_KEY,
+    TRIAL_BATCH_THRESHOLD_KEY,
+)
 from rampart.core.result import Result, SafetyStatus
 from rampart.core.types import ObservabilityLevel
 from rampart.pytest_plugin._collection import (
@@ -24,6 +32,7 @@ from rampart.pytest_plugin._collection import (
 )
 from rampart.pytest_plugin._session import RampartSession
 from rampart.pytest_plugin.plugin import (
+    _TRIAL_MARKER_DEPRECATION_MESSAGE,
     _absorb_results,
     _call_results_key,
     _emit_sinks,
@@ -306,6 +315,83 @@ class TestRampartSession:
         assert report.passed == 1
         assert report.failed == 1
         assert report.errors == 1
+
+    def test_build_report_reconstructs_interleaved_execution_batch(self) -> None:
+        session = RampartSession()
+        collector = ResultCollector()
+        collector.record(result=Result(status=SafetyStatus.SAFE, summary="plain"))
+        for index in range(2):
+            collector.record(
+                result=Result(
+                    status=SafetyStatus.SAFE,
+                    summary=f"batch-{index}",
+                    metadata={
+                        TRIAL_BATCH_SCHEMA_KEY: TRIAL_BATCH_SCHEMA,
+                        TRIAL_BATCH_ID_KEY: "123e4567-e89b-42d3-a456-426614174000",
+                        TRIAL_BATCH_INDEX_KEY: index,
+                        TRIAL_BATCH_COUNT_KEY: 2,
+                        TRIAL_BATCH_THRESHOLD_KEY: 1.0,
+                    },
+                ),
+            )
+        node = MagicMock()
+        node.nodeid = "test_file.py::test_interleaved"
+        node.get_closest_marker.return_value = None
+
+        session.absorb(node=node, collector=collector)
+        report = session.build_report()
+
+        assert report.total_runs == 3
+        assert [
+            result.metadata["_rampart_result_index"] for result in report.results
+        ] == [
+            0,
+            1,
+            2,
+        ]
+        [summary] = report.trial_batches
+        assert summary.safe_count == 2
+        assert summary.complete is True
+        assert summary.passed is True
+
+    def test_build_report_logs_malformed_batch_diagnostic_once(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        session = RampartSession()
+        collector = ResultCollector()
+        collector.record(
+            result=Result(
+                status=SafetyStatus.SAFE,
+                summary="partial",
+                metadata={
+                    TRIAL_BATCH_SCHEMA_KEY: TRIAL_BATCH_SCHEMA,
+                    TRIAL_BATCH_ID_KEY: "123e4567-e89b-42d3-a456-426614174000",
+                    TRIAL_BATCH_INDEX_KEY: 0,
+                    TRIAL_BATCH_COUNT_KEY: 2,
+                    TRIAL_BATCH_THRESHOLD_KEY: 1.0,
+                },
+            ),
+        )
+        node = MagicMock()
+        node.nodeid = "test_file.py::test_partial"
+        node.get_closest_marker.return_value = None
+        session.absorb(node=node, collector=collector)
+
+        with caplog.at_level(logging.WARNING):
+            first = session.build_report()
+            second = session.build_report()
+
+        assert first is second
+        assert first.total_runs == 1
+        [summary] = first.trial_batches
+        assert summary.complete is False
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if "Invalid RAMPART trial batch metadata" in record.getMessage()
+        ]
+        assert len(messages) == 1
 
     def test_record_trial_group(self) -> None:
         session = RampartSession()
@@ -1332,9 +1418,9 @@ class TestTrialMarkerDeprecation:
 
         with pytest.warns(
             pytest.PytestDeprecationWarning,
-            match="forthcoming execution-domain trial API",
-        ):
+        ) as warnings:
             _warn_trial_marker_deprecated(rampart_session=rampart_session)
+        assert str(warnings[0].message) == _TRIAL_MARKER_DEPRECATION_MESSAGE
 
     def test_noop_without_trial_specs(self, recwarn: pytest.WarningsRecorder) -> None:
         _warn_trial_marker_deprecated(rampart_session=RampartSession())
@@ -1407,6 +1493,38 @@ class TestEmitSinks:
         _emit_sinks(rampart_session=session)
 
         assert captured == [raw_summary]
+
+    def test_custom_sink_receives_trial_batch_summaries(self) -> None:
+        captured: list[TestRunReport] = []
+
+        class CapturingSink:
+            async def emit_async(self, *, report: TestRunReport) -> None:
+                captured.append(report)
+
+        session = RampartSession(sinks=[CapturingSink()])
+        collector = ResultCollector()
+        collector.record(
+            result=Result(
+                status=SafetyStatus.SAFE,
+                summary="safe",
+                metadata={
+                    TRIAL_BATCH_SCHEMA_KEY: TRIAL_BATCH_SCHEMA,
+                    TRIAL_BATCH_ID_KEY: "123e4567-e89b-42d3-a456-426614174000",
+                    TRIAL_BATCH_INDEX_KEY: 0,
+                    TRIAL_BATCH_COUNT_KEY: 1,
+                    TRIAL_BATCH_THRESHOLD_KEY: 1.0,
+                },
+            ),
+        )
+        node = MagicMock()
+        node.nodeid = "test.py::test_batch_sink"
+        node.get_closest_marker.return_value = None
+        session.absorb(node=node, collector=collector)
+
+        _emit_sinks(rampart_session=session)
+
+        assert len(captured) == 1
+        assert captured[0].trial_batches[0].passed is True
 
 
 class TestSessionFinishIntegration:

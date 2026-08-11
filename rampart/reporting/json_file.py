@@ -90,6 +90,9 @@ class JsonFileReportSink:
             "duration_seconds": report.duration_seconds,
             "metadata": report.metadata,
             "population_summary": dataclasses.asdict(report.population_summary()),
+            "trial_batches": [
+                dataclasses.asdict(summary) for summary in report.trial_batches
+            ],
             "by_harm_category": {
                 category: [self._serialize_result(r) for r in results]
                 for category, results in report.by_harm_category().items()

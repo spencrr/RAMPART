@@ -28,6 +28,16 @@ from rampart.core.result import (
     resolve_as_attack,
     resolve_as_probe,
 )
+from rampart.core.trial import (
+    TRIAL_BATCH_COUNT_KEY,
+    TRIAL_BATCH_ID_KEY,
+    TRIAL_BATCH_INDEX_KEY,
+    TRIAL_BATCH_SCHEMA,
+    TRIAL_BATCH_SCHEMA_KEY,
+    TRIAL_BATCH_THRESHOLD_KEY,
+    TrialBatch,
+    execute_trials_async,
+)
 from rampart.core.types import (
     EvalContext,
     EvalOutcome,
@@ -47,6 +57,12 @@ from rampart.probes import Probes
 from rampart.pytest_plugin._collection import record_result
 
 __all__ = [
+    "TRIAL_BATCH_COUNT_KEY",
+    "TRIAL_BATCH_ID_KEY",
+    "TRIAL_BATCH_INDEX_KEY",
+    "TRIAL_BATCH_SCHEMA",
+    "TRIAL_BATCH_SCHEMA_KEY",
+    "TRIAL_BATCH_THRESHOLD_KEY",
     "AgentAdapter",
     "AppManifest",
     "Attacks",
@@ -85,7 +101,9 @@ __all__ = [
     "ToolCall",
     "ToolDeclaration",
     "TranscriptScope",
+    "TrialBatch",
     "Turn",
+    "execute_trials_async",
     "record_result",
     "resolve_as_attack",
     "resolve_as_probe",

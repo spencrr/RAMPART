@@ -6,10 +6,18 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
-from rampart.core.execution import ExecutionEvent, ExecutionEventData
+from rampart.core.execution import (
+    BaseExecution,
+    ExecutionEvent,
+    ExecutionEventData,
+    ExecutionEventHandler,
+    _default_handler_factory,
+)
 from rampart.core.result import Result, SafetyStatus
+from rampart.core.trial import TRIAL_BATCH_INDEX_KEY, execute_trials_async
 from rampart.pytest_plugin._collection import (
     ResultCollectionHandler,
     ResultCollector,
@@ -19,6 +27,9 @@ from rampart.pytest_plugin._collection import (
     get_active_collector,
     record_result,
 )
+
+if TYPE_CHECKING:
+    from rampart.core.adapter import AgentAdapter
 
 
 def _make_result(*, summary: str = "test") -> Result:
@@ -37,6 +48,19 @@ def _make_event_data(
         adapter=MagicMock(),
         result=result,
     )
+
+
+class _CollectionExecution(BaseExecution):
+    def __init__(self, *, result: Result) -> None:
+        super().__init__()
+        self._result = result
+
+    @property
+    def strategy_name(self) -> str:
+        return "collection"
+
+    async def _execute_async(self, *, adapter: AgentAdapter) -> Result:
+        return self._result
 
 
 class TestResultCollector:
@@ -238,3 +262,38 @@ class TestGetActiveCollector:
             assert active.results[0].summary == "child"
         finally:
             deactivate_collector(token)
+
+
+class TestTrialBatchCollection:
+    async def test_default_handler_collects_each_trial_exactly_once_async(
+        self,
+    ) -> None:
+        collector = ResultCollector()
+        results = [_make_result(summary=str(index)) for index in range(3)]
+        iterator = iter(results)
+        token = activate_collector(collector)
+        previous_factory = _default_handler_factory.factory
+
+        def handler_factory() -> list[ExecutionEventHandler]:
+            return [ResultCollectionHandler()]
+
+        _default_handler_factory.factory = handler_factory
+        try:
+            batch = await execute_trials_async(
+                execution_factory=lambda: _CollectionExecution(result=next(iterator)),
+                adapter=MagicMock(),
+                count=3,
+            )
+        finally:
+            _default_handler_factory.factory = previous_factory
+            deactivate_collector(token)
+
+        assert collector.results == list(batch.results)
+        assert len(collector.results) == 3
+        assert [
+            result.metadata[TRIAL_BATCH_INDEX_KEY] for result in collector.results
+        ] == [
+            0,
+            1,
+            2,
+        ]

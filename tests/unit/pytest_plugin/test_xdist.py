@@ -15,6 +15,14 @@ from unittest.mock import MagicMock
 import pytest
 from _pytest.config import PytestPluginManager
 
+from rampart.core import (
+    TRIAL_BATCH_COUNT_KEY,
+    TRIAL_BATCH_ID_KEY,
+    TRIAL_BATCH_INDEX_KEY,
+    TRIAL_BATCH_SCHEMA,
+    TRIAL_BATCH_SCHEMA_KEY,
+    TRIAL_BATCH_THRESHOLD_KEY,
+)
 from rampart.core.result import (
     HarmCategory,
     InjectionRecord,
@@ -478,6 +486,28 @@ class TestSerializationRoundTrip:
         recovered = deserialize_worker_data(data=payload)
         assert recovered["n"][0].metadata["test_name"] == "t1"
         assert recovered["n"][0].metadata["tries"] == 3
+
+    def test_trial_batch_metadata_round_trips_without_schema_change(self) -> None:
+        metadata = {
+            TRIAL_BATCH_SCHEMA_KEY: TRIAL_BATCH_SCHEMA,
+            TRIAL_BATCH_ID_KEY: "123e4567-e89b-42d3-a456-426614174000",
+            TRIAL_BATCH_INDEX_KEY: 0,
+            TRIAL_BATCH_COUNT_KEY: 1,
+            TRIAL_BATCH_THRESHOLD_KEY: 1.0,
+        }
+        session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(metadata=metadata)]},
+        )
+
+        payload = serialize_worker_data(session=session)
+        recovered = deserialize_worker_data(data=payload)
+
+        assert payload["schema"] == SCHEMA_VERSION
+        assert recovered["n"][0].metadata | metadata == recovered["n"][0].metadata
+        assert (
+            recovered["n"][0].metadata[TRIAL_BATCH_ID_KEY]
+            == metadata[TRIAL_BATCH_ID_KEY]
+        )
 
     def test_preserves_every_textual_evidence_field(  # ruff: ignore[too-many-locals]
         self,

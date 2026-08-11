@@ -11,9 +11,12 @@ by the pytest_terminal_summary hook.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from rampart.core.result import HarmCategory, Result, SafetyStatus
+
+if TYPE_CHECKING:
+    from rampart.reporting.trial_batch import TrialBatchSummary
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -59,6 +62,8 @@ class TestRunReport:
         errors (int): Number with infrastructure errors.
         duration_seconds (float): Total run duration.
         metadata (dict[str, Any]): Run-level metadata (CI job ID, commit hash, etc.).
+        trial_batches (tuple[TrialBatchSummary, ...]): Execution-domain batch
+            summaries reconstructed from collected Result metadata.
     """
 
     __test__ = False  # Prevent pytest from collecting this dataclass as a test.
@@ -71,6 +76,7 @@ class TestRunReport:
     errors: int = 0
     duration_seconds: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict[str, Any])
+    trial_batches: tuple[TrialBatchSummary, ...] = field(default_factory=tuple)
 
     def by_harm_category(self) -> dict[str, list[Result]]:
         """Group results by harm category.
@@ -95,16 +101,16 @@ class TestRunReport:
     ) -> PopulationSummary:
         """Compute aggregate statistics over collected Result objects.
 
-        Each Result corresponds to one test execution — one run of one
-        test body. For parametrized payload suites, each payload variant
-        is one Result. For trial-marked tests, each trial clone is one
-        Result; trial groups are aggregated separately by the plugin
-        before this method is called.
+        Each Result corresponds to one execution. For parametrized payload
+        suites, each payload variant is one Result. Execution-domain
+        ``TrialBatch`` members are also individual Results even though they
+        share one pytest item. Deprecated trial-marker clones remain individual
+        Results as well.
 
         This method does not distinguish payloads from trial repetitions.
         Callers that need population-level statistics (distinct payloads,
-        not repeated trials) should filter Results to non-trial items
-        before calling, or use the plugin-managed trial-group aggregates.
+        not repeated trials) should filter Results before calling or use
+        ``TestRunReport.trial_batches`` for execution-domain batch statistics.
 
         Args:
             harm_category (HarmCategory | str | None): Filter to a specific

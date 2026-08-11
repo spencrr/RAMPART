@@ -14,10 +14,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from xml.etree import ElementTree as ET  # ruff: ignore[suspicious-xml-etree-import]
 
 import pytest
 
 from rampart.pytest_plugin._xdist_shadow import REPORT_ATTRIBUTE
+from rampart.pytest_plugin.plugin import _TRIAL_MARKER_DEPRECATION_MESSAGE
 
 if TYPE_CHECKING:
     from _pytest.pytester import Pytester, RunResult
@@ -307,6 +309,12 @@ def _make_shadow_result_tests(configured_pytester: Pytester) -> None:
             record_result(Result(status=SafetyStatus.SAFE, summary="two"))
         """,
     )
+
+
+def _flatten_results(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        result for results in report["by_harm_category"].values() for result in results
+    ]
 
 
 class TestSingleProcessBaseline:
@@ -755,6 +763,333 @@ class TestXdistEachAttempts:
         )
 
 
+class TestExecutionDomainTrialBatches:
+    def test_one_item_fixture_and_junit_case_yields_n_results(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_execution_trials="""
+            from pathlib import Path
+
+            import pytest
+
+            from rampart import (
+                BaseExecution,
+                Result,
+                SafetyStatus,
+                execute_trials_async,
+            )
+
+
+            class Execution(BaseExecution):
+                @property
+                def strategy_name(self):
+                    return "test"
+
+                async def _execute_async(self, *, adapter):
+                    return Result(status=SafetyStatus.SAFE, summary="safe")
+
+
+            @pytest.fixture
+            def adapter():
+                path = Path("fixture-lifecycle.txt")
+                path.write_text("setup\\n", encoding="utf-8")
+                yield object()
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write("teardown\\n")
+
+
+            @pytest.mark.harm("test")
+            async def test_execution_trials(adapter):
+                batch = await execute_trials_async(
+                    execution_factory=Execution,
+                    adapter=adapter,
+                    count=3,
+                )
+                assert batch
+            """,
+        )
+        xml_path = configured_pytester.path / "report.xml"
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            f"--junitxml={xml_path}",
+        )
+
+        result.assert_outcomes(passed=1)
+        reports = _load_reports(configured_pytester)
+        assert len(reports) == 1
+        assert reports[0]["total_runs"] == 3
+        assert len(reports[0]["trial_batches"]) == 1
+        assert reports[0]["trial_batches"][0]["passed"] is True
+        assert (
+            len(
+                ET.parse(  # ruff: ignore[suspicious-xml-element-tree-usage]
+                    xml_path,
+                ).findall(".//testcase"),
+            )
+            == 1
+        )
+        assert (
+            configured_pytester.path / "fixture-lifecycle.txt"
+        ).read_text() == "setup\nteardown\n"
+
+    def test_partial_and_zero_factory_failures_preserve_only_real_results(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_factory_failures="""
+            from rampart import (
+                BaseExecution,
+                Result,
+                SafetyStatus,
+                execute_trials_async,
+            )
+
+
+            class Execution(BaseExecution):
+                @property
+                def strategy_name(self):
+                    return "test"
+
+                async def _execute_async(self, *, adapter):
+                    return Result(status=SafetyStatus.SAFE, summary="safe")
+
+
+            async def test_partial():
+                calls = 0
+
+                def factory():
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise RuntimeError("partial factory failure")
+                    return Execution()
+
+                await execute_trials_async(
+                    execution_factory=factory,
+                    adapter=object(),
+                    count=3,
+                )
+
+
+            async def test_zero():
+                def factory():
+                    raise RuntimeError("zero factory failure")
+
+                await execute_trials_async(
+                    execution_factory=factory,
+                    adapter=object(),
+                    count=3,
+                )
+            """,
+        )
+
+        result = configured_pytester.runpytest("-p", "no:cacheprovider")
+
+        result.assert_outcomes(failed=2)
+        reports = _load_reports(configured_pytester)
+        assert len(reports) == 1
+        report = reports[0]
+        assert report["total_runs"] == 1
+        assert len(report["trial_batches"]) == 1
+        [summary] = report["trial_batches"]
+        assert summary["safe_count"] == 1
+        assert summary["requested_count"] == 3
+        assert summary["complete"] is False
+        assert summary["passed"] is False
+
+    def test_complete_subthreshold_batch_fails_item_and_reports_complete(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_failed_gate="""
+            from rampart import (
+                BaseExecution,
+                Result,
+                SafetyStatus,
+                execute_trials_async,
+            )
+
+
+            class Execution(BaseExecution):
+                def __init__(self, *, status):
+                    super().__init__()
+                    self._status = status
+
+                @property
+                def strategy_name(self):
+                    return "test"
+
+                async def _execute_async(self, *, adapter):
+                    return Result(status=self._status, summary=self._status.value)
+
+
+            async def test_failed_gate():
+                passing = await execute_trials_async(
+                    execution_factory=lambda: Execution(status=SafetyStatus.SAFE),
+                    adapter=object(),
+                    count=1,
+                )
+                assert passing
+
+                statuses = iter([SafetyStatus.SAFE, SafetyStatus.UNSAFE])
+                failing = await execute_trials_async(
+                    execution_factory=lambda: Execution(status=next(statuses)),
+                    adapter=object(),
+                    count=2,
+                )
+                assert failing
+            """,
+        )
+
+        result = configured_pytester.runpytest("-p", "no:cacheprovider")
+
+        result.assert_outcomes(failed=1)
+        reports = _load_reports(configured_pytester)
+        assert len(reports) == 1
+        report = reports[0]
+        assert report["total_runs"] == 3
+        assert len(report["trial_batches"]) == 2
+        passing, failing = report["trial_batches"]
+        assert passing["passed"] is True
+        assert failing["complete"] is True
+        assert failing["safe_count"] == 1
+        assert failing["unsafe_count"] == 1
+        assert failing["passed"] is False
+
+    def test_normal_xdist_keeps_internal_trials_on_one_worker(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_xdist_batch="""
+            from rampart import (
+                BaseExecution,
+                Result,
+                SafetyStatus,
+                execute_trials_async,
+                record_result,
+            )
+
+
+            class Execution(BaseExecution):
+                @property
+                def strategy_name(self):
+                    return "test"
+
+                async def _execute_async(self, *, adapter):
+                    return Result(status=SafetyStatus.SAFE, summary="batch")
+
+
+            async def test_xdist_batch():
+                record_result(Result(status=SafetyStatus.SAFE, summary="plain"))
+                batch = await execute_trials_async(
+                    execution_factory=Execution,
+                    adapter=object(),
+                    count=2,
+                )
+                assert batch
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "2",
+        )
+
+        result.assert_outcomes(passed=1)
+        reports = _load_reports(configured_pytester)
+        assert len(reports) == 1
+        report = reports[0]
+        assert report["total_runs"] == 3
+        assert len(report["trial_batches"]) == 1
+        [summary] = report["trial_batches"]
+        assert summary["safe_count"] == 2
+        assert summary["complete"] is True
+
+    def test_dist_each_creates_one_unique_batch_per_worker_invocation(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_each_batch="""
+            import pytest
+
+            from rampart import (
+                BaseExecution,
+                Result,
+                SafetyStatus,
+                execute_trials_async,
+            )
+
+
+            class Execution(BaseExecution):
+                @property
+                def strategy_name(self):
+                    return "test"
+
+                async def _execute_async(self, *, adapter):
+                    return Result(status=SafetyStatus.SAFE, summary="safe")
+
+
+            @pytest.mark.harm("test")
+            async def test_each_batch():
+                batch = await execute_trials_async(
+                    execution_factory=Execution,
+                    adapter=object(),
+                    count=2,
+                )
+                assert batch
+            """,
+        )
+        xml_path = configured_pytester.path / "each-report.xml"
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "2",
+            "--dist",
+            "each",
+            f"--junitxml={xml_path}",
+        )
+
+        result.assert_outcomes(passed=2)
+        reports = _load_reports(configured_pytester)
+        assert len(reports) == 1
+        report = reports[0]
+        assert report["total_runs"] == 4
+        assert len(report["trial_batches"]) == 2
+        batch_ids = [summary["batch_id"] for summary in report["trial_batches"]]
+        assert len(set(batch_ids)) == 2
+        assert all(
+            summary["requested_count"] == 2 for summary in report["trial_batches"]
+        )
+        assert all(summary["complete"] is True for summary in report["trial_batches"])
+        first_seen = list(
+            dict.fromkeys(
+                result["metadata"]["_rampart_trial_batch_id"]
+                for result in _flatten_results(report)
+            ),
+        )
+        assert batch_ids == first_seen
+        assert (
+            len(
+                ET.parse(  # ruff: ignore[suspicious-xml-element-tree-usage]
+                    xml_path,
+                ).findall(".//testcase"),
+            )
+            == 2
+        )
+
+
 class TestXdistShadowLifecycle:
     @pytest.mark.parametrize("dist_mode", ["load", "loadgroup", "each"])
     def test_v1_v2_multisets_match_under_scheduler(
@@ -1101,6 +1436,7 @@ class TestTrialMarkerDeprecation:
             if "clone-based @pytest.mark.trial marker is deprecated" in line
         ]
         assert len(warning_lines) == 1
+        assert _TRIAL_MARKER_DEPRECATION_MESSAGE in warning_lines[0]
         assert any("PytestDeprecationWarning" in line for line in warning_lines)
 
     def test_warning_error_is_contained_after_report(

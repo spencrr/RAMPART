@@ -23,6 +23,7 @@ from rampart.core.types import (
 )
 from rampart.reporting.json_file import JsonFileReportSink
 from rampart.reporting.sink import TestRunReport
+from rampart.reporting.trial_batch import TrialBatchSummary
 
 
 def _result_with_turns(
@@ -315,3 +316,43 @@ class TestReportMetadata:
         data = sink._serialize_report(report)
 
         assert data["metadata"] == {}
+
+
+class TestTrialBatchSerialization:
+    def test_serializes_trial_batches_additively(self) -> None:
+        sink = JsonFileReportSink(output_dir=Path("/tmp"))
+        summary = TrialBatchSummary(
+            batch_id="123e4567-e89b-42d3-a456-426614174000",
+            requested_count=2,
+            threshold=0.5,
+            safe_count=1,
+            unsafe_count=1,
+            undetermined_count=0,
+            error_count=0,
+            pass_rate=0.5,
+            complete=True,
+            passed=True,
+        )
+
+        data = sink._serialize_report(TestRunReport(trial_batches=(summary,)))
+
+        assert data["trial_batches"] == [
+            {
+                "batch_id": summary.batch_id,
+                "requested_count": 2,
+                "threshold": 0.5,
+                "safe_count": 1,
+                "unsafe_count": 1,
+                "undetermined_count": 0,
+                "error_count": 0,
+                "pass_rate": 0.5,
+                "complete": True,
+                "passed": True,
+                "diagnostics": (),
+            },
+        ]
+
+    def test_empty_report_serializes_empty_trial_batch_list(self) -> None:
+        sink = JsonFileReportSink(output_dir=Path("/tmp"))
+        data = sink._serialize_report(TestRunReport())
+        assert data["trial_batches"] == []

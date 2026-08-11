@@ -7,6 +7,7 @@ Registered via the pytest11 entry point in pyproject.toml. Provides:
 - harm and trial markers
 - automatic result collection via the default handler factory
 - trial cloning at collection time
+- execution-domain TrialBatch summary reconstruction
 - terminal summary with harm-category grouping
 - session-finish aggregation for trial groups
 - sink emission for structured reporting
@@ -109,6 +110,11 @@ _STATUS_LABELS: dict[SafetyStatus, str] = {
     SafetyStatus.UNDETERMINED: "WARN",
     SafetyStatus.ERROR: "ERR",
 }
+_TRIAL_MARKER_DEPRECATION_MESSAGE = (
+    "The clone-based @pytest.mark.trial marker is deprecated and will be removed "
+    "in 0.3.0. Migrate to execute_trials_async(execution_factory=..., adapter=..., "
+    "count=..., threshold=...)."
+)
 
 
 def _resolve_trial_n(marker: pytest.Mark) -> int:
@@ -827,9 +833,7 @@ def _warn_trial_marker_deprecated(*, rampart_session: RampartSession) -> None:
     if not rampart_session.trial_specs:
         return
     warning = pytest.PytestDeprecationWarning(
-        "The clone-based @pytest.mark.trial marker is deprecated. "
-        "Migrate to the forthcoming execution-domain trial API when "
-        "it becomes available."
+        _TRIAL_MARKER_DEPRECATION_MESSAGE,
     )
     try:
         warnings.warn(warning, stacklevel=2)
