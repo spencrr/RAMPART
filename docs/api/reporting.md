@@ -8,4 +8,5 @@ Reporting infrastructure for persisting test results.
         - ReportSink
         - TestRunReport
         - PopulationSummary
+        - TrialBatchSummary
         - JsonFileReportSink

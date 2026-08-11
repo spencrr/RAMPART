@@ -118,10 +118,13 @@ Expected output:
 
 ```
 @pytest.mark.harm(*categories): categorize by harm type
-@pytest.mark.trial(n=, threshold=): statistical repetition
+@pytest.mark.trial(n=, threshold=1.0): deprecated clone-based repetition
 ```
 
-RAMPART registers as a pytest plugin automatically via the `pytest11` entry point. No `conftest.py` configuration is needed to activate it.
+RAMPART registers as a pytest plugin automatically via the `pytest11` entry
+point. No `conftest.py` configuration is needed to activate it. New statistical
+tests use the public `execute_trials_async` helper; the marker remains only for
+the `0.2.x` migration window and is removed in `0.3.0`.
 
 ---
 
@@ -144,5 +147,4 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 ```
-
 

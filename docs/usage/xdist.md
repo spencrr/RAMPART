@@ -116,65 +116,48 @@ v1 Result population is never replaced or supplemented by shadow data.
 
 ---
 
-## Trial Tests with xdist
+## Execution-domain trials with xdist
 
-`@pytest.mark.trial(n=, threshold=1.0)` clones a test into N independent runs. Under xdist, clones may be distributed across workers depending on the `--dist` mode.
+`execute_trials_async` runs its N executions sequentially inside the worker that
+owns the surrounding pytest item. xdist schedules pytest items; it does not
+split one helper call across workers.
 
-| `--dist` mode | Trial behavior |
-|---------------|----------------|
+| `--dist` mode | Execution-domain batch behavior |
+|---------------|---------------------------------|
+| `load` (default) | The item runs on one selected worker; all N Results share one batch UUID |
+| `loadgroup` / `loadscope` / `loadfile` | Grouping changes which worker owns the item, not its internal trial behavior |
+| `each` | Every worker invokes the item and creates its own UUID4 batch with N Results |
+
+Internal trials therefore do not provide worker-level parallelism. Use explicit
+pytest parametrization when each trial needs separate worker scheduling,
+fixture setup, retries or selection, or a separate JUnit testcase.
+
+One helper invocation shares its adapter and fixture/process context. Built-in
+executions request a fresh adapter Session for each Result, but external agent
+and backend state may still persist. Custom executions control their own
+session behavior.
+
+Every worker transports ordinary Results through the unchanged
+`rampart.xdist.v1` schema. The controller reconstructs `TrialBatchSummary`
+objects from versioned primitive Result metadata and orders summaries by first
+Result occurrence, not by their random UUIDs.
+
+### Deprecated clone marker with xdist
+
+The clone-based `@pytest.mark.trial` marker remains during `0.2.x` and is removed
+in `0.3.0`. Its old behavior is unchanged:
+
+| `--dist` mode | Deprecated clone behavior |
+|---------------|---------------------------|
 | `each` | Every worker executes every trial clone |
-| `loadgroup` | All trial clones for one test pinned to the same worker |
-| `load` (default) | Trial clones distributed across all workers |
-| `loadscope` / `loadfile` | Grouped by class/module/file |
+| `loadgroup` | All clones for one test are pinned to one worker |
+| `load` (default) | Clones may be distributed across workers |
+| `loadscope` / `loadfile` | Clones are grouped by class/module/file |
 
-**Correctness is preserved regardless of mode** — the controller retains the
-merged result population before evaluating logical trial-clone groups. You'll
-see a warning if you use `@trial` markers without `--dist=loadgroup`:
-
-```text
-RAMPART @trial markers present with --dist=load. Trial clones may be
-split across workers. Aggregation remains correct (controller merges
-all results), but using --dist=loadgroup keeps trial clones co-located
-on one worker for better locality.
-```
-
-This warning is **informational, not a correctness signal** — see below for when it's safe to ignore.
-
-`--dist=each` deliberately creates multiple genuine executions with the same
-node ID. Every execution is retained in `TestRunReport.results` and
-`total_runs`. The temporary clone-based trial gate still uses the number of
-logical clones as its denominator rather than multiplying it by worker count;
-multiple Results for one clone are evaluated fail-closed (`UNSAFE`, then
-`ERROR`, then `SAFE`). This distinction will be replaced by the forthcoming
-execution-domain trial API.
-
-### Choosing `loadgroup` vs `load`
-
-**Both modes produce an identical, correct report.** The controller merges per-worker
-partials into one population and evaluates each trial's threshold against the full
-group either way. The choice is about *execution*, not correctness:
-
-- **`load` (default)** spreads a test's trial clones across **all** workers, so a
-  20-clone trial keeps every worker busy. It is usually the **fastest** option and is
-  the right default when trial clones are **independent** (no shared per-group state).
-- **`loadgroup`** pins all clones of one trial group to a **single** worker. Prefer it
-  only when a trial group needs **cohesion** — e.g. clones share a session-scoped
-  fixture, a per-group cache/connection, or other worker-local state that must not be
-  split across processes. The trade-off is less parallelism, so it can run slower.
-
-**Rule of thumb:** independent trials → plain `pytest -n 4` (faster); trials that
-share per-group worker state → `pytest -n 4 --dist=loadgroup`.
-
-As an illustration, one 22-item suite containing a 20-clone trial measured:
-
-| Mode | Command | Wall time | Reports | `total_runs` |
-|------|---------|-----------|---------|--------------|
-| Serial | `pytest -n 0` | 203.4s | 1 | 22 |
-| Parallel, loadgroup | `pytest -n 4 --dist=loadgroup` | 165.5s | 1 | 22 |
-| Parallel, default load | `pytest -n 4` | **113.8s** | 1 | 22 |
-
-All three emit the same single report and the same trial verdict; `load` is fastest
-here because the 20 clones fan out across the 4 workers instead of being pinned to one.
+Controller aggregation remains correct in every mode. The informational
+`--dist=loadgroup` warning remains for clone locality, and `--dist=each`
+continues to retain every worker attempt while gating the logical clone count.
+Do not use the marker for new tests.
 
 ---
 
@@ -359,8 +342,9 @@ worker loss or a drop still marks the run incomplete, while emitted reports
 continue to contain only the v1 population. This deliberate observation period
 must reconcile cleanly before any later production cutover.
 
-Until then, use `--dist=loadgroup` only when your trial groups need worker
-cohesion (see [Choosing `loadgroup` vs `load`](#choosing-loadgroup-vs-load)) and
+Until then, use `--dist=loadgroup` only when deprecated clone groups need worker
+cohesion (see
+[Deprecated clone marker with xdist](#deprecated-clone-marker-with-xdist)) and
 size the cap for both your largest expected worker payload and largest expected
 single-item Result envelope.
 

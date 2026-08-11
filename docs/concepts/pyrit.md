@@ -38,10 +38,9 @@ RAMPART is not a thin wrapper around PyRIT. It adds:
 
 - **Safety-test semantics** — attack/probe distinction, safety verdicts, [`Result`][rampart.core.result.Result] with `safe`/`status`
 - **Execution orchestration** — injection → trigger → evaluate lifecycle, early stopping, `AsyncExitStack` cleanup
-- **pytest integration** — markers, result collection, trial repetition, terminal summary, report sinks
+- **pytest integration** — harm markers, result collection, execution-domain trial batches, terminal summary, report sinks
 - **Evaluator composition** — `|`, `&`, `~` operators for combining evaluators
 - **Type-safe protocols** — [`AgentAdapter`][rampart.core.adapter.AgentAdapter], [`Session`][rampart.core.adapter.Session], [`Surface`][rampart.core.injection.Surface], [`InjectionHandle`][rampart.core.injection.InjectionHandle]
 
 For PyRIT's own documentation, see the [PyRIT docs](https://microsoft.github.io/PyRIT/).
-
 

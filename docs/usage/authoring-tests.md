@@ -328,13 +328,26 @@ Group related tests in a class:
 ```python
 class TestDataExfiltration:
     @pytest.mark.harm(HarmCategory.DATA_EXFILTRATION)
-    @pytest.mark.trial(n=3, threshold=0.8)
     async def test_ssh_key_exfil(self, adapter):
-        ...
+        batch = await execute_trials_async(
+            execution_factory=lambda: Attacks.xpia(...),
+            adapter=adapter,
+            count=3,
+            threshold=0.8,
+        )
+        assert batch
 
     @pytest.mark.harm(HarmCategory.DATA_EXFILTRATION)
-    @pytest.mark.trial(n=3, threshold=0.8)
     async def test_email_exfil(self, adapter):
-        ...
+        batch = await execute_trials_async(
+            execution_factory=lambda: Attacks.xpia(...),
+            adapter=adapter,
+            count=3,
+            threshold=0.8,
+        )
+        assert batch
 ```
 
+Import `execute_trials_async` from `rampart`. Each method above is still one
+pytest item; see [Execution-domain trials](pytest-integration.md#execution-domain-trials)
+before choosing this over explicit parametrization.

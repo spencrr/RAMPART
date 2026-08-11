@@ -42,6 +42,52 @@ custom assertion message because it bypasses that representation.
 | `UNDETERMINED` | Could not determine safety |
 | `ERROR` | Infrastructure failure |
 
+## Trial batches
+
+[`execute_trials_async`][rampart.core.trial.execute_trials_async] returns a
+frozen [`TrialBatch`][rampart.core.trial.TrialBatch]:
+
+```python
+batch = await execute_trials_async(
+    execution_factory=lambda: Attacks.xpia(...),
+    adapter=my_adapter,
+    count=10,
+    threshold=0.8,
+)
+
+batch.results              # tuple of the 10 original Result objects
+batch.requested_count      # 10
+batch.safe_count           # number with SafetyStatus.SAFE
+batch.unsafe_count         # number with SafetyStatus.UNSAFE
+batch.undetermined_count
+batch.error_count
+batch.pass_rate            # safe_count / requested_count
+batch.passed               # pass_rate >= threshold
+assert batch
+```
+
+The outer batch is immutable but Results are not copied or frozen. Its
+representation contains aggregate fields only and never exposes raw Result
+evidence.
+
+RAMPART tags each Result after its `ON_POST_EXECUTE` handlers finish. The flat
+`rampart.trial-batch.v1` metadata is reporting context and survives both pytest
+fixture teardown and xdist transport. Custom post-execution handlers run before
+these fields are available.
+
+At session end, RAMPART derives `report.trial_batches` from the collected Result
+metadata. Each [`TrialBatchSummary`][rampart.reporting.trial_batch.TrialBatchSummary]
+contains the batch ID, requested count, threshold, four status counts, pass
+rate, completeness, verdict, and bounded validation diagnostics. Malformed,
+duplicate, inconsistent, partial, or cross-worker-colliding metadata cannot
+produce a passing summary. Raw Results and ordinary totals are always retained.
+
+!!! note "Population statistics"
+    `population_summary()` still counts every Result in a batch. Its existing
+    rates exclude `ERROR` Results from their diagnostic denominator, while a
+    trial batch deliberately uses the full requested count. Use
+    `report.trial_batches` for trial-gate statistics.
+
 ### Turns
 
 Each [`Turn`][rampart.core.types.Turn] in `result.turns` is one prompt-response exchange:
@@ -125,6 +171,9 @@ summary.safe_count
 summary.unsafe_count
 summary.attack_success_rate  # UNSAFE / non-ERROR total
 summary.safety_pass_rate     # SAFE / non-ERROR total
+
+# Execution-domain batch summaries, ordered by first Result occurrence
+report.trial_batches
 
 # Filter by category
 exfil = report.population_summary(harm_category=HarmCategory.DATA_EXFILTRATION)

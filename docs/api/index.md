@@ -9,8 +9,8 @@ API reference organized by RAMPART's package layout. Each page documents the pub
 
 | Page | Contents |
 |------|----------|
-| [Core Types](core-types.md) | `Payload`, `Request`, `Response`, `Turn`, `Result`, `SafetyStatus`, `HarmCategory`, and more |
-| [Core Protocols](core-protocols.md) | `Session`, `AgentAdapter`, `Evaluator`, `Surface`, `InjectionHandle`, and more |
+| [Core Types](core-types.md) | `Payload`, `Request`, `Response`, `Turn`, `Result`, `TrialBatch`, `SafetyStatus`, and more |
+| [Core Protocols](core-protocols.md) | `Session`, `AgentAdapter`, `Evaluator`, `Surface`, `execute_trials_async`, and more |
 | [Attacks](attacks.md) | `Attacks.xpia()`, `XPIAExecution` |
 | [Probes](probes.md) | `Probes.behavior()`, `SingleTurnExecution` |
 | [Evaluators](evaluators.md) | `ToolCalled`, `ResponseContains`, `SideEffectOccurred`, `LLMJudge`, `TranscriptScope` |
@@ -18,5 +18,5 @@ API reference organized by RAMPART's package layout. Each page documents the pub
 | [Payloads](payloads.md) | `Payloads`, `PayloadTemplate`, `PayloadStore` |
 | [Surfaces](surfaces.md) | `OneDriveSurface` |
 | [Converters](converters.md) | `DocxConverter` |
-| [Reporting](reporting.md) | `ReportSink`, `TestRunReport`, `JsonFileReportSink` |
+| [Reporting](reporting.md) | `ReportSink`, `TestRunReport`, `TrialBatchSummary`, `JsonFileReportSink` |
 | [pytest Plugin](pytest-plugin.md) | `record_result`, markers, hooks |

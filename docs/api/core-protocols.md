@@ -54,6 +54,11 @@ Protocols and ABCs that define RAMPART's extension points. Implement these to co
         - register_default_handler_factory
         - clear_default_handler_factory
 
+::: rampart.core.trial
+    options:
+      members:
+        - execute_trials_async
+
 ## Errors
 
 ::: rampart.core.errors

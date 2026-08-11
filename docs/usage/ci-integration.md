@@ -25,31 +25,45 @@ pip install pytest-xdist
 pytest tests/ -n auto
 ```
 
-RAMPART aggregates results across worker processes and emits a single unified report under **any** `--dist` mode. The default `--dist=load` spreads `@trial` clones across all workers and is usually fastest. Add `--dist=loadgroup` only when a trial group needs to stay on one worker (e.g. clones share a session fixture or per-group worker state). See [Choosing `loadgroup` vs `load`](xdist.md#choosing-loadgroup-vs-load) for details and security considerations.
+RAMPART aggregates results across worker processes and emits a single unified
+report under **any** `--dist` mode. Execution-domain trials stay sequential on
+the worker that owns their pytest item; xdist distributes items, not the
+executions inside one `execute_trials_async` call.
 
 ---
 
-## Trial Markers for Statistical Confidence
+## Trial Batches for Statistical Confidence
 
-Use `@pytest.mark.trial(n=, threshold=1.0)` for tests where a single run is not conclusive:
+Use `execute_trials_async` when a single execution is not conclusive:
 
 ```python
-@pytest.mark.trial(n=10, threshold=0.8)
 async def test_injection_resistance(adapter):
-    result = await Attacks.xpia(...).execute_async(adapter=adapter)
-    assert result
+    batch = await execute_trials_async(
+        execution_factory=lambda: Attacks.xpia(...),
+        adapter=adapter,
+        count=10,
+        threshold=0.8,
+    )
+    assert batch
 ```
 
-This runs 10 independent trials. The test group passes only if ≥ 80% of trials are `SAFE`.
+This requests 10 sequential Results and passes when at least 80% are `SAFE`.
+`UNSAFE`, `ERROR`, and `UNDETERMINED` remain in the denominator; an `UNSAFE`
+Result is tolerated when the explicit threshold still passes.
 
-**Trial semantics in CI:**
+**CI boundary:**
 
-- Each trial clone appears as a separate pytest item
-- The aggregate verdict appears in the RAMPART terminal summary
-- Any `UNSAFE` trial → the group fails
-- `ERROR` trials count against the pass rate
-- A clone that records no Result counts against the pass rate
-- A failed aggregate changes an otherwise-successful pytest exit status to `1`
+- one helper call is one pytest item, fixture lifecycle, worker, and JUnit case
+- every execution is a distinct object and produces a separate RAMPART Result
+- built-in executions request fresh adapter Sessions, but adapter, fixture,
+  process, external-agent, and backend state may persist
+- use explicit parametrization for worker distribution, per-trial fixture
+  setup, retries or selection, and individual JUnit cases
+- assert the returned batch to make its threshold the pytest gate
+
+!!! warning "Deprecated clone marker"
+    The clone-based `@pytest.mark.trial` marker remains only for the `0.2.x`
+    migration window and is removed in `0.3.0`.
 
 ---
 
@@ -142,15 +156,16 @@ llm = LLMConfig(
 
 ## Exit Codes
 
-RAMPART preserves existing nonzero pytest exit codes. If pytest would otherwise
-exit successfully, RAMPART changes the status to `1` when a trial aggregate
-fails or an xdist run is incomplete. Collect-only runs do not evaluate trial
-gates.
+RAMPART preserves existing nonzero pytest exit codes. An asserted
+execution-domain `TrialBatch` fails like an ordinary pytest assertion. For the
+deprecated clone marker only, RAMPART changes an otherwise-successful status to
+`1` when its aggregate fails. Incomplete xdist runs also force status `1`.
+Collect-only runs do not evaluate deprecated clone gates.
 
 | Exit Code | Meaning |
 |-----------|---------|
 | `0` | All tests passed |
-| `1` | Tests failed, a RAMPART trial gate failed, or the run was incomplete |
+| `1` | Tests failed, a deprecated clone gate failed, or the run was incomplete |
 | `2` | Test execution interrupted |
 | `3` | Internal pytest error |
 | `4` | Pytest usage or configuration error, including invalid RAMPART marker values |

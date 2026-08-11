@@ -34,6 +34,6 @@ You provide an **adapter** that connects your agent to the framework. RAMPART pr
 
 - **Execution strategies** — orchestrate injection, triggering, and evaluation lifecycles
 - **Evaluators** — detect conditions in agent responses (tool calls, text patterns, side effects)
-- **pytest integration** — markers for harm categorization and statistical trials, automatic result collection, terminal summaries
+- **pytest integration** — harm categorization, execution-domain trial batches, automatic result collection, terminal summaries
 - **Parallel execution** — run tests across worker processes with `pytest-xdist`; RAMPART produces a single unified report
 - **Reporting** — structured JSON output for CI dashboards

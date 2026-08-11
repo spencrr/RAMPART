@@ -31,6 +31,13 @@ Data types shared across the entire framework. All importable from `rampart` dir
         - resolve_as_attack
         - resolve_as_probe
 
+## Trial Batches
+
+::: rampart.core.trial
+    options:
+      members:
+        - TrialBatch
+
 ## Configuration
 
 ::: rampart.core.llm
