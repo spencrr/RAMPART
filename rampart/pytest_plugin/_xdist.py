@@ -1116,25 +1116,40 @@ def deserialize_worker_data(*, data: object) -> dict[str, list[Result]]:
         WorkerOutputError: Malformed payload (type errors, bad enums).
     """
     typed = _validate_schema(data=data)
-    raw_results = typed.get("results_by_nodeid", {})
-    if not isinstance(raw_results, dict):
+    if "results_by_nodeid" not in typed:
+        msg = f"Worker missing required 'results_by_nodeid' for {SCHEMA_VERSION}."
+        raise WorkerOutputError(msg)
+    raw_results = typed["results_by_nodeid"]
+    if type(raw_results) is not dict:
         msg = _expected_type_message(
             expected="dict for results_by_nodeid",
             value=raw_results,
         )
         raise WorkerOutputError(msg)
     out: dict[str, list[Result]] = {}
-    for nodeid, results_data in cast("dict[Any, Any]", raw_results).items():
-        if not isinstance(results_data, list):
-            continue
-        nodeid_str = str(nodeid)
+    for nodeid, results_data in dict.items(cast("dict[Any, Any]", raw_results)):
+        if type(nodeid) is not str:
+            msg = _expected_type_message(
+                expected="nonempty string key for results_by_nodeid",
+                value=nodeid,
+            )
+            raise WorkerOutputError(msg)
+        if not nodeid:
+            msg = "results_by_nodeid keys must not be empty."
+            raise WorkerOutputError(msg)
+        if type(results_data) is not list:
+            msg = _expected_type_message(
+                expected=f"list for results_by_nodeid[{bounded_repr(nodeid)}]",
+                value=results_data,
+            )
+            raise WorkerOutputError(msg)
         deserialized: list[Result] = []
         for index, raw_result in enumerate(cast("list[Any]", results_data)):
             result = _deserialize_result(data=raw_result)
-            result.metadata["_pytest_nodeid"] = nodeid_str
+            result.metadata["_pytest_nodeid"] = nodeid
             result.metadata["_rampart_result_index"] = index
             deserialized.append(result)
-        out[nodeid_str] = deserialized
+        out[nodeid] = deserialized
     return out
 
 

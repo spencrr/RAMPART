@@ -583,6 +583,45 @@ class TestDeserializationValidation:
         with pytest.raises(SchemaVersionError, match="does not match"):
             deserialize_worker_data(data=payload)
 
+    def test_accepts_empty_results_block(self) -> None:
+        payload: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "results_by_nodeid": {},
+        }
+        assert deserialize_worker_data(data=payload) == {}
+
+    def test_rejects_missing_results_block(self) -> None:
+        with pytest.raises(WorkerOutputError, match="missing required"):
+            deserialize_worker_data(data={"schema": SCHEMA_VERSION})
+
+    def test_rejects_non_list_result_group(self) -> None:
+        payload: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "results_by_nodeid": {"node": {}},
+        }
+        with pytest.raises(WorkerOutputError, match="Expected list"):
+            deserialize_worker_data(data=payload)
+
+    @pytest.mark.parametrize("nodeid", [1, ""], ids=["non-string", "empty"])
+    def test_rejects_invalid_result_group_key(self, nodeid: object) -> None:
+        payload: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "results_by_nodeid": {nodeid: []},
+        }
+        with pytest.raises(WorkerOutputError):
+            deserialize_worker_data(data=payload)
+
+    def test_result_group_key_diagnostic_is_terminal_safe(self) -> None:
+        controlled_type = type("Bad\r\n\x1b]0;name\x07\x80", (), {})
+        payload: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "results_by_nodeid": {controlled_type(): []},
+        }
+        with pytest.raises(WorkerOutputError) as exc_info:
+            deserialize_worker_data(data=payload)
+        _assert_no_terminal_controls(str(exc_info.value))
+        assert len(str(exc_info.value)) < 200
+
     def test_hostile_schema_repr_does_not_escape_validation(self) -> None:
         payload: dict[str, Any] = {
             "schema": _HostileTypeName(),
@@ -987,12 +1026,83 @@ class TestHandleTestnodedown:
         node.workeroutput = {
             WORKEROUTPUT_KEY: {
                 "schema": SCHEMA_VERSION,
+                "results_by_nodeid": {},
+                "trial_specs": [],
                 "rampart_transport_error": "invalid trial threshold",
             },
         }
         handle_testnodedown(session=session, node=node, error=None)
         assert session.is_incomplete is True
         assert "transport validation failed" in session.incomplete_reasons[0]
+
+
+class TestHandleTestnodedownResultsValidation:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"schema": SCHEMA_VERSION, "trial_specs": []},
+            {
+                "schema": SCHEMA_VERSION,
+                "results_by_nodeid": {"node": {}},
+                "trial_specs": [],
+            },
+            {
+                "schema": SCHEMA_VERSION,
+                "results_by_nodeid": {1: []},
+                "trial_specs": [],
+            },
+            {
+                "schema": SCHEMA_VERSION,
+                "results_by_nodeid": {"": []},
+                "trial_specs": [],
+            },
+        ],
+        ids=["missing-block", "non-list-group", "non-string-key", "empty-key"],
+    )
+    def test_malformed_results_fail_closed(self, payload: dict[str, Any]) -> None:
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {WORKEROUTPUT_KEY: payload}
+        rampart_session = RampartSession()
+
+        handle_testnodedown(
+            session=rampart_session,
+            node=node,
+            error=None,
+        )
+
+        assert rampart_session.is_incomplete is True
+        assert rampart_session.has_results is False
+        assert "deserialization failed" in rampart_session.incomplete_reasons[0]
+        _assert_no_terminal_controls(rampart_session.incomplete_reasons[0])
+        pytest_session = MagicMock()
+        pytest_session.exitstatus = pytest.ExitCode.OK
+        _enforce_incomplete_exit_status(
+            session=pytest_session,
+            rampart_session=rampart_session,
+        )
+        assert pytest_session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_empty_results_block_is_complete(self) -> None:
+        node = MagicMock()
+        node.gateway.id = "gw1"
+        node.workeroutput = {
+            WORKEROUTPUT_KEY: {
+                "schema": SCHEMA_VERSION,
+                "results_by_nodeid": {},
+                "trial_specs": [],
+            },
+        }
+        rampart_session = RampartSession()
+
+        handle_testnodedown(
+            session=rampart_session,
+            node=node,
+            error=None,
+        )
+
+        assert rampart_session.is_incomplete is False
+        assert rampart_session.has_results is False
 
 
 class TestHandleTestnodedownTransportDiagnostics:

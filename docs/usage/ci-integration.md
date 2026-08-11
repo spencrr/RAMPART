@@ -145,4 +145,6 @@ gates.
 | `0` | All tests passed |
 | `1` | Tests failed, a RAMPART trial gate failed, or the run was incomplete |
 | `2` | Test execution interrupted |
+| `3` | Internal pytest error |
+| `4` | Pytest usage or configuration error, including invalid RAMPART marker values |
 | `5` | No tests collected |

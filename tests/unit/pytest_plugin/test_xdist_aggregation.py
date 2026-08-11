@@ -576,6 +576,51 @@ class TestXdistEachAttempts:
         assert reports[0]["total_runs"] == 2
         assert reports[0]["population_summary"]["total_runs"] == 2
 
+    def test_each_trial_retains_attempts_but_gates_logical_clones(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_each_trial="""
+            import os
+
+            import pytest
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+            @pytest.mark.trial(n=2)
+            def test_each_trial():
+                worker_id = os.environ["PYTEST_XDIST_WORKER"]
+                status = (
+                    SafetyStatus.UNSAFE
+                    if worker_id.endswith("0")
+                    else SafetyStatus.SAFE
+                )
+                record_result(Result(status=status, summary=status.value))
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "2",
+            "--dist",
+            "each",
+        )
+
+        result.assert_outcomes(passed=4)
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
+        reports = _load_reports(configured_pytester)
+        assert len(reports) == 1
+        assert reports[0]["total_runs"] == 4
+        assert reports[0]["passed"] == 2
+        assert reports[0]["failed"] == 2
+        assert (
+            "FAIL  test_each_trial "
+            "[0/2 safe, 0% pass rate, threshold: 100%]" in "\n".join(result.outlines)
+        )
+
 
 class TestTrialMarkerDeprecation:
     @pytest.mark.parametrize(
@@ -615,6 +660,34 @@ class TestTrialMarkerDeprecation:
         assert len(warning_lines) == 1
         assert any("PytestDeprecationWarning" in line for line in warning_lines)
 
+    def test_warning_error_does_not_preempt_report(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_warning_error="""
+            import pytest
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+            @pytest.mark.trial(n=2)
+            def test_warning_error():
+                record_result(Result(status=SafetyStatus.SAFE, summary="safe"))
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-W",
+            "error::pytest.PytestDeprecationWarning",
+        )
+
+        assert result.ret == pytest.ExitCode.INTERNAL_ERROR
+        reports = _load_reports(configured_pytester)
+        assert len(reports) == 1
+        assert reports[0]["total_runs"] == 2
+
 
 class TestXdistMetadata:
     def test_report_includes_xdist_metadata(
@@ -638,13 +711,14 @@ class TestXdistMetadata:
         ``incomplete=True`` plus a reason in the merged report.
         """
         _setup_simple_tests(configured_pytester)
-        configured_pytester.runpytest(
+        result = configured_pytester.runpytest(
             "-p",
             "no:cacheprovider",
             "-n",
             "2",
             "--rampart-xdist-max-bytes=1",
         )
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
         reports = _load_reports(configured_pytester)
         assert len(reports) == 1
         metadata = reports[0].get("metadata", {})

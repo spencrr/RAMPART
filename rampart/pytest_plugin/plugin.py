@@ -856,7 +856,6 @@ def pytest_sessionfinish(
             rampart_session=rampart_session,
         )
     _enforce_incomplete_exit_status(session=session, rampart_session=rampart_session)
-    _warn_trial_marker_deprecated(rampart_session=rampart_session)
 
     if is_xdist_controller(config=session.config):
         _record_xdist_metadata(session=session, rampart_session=rampart_session)
@@ -867,11 +866,13 @@ def pytest_sessionfinish(
         if controller_sinks:
             rampart_session.add_sinks(sinks=controller_sinks)
         _emit_sinks(rampart_session=rampart_session)
+        _warn_trial_marker_deprecated(rampart_session=rampart_session)
         return
 
     if _has_sink_hook_impl(config=session.config):
         rampart_session.add_sinks(sinks=_resolve_hook_sinks(config=session.config))
     _emit_sinks(rampart_session=rampart_session)
+    _warn_trial_marker_deprecated(rampart_session=rampart_session)
 
 
 @pytest.hookimpl(optionalhook=True)

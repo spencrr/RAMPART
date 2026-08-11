@@ -41,7 +41,10 @@ Built-in categories:
 
 ### `@pytest.mark.trial(n=, threshold=1.0)`
 
-Run a test multiple times for statistical confidence. Each trial is an independent execution with a fresh session.
+Run a test multiple times for statistical confidence. Each trial clone is a
+separate pytest item and execution, but clones in the same process can share
+broader-scoped fixture and process state. Use explicit parametrization or
+execution-layer factories when stronger isolation is required.
 
 !!! warning "Deprecated clone-based API"
     The clone-based `@pytest.mark.trial` marker is a temporary compatibility
@@ -219,4 +222,3 @@ Each result line shows:
 Trial group lines show aggregate stats: safe count, pass rate, threshold, and overall verdict.
 
 The **Population** line shows totals across all tests in the session, with the attack success rate excluding `ERROR` results from the denominator.
-
