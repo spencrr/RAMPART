@@ -141,6 +141,8 @@ class _ConfigStub:
     def __init__(self) -> None:
         self._ini_lines: list[tuple[str, str]] = []
         self.stash = _StashStub()
+        self.option = MagicMock(dist="no", numprocesses=0)
+        self.pluginmanager = MagicMock()
 
     def addinivalue_line(self, name: str, line: str) -> None:
         """Record marker registrations."""

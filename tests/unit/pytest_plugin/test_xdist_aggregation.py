@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from rampart.pytest_plugin._xdist_shadow import REPORT_ATTRIBUTE
+
 if TYPE_CHECKING:
     from _pytest.pytester import Pytester, RunResult
 
@@ -89,6 +91,89 @@ class SnapshotSink:
 
 def pytest_rampart_sinks(config):
     return [SnapshotSink()]
+"""
+
+_SHADOW_SNAPSHOT_CONFTEST = """\
+import json
+from pathlib import Path
+
+import pytest
+
+from rampart.pytest_plugin._xdist_shadow import (
+    REPORT_ATTRIBUTE,
+    SHADOW_MANIFEST_KEY,
+    SHADOW_RUNTIME_KEY,
+)
+
+
+_MANIFEST_MODE = "__MANIFEST_MODE__"
+_REPORT_MODE = "__REPORT_MODE__"
+_SHADOW_SNAPSHOT = Path("shadow_snapshot.json").absolute()
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    config = item.config
+    if (
+        hasattr(config, "workerinput")
+        and report.when == "teardown"
+        and hasattr(report, REPORT_ATTRIBUTE)
+        and _REPORT_MODE == "malformed"
+    ):
+        setattr(report, REPORT_ATTRIBUTE, "{")
+    return report
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    del exitstatus
+    config = session.config
+    if hasattr(config, "workerinput"):
+        if _MANIFEST_MODE == "missing":
+            config.workeroutput.pop(SHADOW_MANIFEST_KEY, None)
+        elif _MANIFEST_MODE == "empty":
+            config.workeroutput[SHADOW_MANIFEST_KEY] = {}
+        return
+
+    runtime = config.stash.get(SHADOW_RUNTIME_KEY, None)
+    if runtime is None:
+        return
+    deliveries = sorted(
+        runtime._controller.deliveries.values(),
+        key=lambda item: (item.worker_id, item.envelope.sequence),
+    )
+    per_worker = {}
+    for delivery in deliveries:
+        per_worker.setdefault(delivery.worker_id, []).append(
+            delivery.envelope.sequence,
+        )
+    snapshot = {
+        "delivery_count": len(deliveries),
+        "faults": sorted(runtime._controller.fault_codes),
+        "incomplete": runtime.session.is_incomplete,
+        "result_indexes": [
+            [result.index for result in delivery.envelope.results]
+            for delivery in deliveries
+        ],
+        "sequences": sorted(per_worker.values()),
+        "shadow_results": sum(
+            len(delivery.envelope.results) for delivery in deliveries
+        ),
+        "summaries": [
+            result.result.summary
+            for delivery in deliveries
+            for result in delivery.envelope.results
+        ],
+        "v1_results": sum(
+            len(results) for results in runtime.session.results_by_nodeid.values()
+        ),
+        "worker_count": len(per_worker),
+    }
+    _SHADOW_SNAPSHOT.write_text(
+        json.dumps(snapshot, sort_keys=True),
+        encoding="utf-8",
+    )
 """
 
 
@@ -179,6 +264,49 @@ def _setup_simple_tests(configured_pytester: Pytester) -> None:
 def _load_evidence_snapshot(configured_pytester: Pytester) -> dict[str, Any]:
     path = configured_pytester.path / "evidence_snapshot.json"
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _configure_shadow_snapshot(
+    configured_pytester: Pytester,
+    *,
+    manifest_mode: str = "",
+    report_mode: str = "",
+) -> None:
+    observer = _SHADOW_SNAPSHOT_CONFTEST.replace(
+        "__MANIFEST_MODE__",
+        manifest_mode,
+    ).replace(
+        "__REPORT_MODE__",
+        report_mode,
+    )
+    configured_pytester.makeconftest(f"{_CONFTEST}\n{observer}")
+
+
+def _load_shadow_snapshot(configured_pytester: Pytester) -> dict[str, Any]:
+    path = configured_pytester.path / "shadow_snapshot.json"
+    assert path.is_file(), "controller wrote no v2 shadow snapshot"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _make_shadow_result_tests(configured_pytester: Pytester) -> None:
+    configured_pytester.makepyfile(
+        test_shadow="""\
+        import pytest
+
+        from rampart import record_result
+        from rampart.core.result import Result, SafetyStatus
+
+
+        @pytest.mark.xdist_group(name="shadow")
+        def test_shadow_one():
+            record_result(Result(status=SafetyStatus.SAFE, summary="one"))
+
+
+        @pytest.mark.xdist_group(name="shadow")
+        def test_shadow_two():
+            record_result(Result(status=SafetyStatus.SAFE, summary="two"))
+        """,
+    )
 
 
 class TestSingleProcessBaseline:
@@ -625,6 +753,316 @@ class TestXdistEachAttempts:
             "FAIL  test_each_trial "
             "[0/2 safe, 0% pass rate, threshold: 100%]" in "\n".join(result.outlines)
         )
+
+
+class TestXdistShadowLifecycle:
+    @pytest.mark.parametrize("dist_mode", ["load", "loadgroup", "each"])
+    def test_v1_v2_multisets_match_under_scheduler(
+        self,
+        configured_pytester: Pytester,
+        dist_mode: str,
+    ) -> None:
+        _configure_shadow_snapshot(configured_pytester)
+        _make_shadow_result_tests(configured_pytester)
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "2",
+            f"--dist={dist_mode}",
+        )
+
+        expected = 4 if dist_mode == "each" else 2
+        result.assert_outcomes(passed=expected)
+        snapshot = _load_shadow_snapshot(configured_pytester)
+        assert snapshot["v1_results"] == expected
+        assert snapshot["shadow_results"] == expected
+        assert snapshot["faults"] == []
+        assert snapshot["incomplete"] is False
+
+    def test_same_worker_attempts_have_distinct_sequences(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        _configure_shadow_snapshot(configured_pytester)
+        _make_shadow_result_tests(configured_pytester)
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+        )
+
+        result.assert_outcomes(passed=2)
+        snapshot = _load_shadow_snapshot(configured_pytester)
+        assert snapshot["sequences"] == [[1, 2]]
+        assert snapshot["delivery_count"] == 2
+        assert sorted(snapshot["summaries"]) == ["one", "two"]
+
+    def test_one_item_preserves_multiple_result_order(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        _configure_shadow_snapshot(configured_pytester)
+        configured_pytester.makepyfile(
+            test_multiple="""\
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+
+            def test_multiple_results():
+                record_result(Result(status=SafetyStatus.SAFE, summary="first"))
+                record_result(Result(status=SafetyStatus.SAFE, summary="second"))
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+        )
+
+        result.assert_outcomes(passed=1)
+        snapshot = _load_shadow_snapshot(configured_pytester)
+        assert snapshot["result_indexes"] == [[0, 1]]
+        assert snapshot["summaries"] == ["first", "second"]
+        assert snapshot["v1_results"] == snapshot["shadow_results"] == 2
+
+    def test_non_text_payload_reconciles_cleanly(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        _configure_shadow_snapshot(configured_pytester)
+        configured_pytester.makepyfile(
+            test_non_text="""\
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+            from rampart.core.types import (
+                Payload,
+                PayloadFormat,
+                Request,
+                Response,
+                Turn,
+            )
+
+
+            def test_non_text_payload():
+                record_result(
+                    Result(
+                        status=SafetyStatus.SAFE,
+                        summary="html payload",
+                        turns=[
+                            Turn(
+                                request=Request(
+                                    attachments=[
+                                        Payload(
+                                            content="<b>payload</b>",
+                                            format=PayloadFormat.HTML,
+                                        )
+                                    ]
+                                ),
+                                response=Response(text="ok"),
+                            )
+                        ],
+                    )
+                )
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+        )
+
+        result.assert_outcomes(passed=1)
+        assert result.ret == pytest.ExitCode.OK
+        snapshot = _load_shadow_snapshot(configured_pytester)
+        assert snapshot["v1_results"] == snapshot["shadow_results"] == 1
+        assert snapshot["faults"] == []
+
+    @pytest.mark.parametrize("manifest_mode", ["missing", "empty"])
+    def test_invalid_clean_manifest_is_incomplete_nonzero(
+        self,
+        configured_pytester: Pytester,
+        manifest_mode: str,
+    ) -> None:
+        _configure_shadow_snapshot(
+            configured_pytester,
+            manifest_mode=manifest_mode,
+        )
+        configured_pytester.makepyfile(
+            test_manifest="""\
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+
+            def test_manifest():
+                record_result(Result(status=SafetyStatus.SAFE, summary="kept by v1"))
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+        )
+
+        result.assert_outcomes(passed=1)
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
+        snapshot = _load_shadow_snapshot(configured_pytester)
+        assert snapshot["v1_results"] == snapshot["shadow_results"] == 1
+        assert snapshot["incomplete"] is True
+        assert any(
+            code.startswith(("missing-manifest:", "malformed-manifest:"))
+            for code in snapshot["faults"]
+        )
+
+    def test_malformed_report_attribute_is_incomplete_nonzero(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        _configure_shadow_snapshot(
+            configured_pytester,
+            report_mode="malformed",
+        )
+        configured_pytester.makepyfile(
+            test_malformed="""\
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+
+            def test_malformed():
+                record_result(Result(status=SafetyStatus.SAFE, summary="v1 survives"))
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+        )
+
+        result.assert_outcomes(passed=1)
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
+        snapshot = _load_shadow_snapshot(configured_pytester)
+        assert snapshot["v1_results"] == 1
+        assert snapshot["shadow_results"] == 0
+        assert snapshot["incomplete"] is True
+        assert any(
+            code.startswith("malformed-envelope:") for code in snapshot["faults"]
+        )
+
+    def test_worker_loss_retains_delivered_shadow_only(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        _configure_shadow_snapshot(configured_pytester)
+        configured_pytester.makepyfile(
+            test_worker_loss="""\
+            import os
+
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+
+            def test_a_delivered():
+                record_result(Result(status=SafetyStatus.SAFE, summary="delivered"))
+
+
+            def test_b_worker_loss():
+                os._exit(3)
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+            "--max-worker-restart=0",
+        )
+
+        assert result.ret != pytest.ExitCode.OK
+        snapshot = _load_shadow_snapshot(configured_pytester)
+        assert snapshot["summaries"] == ["delivered"]
+        assert snapshot["shadow_results"] == 1
+        assert snapshot["v1_results"] == 0
+        assert snapshot["incomplete"] is True
+
+    def test_size_drop_keeps_shadow_siblings_and_is_nonzero(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        _configure_shadow_snapshot(configured_pytester)
+        configured_pytester.makepyfile(
+            test_drop="""\
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+
+            def test_drop():
+                record_result(Result(status=SafetyStatus.SAFE, summary="first"))
+                record_result(Result(status=SafetyStatus.SAFE, summary="x" * 5000))
+                record_result(Result(status=SafetyStatus.SAFE, summary="third"))
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+            "--rampart-xdist-max-bytes=1000",
+        )
+
+        result.assert_outcomes(passed=1)
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
+        snapshot = _load_shadow_snapshot(configured_pytester)
+        assert snapshot["summaries"] == ["first", "third"]
+        assert snapshot["shadow_results"] == 2
+        assert snapshot["incomplete"] is True
+
+    def test_private_envelope_does_not_leak_to_junit(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_junit_shadow="""\
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+
+            def test_junit_shadow():
+                record_result(
+                    Result(
+                        status=SafetyStatus.SAFE,
+                        summary="shadow-junit-secret",
+                    )
+                )
+            """,
+        )
+        xml_path = configured_pytester.path / "shadow-report.xml"
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+            f"--junitxml={xml_path}",
+        )
+
+        result.assert_outcomes(passed=1)
+        assert result.ret == pytest.ExitCode.OK
+        xml_text = xml_path.read_text(encoding="utf-8")
+        assert REPORT_ATTRIBUTE not in xml_text
+        assert "shadow-junit-secret" not in xml_text
 
 
 class TestTrialMarkerDeprecation:

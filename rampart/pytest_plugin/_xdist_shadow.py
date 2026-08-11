@@ -1,0 +1,1462 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
+"""Shadow-only incremental xdist Result transport.
+
+The v2 channel in this module validates per-item delivery against the existing
+v1 bulk worker payload. It never contributes Results to user-visible reports.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+from collections import Counter
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+
+import pytest
+
+from rampart.core.result import Result, SafetyStatus
+from rampart.core.types import EvalOutcome, ObservabilityLevel, PayloadFormat
+from rampart.pytest_plugin._diagnostics import (
+    bounded_text,
+    safe_type_name,
+)
+from rampart.pytest_plugin._xdist import (
+    MAX_METADATA_DEPTH,
+    WorkerOutputError,
+    _deserialize_result,
+    _serialize_result,
+    _size_limit,
+    is_xdist_controller,
+    is_xdist_worker,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Generator, Sequence
+
+    from rampart.pytest_plugin._session import RampartSession
+
+logger = logging.getLogger(__name__)
+
+REPORT_ATTRIBUTE: str = "_rampart_xdist_v2_shadow_json"
+SHADOW_MANIFEST_KEY: str = "rampart_xdist_v2_shadow_manifest"
+SHADOW_SCHEMA_VERSION: int = 2
+SHADOW_RUNTIME_PLUGIN_NAME: str = "_rampart_xdist_v2_shadow_runtime"
+
+_NODEID_METADATA_KEY: str = "_pytest_nodeid"
+_RESULT_INDEX_METADATA_KEY: str = "_rampart_result_index"
+_SOURCE_WORKER_METADATA_KEY: str = "_rampart_source_worker"
+_TRANSPORT_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        _NODEID_METADATA_KEY,
+        _RESULT_INDEX_METADATA_KEY,
+        _SOURCE_WORKER_METADATA_KEY,
+    }
+)
+_EVAL_OUTCOME_VALUES = frozenset(item.value for item in EvalOutcome)
+_OBSERVABILITY_VALUES = frozenset(item.value for item in ObservabilityLevel)
+_PAYLOAD_FORMAT_VALUES = frozenset(item.value for item in PayloadFormat)
+_SAFETY_STATUS_VALUES = frozenset(item.value for item in SafetyStatus)
+
+
+class ShadowDropReason(StrEnum):
+    """Reasons a Result can be omitted from a shadow envelope."""
+
+    SIZE_LIMIT = "size_limit"
+
+
+class ShadowDropWire(TypedDict):
+    """Wire representation of one omitted Result."""
+
+    index: int
+    reason: str
+    serialized_bytes: int
+
+
+class ShadowEvalResultWire(TypedDict):
+    """Wire projection of one evaluator result."""
+
+    outcome: str
+    confidence: float | None
+    evidence: list[str]
+    rationale: str
+
+
+class ShadowPayloadWire(TypedDict):
+    """Wire projection of one request payload."""
+
+    content: str
+    id: str
+    format: str
+    artifact: str | None
+    metadata: dict[str, Any]
+
+
+class ShadowRequestWire(TypedDict):
+    """Wire projection of one request."""
+
+    prompt: str | None
+    attachments: list[ShadowPayloadWire]
+
+
+class ShadowToolCallWire(TypedDict):
+    """Wire projection of one tool call."""
+
+    name: str
+    arguments: dict[str, Any]
+    result: str | None
+    timestamp: str | None
+
+
+class ShadowSideEffectWire(TypedDict):
+    """Wire projection of one side effect."""
+
+    kind: str
+    details: dict[str, Any]
+
+
+class ShadowResponseWire(TypedDict):
+    """Wire projection of one response."""
+
+    text: str
+    tool_calls: list[ShadowToolCallWire]
+    side_effects: list[ShadowSideEffectWire]
+    metadata: dict[str, Any]
+
+
+class ShadowTurnWire(TypedDict):
+    """Wire projection of one conversation turn."""
+
+    request: ShadowRequestWire
+    response: ShadowResponseWire
+    eval_result: ShadowEvalResultWire | None
+    turn_number: int
+    timestamp: str | None
+    driver_reasoning: str
+
+
+class ShadowInjectionWire(TypedDict):
+    """Wire projection of one injection record."""
+
+    payload_id: str | None
+    surface_name: str
+
+
+class ShadowResultWire(TypedDict):
+    """Exact v1 Result projection carried inside a v2 envelope."""
+
+    safe: bool
+    status: str
+    summary: str
+    turns: list[ShadowTurnWire]
+    duration_seconds: float | None
+    harm_category: str | None
+    strategy: str
+    observability_level: str
+    injections: list[ShadowInjectionWire]
+    metadata: dict[str, Any]
+
+
+class ShadowEnvelopeWire(TypedDict):
+    """Per-item v2 shadow envelope."""
+
+    schema_version: int
+    sequence: int
+    produced: int
+    results: list[ShadowResultWire]
+    dropped: list[ShadowDropWire]
+
+
+class ShadowManifestWire(TypedDict):
+    """O(1) clean-finish delivery manifest."""
+
+    schema_version: int
+    envelopes_sent: int
+    last_sequence: int
+    results_sent: int
+    results_dropped: int
+
+
+class ShadowTransportError(Exception):
+    """Raised when v2 shadow data violates the transport contract."""
+
+
+class ShadowSizeError(ShadowTransportError):
+    """Raised before parsing an oversized report attribute."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class _SerializedResult:
+    index: int
+    payload: ShadowResultWire
+    serialized_bytes: int
+    drop: ShadowDropWire
+    drop_bytes: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class EnvelopeBuild:
+    """Outcome of constructing one worker report attribute."""
+
+    encoded: str | None
+    results_sent: int
+    results_dropped: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class ValidatedResult:
+    """One strictly validated Result and its envelope-local identity."""
+
+    index: int
+    result: Result
+
+
+@dataclass(frozen=True, kw_only=True)
+class ValidatedDrop:
+    """One strictly validated drop record."""
+
+    index: int
+    serialized_bytes: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class ValidatedEnvelope:
+    """Validated semantic envelope used by controller state."""
+
+    sequence: int
+    produced: int
+    results: tuple[ValidatedResult, ...]
+    dropped: tuple[ValidatedDrop, ...]
+    semantic_key: object
+
+
+@dataclass(frozen=True, kw_only=True)
+class ValidatedManifest:
+    """Validated clean-finish worker counters."""
+
+    envelopes_sent: int
+    last_sequence: int
+    results_sent: int
+    results_dropped: int
+    semantic_key: object
+
+
+@dataclass(frozen=True, kw_only=True)
+class ShadowDelivery:
+    """One unique controller-side envelope delivery."""
+
+    worker_id: str
+    nodeid: str
+    envelope: ValidatedEnvelope
+
+
+@dataclass(kw_only=True)
+class _WorkerState:
+    last_sequence: int = 0
+    envelopes_sent: int = 0
+    results_sent: int = 0
+    results_dropped: int = 0
+
+    def manifest(self) -> ShadowManifestWire:
+        """Return the worker's constant-size clean-finish manifest."""
+        return {
+            "schema_version": SHADOW_SCHEMA_VERSION,
+            "envelopes_sent": self.envelopes_sent,
+            "last_sequence": self.last_sequence,
+            "results_sent": self.results_sent,
+            "results_dropped": self.results_dropped,
+        }
+
+
+@dataclass(kw_only=True)
+class _ControllerState:
+    deliveries: dict[tuple[str, int], ShadowDelivery] = field(default_factory=dict)
+    manifests: dict[str, ValidatedManifest] = field(default_factory=dict)
+    report_workers: set[str] = field(default_factory=set)
+    node_down_workers: set[str] = field(default_factory=set)
+    fault_codes: set[str] = field(default_factory=set)
+    reconciled: bool = False
+
+
+ITEM_RESULTS_KEY = pytest.StashKey[tuple[Result, ...]]()
+
+
+def _encode_json(value: object) -> str:
+    """Return one deterministic, non-lossy JSON wire encoding."""
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _encoded_size(value: object) -> int:
+    """Return the UTF-8 byte length of the actual wire encoding."""
+    return len(_encode_json(value).encode("utf-8"))
+
+
+def _prepare_result(
+    *,
+    result: Result,
+    nodeid: str,
+    index: int,
+) -> _SerializedResult:
+    """Return one Result projection without authoritative route metadata."""
+    raw = _serialize_result(result=result, nodeid=nodeid)
+    metadata = dict(cast("dict[str, Any]", raw["metadata"]))
+    metadata.pop(_NODEID_METADATA_KEY, None)
+    metadata.pop(_SOURCE_WORKER_METADATA_KEY, None)
+    metadata[_RESULT_INDEX_METADATA_KEY] = index
+    raw["metadata"] = metadata
+    payload = cast("ShadowResultWire", raw)
+    payload_encoded = _encode_json(payload)
+    serialized_bytes = len(payload_encoded.encode("utf-8"))
+    drop = _drop_wire(index=index, serialized_bytes=serialized_bytes)
+    drop_encoded = _encode_json(drop)
+    return _SerializedResult(
+        index=index,
+        payload=payload,
+        serialized_bytes=serialized_bytes,
+        drop=drop,
+        drop_bytes=len(drop_encoded.encode("utf-8")),
+    )
+
+
+def _drop_wire(*, index: int, serialized_bytes: int) -> ShadowDropWire:
+    """Return the bounded drop marker for one Result."""
+    return {
+        "index": index,
+        "reason": ShadowDropReason.SIZE_LIMIT.value,
+        "serialized_bytes": serialized_bytes,
+    }
+
+
+def _envelope_wire(
+    *,
+    sequence: int,
+    records: Sequence[_SerializedResult],
+    retained: frozenset[int],
+) -> ShadowEnvelopeWire:
+    """Return one complete envelope for a selected Result subset."""
+    return {
+        "schema_version": SHADOW_SCHEMA_VERSION,
+        "sequence": sequence,
+        "produced": len(records),
+        "results": [record.payload for record in records if record.index in retained],
+        "dropped": [record.drop for record in records if record.index not in retained],
+    }
+
+
+def build_envelope(
+    *,
+    results: tuple[Result, ...],
+    nodeid: str,
+    sequence: int,
+    limit: int,
+) -> EnvelopeBuild:
+    """Return the maximal deterministic Result prefix fitting one attribute."""
+    if not results:
+        return EnvelopeBuild(encoded=None, results_sent=0, results_dropped=0)
+    records = tuple(
+        _prepare_result(result=result, nodeid=nodeid, index=index)
+        for index, result in enumerate(results)
+    )
+    retained: set[int] = set()
+    all_drop = _envelope_wire(
+        sequence=sequence,
+        records=records,
+        retained=frozenset(),
+    )
+    current_size = _encoded_size(all_drop)
+    if current_size > limit:
+        return EnvelopeBuild(
+            encoded=None,
+            results_sent=0,
+            results_dropped=len(records),
+        )
+
+    retained_count = 0
+    dropped_count = len(records)
+    combined_limit_reached = False
+    for record in records:
+        if record.serialized_bytes > limit or combined_limit_reached:
+            continue
+        candidate_size = (
+            current_size
+            + record.serialized_bytes
+            + int(retained_count > 0)
+            - record.drop_bytes
+            - int(dropped_count > 1)
+        )
+        if candidate_size <= limit:
+            retained.add(record.index)
+            retained_count += 1
+            dropped_count -= 1
+            current_size = candidate_size
+        else:
+            combined_limit_reached = True
+
+    envelope = _envelope_wire(
+        sequence=sequence,
+        records=records,
+        retained=frozenset(retained),
+    )
+    encoded = _encode_json(envelope)
+    if len(encoded.encode("utf-8")) > limit:
+        return EnvelopeBuild(
+            encoded=None,
+            results_sent=0,
+            results_dropped=len(records),
+        )
+    return EnvelopeBuild(
+        encoded=encoded,
+        results_sent=len(retained),
+        results_dropped=len(records) - len(retained),
+    )
+
+
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Return a JSON object after rejecting duplicate keys.
+
+    Raises:
+        ShadowTransportError: If the object repeats a key.
+    """
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            msg = "Shadow JSON objects must not contain duplicate keys."
+            raise ShadowTransportError(msg)
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> object:
+    """Reject NaN and infinities at the JSON boundary.
+
+    Raises:
+        ShadowTransportError: Always, because JSON constants are unsupported.
+    """
+    del value
+    msg = "Shadow JSON must not contain non-finite numeric constants."
+    raise ShadowTransportError(msg)
+
+
+def _parse_json(encoded: str) -> object:
+    """Return strict JSON without duplicate keys or non-finite constants.
+
+    Raises:
+        ShadowTransportError: If the input is malformed or unsupported.
+    """
+    try:
+        return json.loads(
+            encoded,
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_json_constant,
+        )
+    except json.JSONDecodeError as exc:
+        msg = f"Shadow envelope contains malformed JSON at offset {exc.pos}."
+        raise ShadowTransportError(msg) from None
+    except (RecursionError, ValueError) as exc:
+        msg = f"Shadow envelope JSON parsing failed with {safe_type_name(exc)}."
+        raise ShadowTransportError(msg) from None
+
+
+def _require_exact_dict(
+    *,
+    value: object,
+    keys: frozenset[str],
+    context: str,
+) -> dict[str, Any]:
+    """Return one exact builtin dictionary with an exact string key set.
+
+    Raises:
+        ShadowTransportError: If the type or key set is invalid.
+    """
+    if type(value) is not dict:
+        msg = f"{context} must be an exact dict, got {safe_type_name(value)}."
+        raise ShadowTransportError(msg)
+    typed = cast("dict[object, Any]", value)
+    raw_keys = list(dict.keys(typed))
+    if any(type(key) is not str for key in raw_keys):
+        msg = f"{context} keys must be exact strings."
+        raise ShadowTransportError(msg)
+    actual = frozenset(cast("list[str]", raw_keys))
+    if actual != keys:
+        msg = f"{context} must contain exactly {len(keys)} required keys."
+        raise ShadowTransportError(msg)
+    return cast("dict[str, Any]", typed)
+
+
+def _require_string_dict(*, value: object, context: str) -> dict[str, Any]:
+    """Return an exact builtin dictionary with exact string keys.
+
+    Raises:
+        ShadowTransportError: If the type or any key is invalid.
+    """
+    if type(value) is not dict:
+        msg = f"{context} must be an exact dict, got {safe_type_name(value)}."
+        raise ShadowTransportError(msg)
+    typed = cast("dict[object, Any]", value)
+    if any(type(key) is not str for key in dict.keys(typed)):
+        msg = f"{context} keys must be exact strings."
+        raise ShadowTransportError(msg)
+    return cast("dict[str, Any]", typed)
+
+
+def _require_int(
+    *,
+    value: object,
+    minimum: int,
+    context: str,
+) -> int:
+    """Return an exact integer at or above a lower bound.
+
+    Raises:
+        ShadowTransportError: If the value is not an in-range exact integer.
+    """
+    if type(value) is not int or value < minimum:
+        msg = f"{context} must be an integer >= {minimum}."
+        raise ShadowTransportError(msg)
+    return value
+
+
+def _require_str(*, value: object, context: str) -> str:
+    """Return one exact string.
+
+    Raises:
+        ShadowTransportError: If the value is not an exact string.
+    """
+    if type(value) is not str:
+        msg = f"{context} must be an exact string."
+        raise ShadowTransportError(msg)
+    return value
+
+
+def _require_optional_str(*, value: object, context: str) -> str | None:
+    """Return one exact string or None.
+
+    Raises:
+        ShadowTransportError: If the value has any other type.
+    """
+    if value is None:
+        return None
+    return _require_str(value=value, context=context)
+
+
+def _require_list(*, value: object, context: str) -> list[object]:
+    """Return one exact list.
+
+    Raises:
+        ShadowTransportError: If the value is not an exact list.
+    """
+    if type(value) is not list:
+        msg = f"{context} must be an exact list."
+        raise ShadowTransportError(msg)
+    return cast("list[object]", value)
+
+
+def _require_number_or_none(*, value: object, context: str) -> int | float | None:
+    """Return one finite exact number or None.
+
+    Raises:
+        ShadowTransportError: If the value is boolean, nonnumeric, or non-finite.
+    """
+    if value is None:
+        return None
+    if type(value) is not int and type(value) is not float:
+        msg = f"{context} must be a finite number or None."
+        raise ShadowTransportError(msg)
+    if type(value) is float and not math.isfinite(value):
+        msg = f"{context} must be finite."
+        raise ShadowTransportError(msg)
+    return value
+
+
+def _require_enum_string(
+    *,
+    value: object,
+    allowed: frozenset[str],
+    context: str,
+) -> str:
+    """Return one exact supported enum string.
+
+    Raises:
+        ShadowTransportError: If the value is not supported.
+    """
+    parsed = _require_str(value=value, context=context)
+    if parsed not in allowed:
+        msg = f"{context} is unsupported."
+        raise ShadowTransportError(msg)
+    return parsed
+
+
+def _validate_json_tree(*, value: object, context: str) -> None:
+    """Validate bounded JSON metadata without recursive Python calls.
+
+    Raises:
+        ShadowTransportError: If a value is unsupported or too deeply nested.
+    """
+    pending: list[tuple[object, int]] = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        current_type = type(current)
+        if current_type in {type(None), bool, int, str}:
+            continue
+        if current_type is float:
+            if not math.isfinite(cast("float", current)):
+                msg = f"{context} contains a non-finite float."
+                raise ShadowTransportError(msg)
+            continue
+        if current_type is list:
+            children = cast("list[object]", current)
+        elif current_type is dict:
+            typed = _require_string_dict(value=current, context=context)
+            children = list(typed.values())
+        else:
+            msg = f"{context} contains unsupported {safe_type_name(current)}."
+            raise ShadowTransportError(msg)
+        if depth > MAX_METADATA_DEPTH:
+            msg = f"{context} exceeds the supported metadata depth."
+            raise ShadowTransportError(msg)
+        pending.extend((child, depth + 1) for child in children)
+
+
+def _validate_metadata(*, value: object, context: str) -> dict[str, Any]:
+    """Return one strictly bounded JSON metadata dictionary.
+
+    Raises:
+        ShadowTransportError: If the dictionary is malformed.
+    """
+    typed = _require_string_dict(value=value, context=context)
+    for item in typed.values():
+        _validate_json_tree(value=item, context=context)
+    return typed
+
+
+def _validate_eval_result(value: object) -> None:
+    """Validate one evaluator-result projection.
+
+    Raises:
+        ShadowTransportError: If any field is malformed.
+    """
+    if value is None:
+        return
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowEvalResultWire.__required_keys__),
+        context="Shadow EvalResult",
+    )
+    _require_enum_string(
+        value=typed["outcome"],
+        allowed=_EVAL_OUTCOME_VALUES,
+        context="Shadow EvalResult outcome",
+    )
+    _require_number_or_none(
+        value=typed["confidence"],
+        context="Shadow EvalResult confidence",
+    )
+    for item in _require_list(
+        value=typed["evidence"],
+        context="Shadow EvalResult evidence",
+    ):
+        _require_str(value=item, context="Shadow EvalResult evidence item")
+    _require_str(value=typed["rationale"], context="Shadow EvalResult rationale")
+
+
+def _validate_payload(value: object) -> None:
+    """Validate one payload projection.
+
+    Raises:
+        ShadowTransportError: If any field is malformed.
+    """
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowPayloadWire.__required_keys__),
+        context="Shadow Payload",
+    )
+    _require_str(value=typed["content"], context="Shadow Payload content")
+    _require_str(value=typed["id"], context="Shadow Payload id")
+    _require_enum_string(
+        value=typed["format"],
+        allowed=_PAYLOAD_FORMAT_VALUES,
+        context="Shadow Payload format",
+    )
+    _require_optional_str(value=typed["artifact"], context="Shadow Payload artifact")
+    _validate_metadata(value=typed["metadata"], context="Shadow Payload metadata")
+
+
+def _validate_request(value: object) -> None:
+    """Validate one request projection.
+
+    Raises:
+        ShadowTransportError: If any field is malformed.
+    """
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowRequestWire.__required_keys__),
+        context="Shadow Request",
+    )
+    _require_optional_str(value=typed["prompt"], context="Shadow Request prompt")
+    attachments = _require_list(
+        value=typed["attachments"],
+        context="Shadow Request attachments",
+    )
+    for attachment in attachments:
+        _validate_payload(attachment)
+
+
+def _validate_tool_call(value: object) -> None:
+    """Validate one tool-call projection.
+
+    Raises:
+        ShadowTransportError: If any field is malformed.
+    """
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowToolCallWire.__required_keys__),
+        context="Shadow ToolCall",
+    )
+    _require_str(value=typed["name"], context="Shadow ToolCall name")
+    _validate_metadata(value=typed["arguments"], context="Shadow ToolCall arguments")
+    _require_optional_str(value=typed["result"], context="Shadow ToolCall result")
+    _require_optional_str(
+        value=typed["timestamp"],
+        context="Shadow ToolCall timestamp",
+    )
+
+
+def _validate_side_effect(value: object) -> None:
+    """Validate one side-effect projection.
+
+    Raises:
+        ShadowTransportError: If any field is malformed.
+    """
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowSideEffectWire.__required_keys__),
+        context="Shadow SideEffect",
+    )
+    _require_str(value=typed["kind"], context="Shadow SideEffect kind")
+    _validate_metadata(value=typed["details"], context="Shadow SideEffect details")
+
+
+def _validate_response(value: object) -> None:
+    """Validate one response projection.
+
+    Raises:
+        ShadowTransportError: If any field is malformed.
+    """
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowResponseWire.__required_keys__),
+        context="Shadow Response",
+    )
+    _require_str(value=typed["text"], context="Shadow Response text")
+    for tool_call in _require_list(
+        value=typed["tool_calls"],
+        context="Shadow Response tool_calls",
+    ):
+        _validate_tool_call(tool_call)
+    for side_effect in _require_list(
+        value=typed["side_effects"],
+        context="Shadow Response side_effects",
+    ):
+        _validate_side_effect(side_effect)
+    _validate_metadata(value=typed["metadata"], context="Shadow Response metadata")
+
+
+def _validate_turn(value: object) -> None:
+    """Validate one turn projection.
+
+    Raises:
+        ShadowTransportError: If any field is malformed.
+    """
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowTurnWire.__required_keys__),
+        context="Shadow Turn",
+    )
+    _validate_request(typed["request"])
+    _validate_response(typed["response"])
+    _validate_eval_result(typed["eval_result"])
+    if type(typed["turn_number"]) is not int:
+        msg = "Shadow Turn turn_number must be an exact integer."
+        raise ShadowTransportError(msg)
+    _require_optional_str(value=typed["timestamp"], context="Shadow Turn timestamp")
+    _require_str(
+        value=typed["driver_reasoning"],
+        context="Shadow Turn driver_reasoning",
+    )
+
+
+def _validate_injection(value: object) -> None:
+    """Validate one injection-record projection.
+
+    Raises:
+        ShadowTransportError: If any field is malformed.
+    """
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowInjectionWire.__required_keys__),
+        context="Shadow InjectionRecord",
+    )
+    _require_optional_str(
+        value=typed["payload_id"],
+        context="Shadow InjectionRecord payload_id",
+    )
+    _require_str(
+        value=typed["surface_name"],
+        context="Shadow InjectionRecord surface_name",
+    )
+
+
+def _freeze_json(  # ruff: ignore[too-many-return-statements]
+    value: object,
+) -> object:
+    """Return a type- and order-preserving hashable JSON tree.
+
+    Raises:
+        ShadowTransportError: If the value is outside the JSON projection.
+    """
+    value_type = type(value)
+    if value_type is type(None):
+        return ("none",)
+    if value_type is bool:
+        return ("bool", cast("bool", value))
+    if value_type is int:
+        return ("int", cast("int", value))
+    if value_type is float:
+        return ("float", cast("float", value))
+    if value_type is str:
+        return ("str", cast("str", value))
+    if value_type is list:
+        return (
+            "list",
+            tuple(_freeze_json(item) for item in cast("list[object]", value)),
+        )
+    if value_type is dict:
+        typed = cast("dict[object, object]", value)
+        if any(type(key) is not str for key in dict.keys(typed)):
+            msg = "Canonical JSON dictionaries require exact string keys."
+            raise ShadowTransportError(msg)
+        items = tuple(
+            (cast("str", key), _freeze_json(item))
+            for key, item in sorted(
+                dict.items(typed),
+                key=lambda pair: cast("str", pair[0]),
+            )
+        )
+        return ("dict", items)
+    msg = f"Canonical JSON received unsupported {safe_type_name(value)}."
+    raise ShadowTransportError(msg)
+
+
+def _validate_result(
+    *,
+    value: object,
+) -> tuple[ValidatedResult, object]:
+    """Return one strictly validated existing v1 Result projection.
+
+    Raises:
+        ShadowTransportError: If any Result field is malformed or coerced.
+    """
+    keys = frozenset(ShadowResultWire.__required_keys__)
+    typed = _require_exact_dict(value=value, keys=keys, context="Shadow Result")
+    if type(typed["safe"]) is not bool:
+        msg = "Shadow Result safe must be an exact boolean."
+        raise ShadowTransportError(msg)
+    _require_enum_string(
+        value=typed["status"],
+        allowed=_SAFETY_STATUS_VALUES,
+        context="Shadow Result status",
+    )
+    _require_str(value=typed["summary"], context="Shadow Result summary")
+    for turn in _require_list(value=typed["turns"], context="Shadow Result turns"):
+        _validate_turn(turn)
+    _require_number_or_none(
+        value=typed["duration_seconds"],
+        context="Shadow Result duration_seconds",
+    )
+    _require_optional_str(
+        value=typed["harm_category"],
+        context="Shadow Result harm_category",
+    )
+    _require_str(value=typed["strategy"], context="Shadow Result strategy")
+    _require_enum_string(
+        value=typed["observability_level"],
+        allowed=_OBSERVABILITY_VALUES,
+        context="Shadow Result observability_level",
+    )
+    for injection in _require_list(
+        value=typed["injections"],
+        context="Shadow Result injections",
+    ):
+        _validate_injection(injection)
+    metadata = _validate_metadata(
+        value=typed["metadata"],
+        context="Shadow Result metadata",
+    )
+    if _NODEID_METADATA_KEY in metadata or _SOURCE_WORKER_METADATA_KEY in metadata:
+        msg = "Shadow Result must not embed authoritative route metadata."
+        raise ShadowTransportError(msg)
+    index = _require_int(
+        value=metadata.get(_RESULT_INDEX_METADATA_KEY),
+        minimum=0,
+        context="Shadow Result index",
+    )
+    try:
+        result = _deserialize_result(data=typed)
+    except WorkerOutputError as exc:
+        msg = f"Shadow Result validation failed: {bounded_text(str(exc))}"
+        raise ShadowTransportError(msg) from None
+    if result.safe is not typed["safe"]:
+        msg = "Shadow Result safe does not match status."
+        raise ShadowTransportError(msg)
+    return ValidatedResult(index=index, result=result), _freeze_json(typed)
+
+
+def _validate_drop(value: object) -> ValidatedDrop:
+    """Return one strictly validated drop record.
+
+    Raises:
+        ShadowTransportError: If the record violates the v2 schema.
+    """
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowDropWire.__required_keys__),
+        context="Shadow drop",
+    )
+    index = _require_int(
+        value=typed["index"],
+        minimum=0,
+        context="Shadow drop index",
+    )
+    serialized_bytes = _require_int(
+        value=typed["serialized_bytes"],
+        minimum=1,
+        context="Shadow drop serialized_bytes",
+    )
+    if type(typed["reason"]) is not str:
+        msg = "Shadow drop reason must be an exact string."
+        raise ShadowTransportError(msg)
+    if typed["reason"] != ShadowDropReason.SIZE_LIMIT.value:
+        msg = "Shadow drop reason is unsupported."
+        raise ShadowTransportError(msg)
+    return ValidatedDrop(index=index, serialized_bytes=serialized_bytes)
+
+
+def parse_envelope(  # ruff: ignore[complex-structure, too-many-locals]
+    *,
+    encoded: str,
+    limit: int,
+    nodeid: str,
+) -> ValidatedEnvelope:
+    """Return one parsed and strictly validated report attribute.
+
+    Raises:
+        ShadowSizeError: If the attribute exceeds the configured cap.
+        ShadowTransportError: If the envelope or a nested record is malformed.
+    """
+    del nodeid
+    if len(encoded) > limit:
+        msg = f"Shadow report attribute exceeds its {limit}-byte cap."
+        raise ShadowSizeError(msg)
+    try:
+        encoded_size = len(encoded.encode("utf-8"))
+    except UnicodeEncodeError:
+        msg = "Shadow report attribute is not valid UTF-8 text."
+        raise ShadowTransportError(msg) from None
+    if encoded_size > limit:
+        msg = f"Shadow report attribute is {encoded_size} bytes; cap is {limit}."
+        raise ShadowSizeError(msg)
+    value = _parse_json(encoded)
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowEnvelopeWire.__required_keys__),
+        context="Shadow envelope",
+    )
+    if type(typed["schema_version"]) is not int:
+        msg = "Shadow schema_version must be an exact integer."
+        raise ShadowTransportError(msg)
+    if typed["schema_version"] != SHADOW_SCHEMA_VERSION:
+        msg = "Shadow envelope schema_version is unsupported."
+        raise ShadowTransportError(msg)
+    sequence = _require_int(
+        value=typed["sequence"],
+        minimum=1,
+        context="Shadow sequence",
+    )
+    produced = _require_int(
+        value=typed["produced"],
+        minimum=1,
+        context="Shadow produced",
+    )
+    if type(typed["results"]) is not list or type(typed["dropped"]) is not list:
+        msg = "Shadow results and dropped must be exact lists."
+        raise ShadowTransportError(msg)
+    raw_results = cast("list[object]", typed["results"])
+    raw_drops = cast("list[object]", typed["dropped"])
+    if produced != len(raw_results) + len(raw_drops):
+        msg = "Shadow produced must equal result and drop record counts."
+        raise ShadowTransportError(msg)
+    validated_results: list[ValidatedResult] = []
+    result_keys: list[object] = []
+    for raw_result in raw_results:
+        validated, semantic_key = _validate_result(value=raw_result)
+        validated_results.append(validated)
+        result_keys.append(semantic_key)
+    validated_drops = tuple(_validate_drop(value=drop) for drop in raw_drops)
+    result_indexes = [result.index for result in validated_results]
+    drop_indexes = [drop.index for drop in validated_drops]
+    indexes = [*result_indexes, *drop_indexes]
+    if result_indexes != sorted(result_indexes):
+        msg = "Shadow Result indexes must be increasing."
+        raise ShadowTransportError(msg)
+    if len(indexes) != len(set(indexes)) or set(indexes) != set(range(produced)):
+        msg = "Shadow Result and drop indexes must partition produced records."
+        raise ShadowTransportError(msg)
+    semantic_key = (
+        ("sequence", sequence),
+        ("produced", produced),
+        ("results", tuple(result_keys)),
+        (
+            "dropped",
+            tuple((drop.index, drop.serialized_bytes) for drop in validated_drops),
+        ),
+    )
+    return ValidatedEnvelope(
+        sequence=sequence,
+        produced=produced,
+        results=tuple(validated_results),
+        dropped=validated_drops,
+        semantic_key=semantic_key,
+    )
+
+
+def validate_manifest(value: object) -> ValidatedManifest:
+    """Return one strictly validated clean-finish manifest.
+
+    Raises:
+        ShadowTransportError: If the manifest violates the v2 schema.
+    """
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowManifestWire.__required_keys__),
+        context="Shadow manifest",
+    )
+    if type(typed["schema_version"]) is not int:
+        msg = "Shadow manifest schema_version must be an exact integer."
+        raise ShadowTransportError(msg)
+    if typed["schema_version"] != SHADOW_SCHEMA_VERSION:
+        msg = "Shadow manifest schema_version is unsupported."
+        raise ShadowTransportError(msg)
+    envelopes_sent = _require_int(
+        value=typed["envelopes_sent"],
+        minimum=0,
+        context="Shadow manifest envelopes_sent",
+    )
+    last_sequence = _require_int(
+        value=typed["last_sequence"],
+        minimum=0,
+        context="Shadow manifest last_sequence",
+    )
+    results_sent = _require_int(
+        value=typed["results_sent"],
+        minimum=0,
+        context="Shadow manifest results_sent",
+    )
+    results_dropped = _require_int(
+        value=typed["results_dropped"],
+        minimum=0,
+        context="Shadow manifest results_dropped",
+    )
+    if envelopes_sent != last_sequence:
+        msg = "Shadow manifest envelopes_sent must equal last_sequence."
+        raise ShadowTransportError(msg)
+    semantic_key = (
+        envelopes_sent,
+        last_sequence,
+        results_sent,
+        results_dropped,
+    )
+    return ValidatedManifest(
+        envelopes_sent=envelopes_sent,
+        last_sequence=last_sequence,
+        results_sent=results_sent,
+        results_dropped=results_dropped,
+        semantic_key=semantic_key,
+    )
+
+
+def _result_key(*, nodeid: str, result: Result) -> object:
+    """Return the semantic reconciliation key for one controller Result."""
+    payload = _serialize_result(result=result, nodeid=nodeid)
+    metadata = dict(cast("dict[str, Any]", payload["metadata"]))
+    for key in _TRANSPORT_METADATA_KEYS:
+        metadata.pop(key, None)
+    payload["metadata"] = metadata
+    return nodeid, _freeze_json(payload)
+
+
+@dataclass(kw_only=True, eq=False)
+class XdistShadowRuntime:
+    """Per-config worker/controller runtime for the v2 shadow channel."""
+
+    config: pytest.Config
+    session: RampartSession
+    _worker: _WorkerState = field(default_factory=_WorkerState)
+    _controller: _ControllerState = field(default_factory=_ControllerState)
+    _is_worker: bool = field(init=False)
+    _is_controller: bool = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._is_worker = is_xdist_worker(config=self.config)
+        self._is_controller = is_xdist_controller(config=self.config)
+
+    def remember_results(
+        self,
+        *,
+        item: pytest.Item,
+        results: tuple[Result, ...],
+    ) -> None:
+        """Stash the exact absorbed tuple for this item attempt."""
+        if not self._is_worker:
+            return
+        if ITEM_RESULTS_KEY in item.stash:
+            stale = item.stash[ITEM_RESULTS_KEY]
+            self._worker.results_dropped += len(stale)
+            logger.warning(
+                "Discarded %d stale RAMPART shadow Result(s) before a rerun.",
+                len(stale),
+            )
+        item.stash[ITEM_RESULTS_KEY] = results
+
+    def record_source_failure(self, *, result_count: int) -> None:
+        """Account for Results that could not be sourced from absorption."""
+        if self._is_worker and result_count > 0:
+            self._worker.results_dropped += result_count
+            logger.warning(
+                "RAMPART shadow could not source %d absorbed Result(s).",
+                result_count,
+            )
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_makereport(
+        self,
+        item: pytest.Item,
+        call: pytest.CallInfo[None],
+    ) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+        """Return a teardown report carrying one worker envelope when needed."""
+        del call
+        report = yield
+        if not self._is_worker or report.when != "teardown":
+            return report
+        results = item.stash.get(ITEM_RESULTS_KEY, ())
+        if ITEM_RESULTS_KEY in item.stash:
+            del item.stash[ITEM_RESULTS_KEY]
+        if not results:
+            return report
+        sequence = self._worker.last_sequence + 1
+        nodeid = item.nodeid if type(item.nodeid) is str else "<invalid-nodeid>"
+        try:
+            built = build_envelope(
+                results=results,
+                nodeid=nodeid,
+                sequence=sequence,
+                limit=_size_limit(config=self.config),
+            )
+        except Exception as exc:  # ruff: ignore[blind-except] — v2 cannot break v1
+            self._worker.results_dropped += len(results)
+            logger.warning(
+                "RAMPART shadow serialization failed for %s with %s.",
+                bounded_text(nodeid),
+                safe_type_name(exc),
+            )
+            return report
+        self._worker.results_dropped += built.results_dropped
+        if built.encoded is None:
+            return report
+        setattr(report, REPORT_ATTRIBUTE, built.encoded)
+        self._worker.last_sequence = sequence
+        self._worker.envelopes_sent += 1
+        self._worker.results_sent += built.results_sent
+        return report
+
+    def pytest_runtest_logreport(  # ruff: ignore[complex-structure, too-many-return-statements]
+        self,
+        report: pytest.TestReport,
+    ) -> None:
+        """Consume one reconstructed controller teardown attribute."""
+        if not self._is_controller or report.when != "teardown":
+            return
+        sentinel = object()
+        encoded = report.__dict__.get(REPORT_ATTRIBUTE, sentinel)
+        if encoded is sentinel:
+            return
+        worker_id = getattr(report, "worker_id", None)
+        nodeid = getattr(report, "nodeid", None)
+        if type(worker_id) is not str or not worker_id:
+            self._record_fault(
+                code="invalid-report-worker",
+                reason="shadow report has missing or invalid worker identity",
+            )
+            return
+        self._controller.report_workers.add(worker_id)
+        if type(nodeid) is not str or not nodeid:
+            self._record_fault(
+                code=f"invalid-report-node:{worker_id}",
+                reason=f"worker {worker_id} shadow report has invalid node identity",
+            )
+            return
+        if type(encoded) is not str or not encoded:
+            self._record_fault(
+                code=f"invalid-report-attribute:{worker_id}",
+                reason=f"worker {worker_id} shadow report attribute is invalid",
+            )
+            return
+        try:
+            envelope = parse_envelope(
+                encoded=encoded,
+                limit=_size_limit(config=self.config),
+                nodeid=nodeid,
+            )
+        except ShadowTransportError as exc:
+            self._record_fault(
+                code=f"malformed-envelope:{worker_id}:{nodeid}",
+                reason=(
+                    f"worker {worker_id} shadow envelope validation failed: "
+                    f"{bounded_text(str(exc))}"
+                ),
+            )
+            return
+        except Exception as exc:  # ruff: ignore[blind-except] — v2 cannot break v1
+            self._record_fault(
+                code=f"envelope-boundary-error:{worker_id}:{nodeid}",
+                reason=(
+                    f"worker {worker_id} shadow envelope processing failed with "
+                    f"{safe_type_name(exc)}"
+                ),
+            )
+            return
+        key = worker_id, envelope.sequence
+        existing = self._controller.deliveries.get(key)
+        if existing is not None:
+            if (
+                existing.nodeid == nodeid
+                and existing.envelope.semantic_key == envelope.semantic_key
+            ):
+                return
+            self._record_fault(
+                code=f"conflicting-envelope:{worker_id}:{envelope.sequence}",
+                reason=(
+                    f"worker {worker_id} shadow sequence {envelope.sequence} "
+                    "was delivered with conflicting content"
+                ),
+            )
+            return
+        for validated in envelope.results:
+            validated.result.metadata[_NODEID_METADATA_KEY] = nodeid
+            validated.result.metadata[_SOURCE_WORKER_METADATA_KEY] = worker_id
+            validated.result.metadata[_RESULT_INDEX_METADATA_KEY] = validated.index
+        self._controller.deliveries[key] = ShadowDelivery(
+            worker_id=worker_id,
+            nodeid=nodeid,
+            envelope=envelope,
+        )
+        if envelope.dropped:
+            self._record_fault(
+                code=f"drop-record:{worker_id}:{envelope.sequence}",
+                reason=(
+                    f"worker {worker_id} shadow sequence {envelope.sequence} "
+                    f"dropped {len(envelope.dropped)} Result(s)"
+                ),
+            )
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(  # ruff: ignore[too-many-return-statements]
+        self,
+        node: object,
+        error: object,
+    ) -> None:
+        """Validate one clean worker manifest after all its report events."""
+        if not self._is_controller:
+            return
+        worker_id = self._node_worker_id(node)
+        if worker_id is None:
+            self._record_fault(
+                code="invalid-node-worker",
+                reason="shadow node-down event has invalid worker identity",
+            )
+            return
+        self._controller.node_down_workers.add(worker_id)
+        if error is not None:
+            self._record_fault(
+                code=f"worker-error:{worker_id}",
+                reason=f"worker {worker_id} ended without a clean shadow manifest",
+            )
+            return
+        workeroutput = getattr(node, "workeroutput", None)
+        if type(workeroutput) is not dict:
+            self._record_fault(
+                code=f"missing-workeroutput:{worker_id}",
+                reason=f"worker {worker_id} has no valid shadow workeroutput",
+            )
+            return
+        raw_manifest = cast("dict[object, object]", workeroutput).get(
+            SHADOW_MANIFEST_KEY
+        )
+        if raw_manifest is None:
+            self._record_fault(
+                code=f"missing-manifest:{worker_id}",
+                reason=f"worker {worker_id} is missing its clean shadow manifest",
+            )
+            return
+        try:
+            manifest = validate_manifest(raw_manifest)
+        except ShadowTransportError as exc:
+            self._record_fault(
+                code=f"malformed-manifest:{worker_id}",
+                reason=(
+                    f"worker {worker_id} shadow manifest validation failed: "
+                    f"{bounded_text(str(exc))}"
+                ),
+            )
+            return
+        existing = self._controller.manifests.get(worker_id)
+        if existing is not None and existing.semantic_key != manifest.semantic_key:
+            self._record_fault(
+                code=f"conflicting-manifest:{worker_id}",
+                reason=f"worker {worker_id} delivered conflicting shadow manifests",
+            )
+            return
+        self._controller.manifests[worker_id] = manifest
+        self._validate_worker_manifest(worker_id=worker_id, manifest=manifest)
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_sessionfinish(
+        self,
+        session: pytest.Session,
+        exitstatus: int,
+    ) -> None:
+        """Publish a worker manifest or reconcile controller shadow state."""
+        del exitstatus
+        if self._is_worker:
+            workeroutput = getattr(self.config, "workeroutput", None)
+            if type(workeroutput) is dict:
+                cast("dict[str, object]", workeroutput)[SHADOW_MANIFEST_KEY] = (
+                    self._worker.manifest()
+                )
+            return
+        if self._is_controller and session.config is self.config:
+            self._reconcile_controller()
+
+    def _validate_worker_manifest(
+        self,
+        *,
+        worker_id: str,
+        manifest: ValidatedManifest,
+    ) -> None:
+        deliveries = [
+            delivery
+            for (source_worker, _), delivery in self._controller.deliveries.items()
+            if source_worker == worker_id
+        ]
+        sequences = sorted(delivery.envelope.sequence for delivery in deliveries)
+        contiguous = len(sequences) == manifest.last_sequence and all(
+            sequence == expected for expected, sequence in enumerate(sequences, start=1)
+        )
+        if not contiguous or len(deliveries) != manifest.envelopes_sent:
+            self._record_fault(
+                code=f"sequence-mismatch:{worker_id}",
+                reason=(
+                    f"worker {worker_id} shadow sequence manifest does not reconcile"
+                ),
+            )
+        results_sent = sum(len(item.envelope.results) for item in deliveries)
+        results_dropped = sum(len(item.envelope.dropped) for item in deliveries)
+        if results_sent != manifest.results_sent:
+            self._record_fault(
+                code=f"result-count-mismatch:{worker_id}",
+                reason=f"worker {worker_id} shadow Result count does not reconcile",
+            )
+        if results_dropped != manifest.results_dropped:
+            self._record_fault(
+                code=f"drop-count-mismatch:{worker_id}",
+                reason=f"worker {worker_id} shadow drop count does not reconcile",
+            )
+        if manifest.results_dropped:
+            self._record_fault(
+                code=f"manifest-drops:{worker_id}",
+                reason=(
+                    f"worker {worker_id} shadow manifest records "
+                    f"{manifest.results_dropped} dropped Result(s)"
+                ),
+            )
+
+    def _reconcile_controller(self) -> None:
+        if self._controller.reconciled:
+            return
+        self._controller.reconciled = True
+        missing_node_down = (
+            self._controller.report_workers - self._controller.node_down_workers
+        )
+        for worker_id in sorted(missing_node_down):
+            self._record_fault(
+                code=f"missing-node-down:{worker_id}",
+                reason=f"worker {worker_id} has shadow Results but no node-down event",
+            )
+        if self._controller.fault_codes:
+            return
+        try:
+            v1 = Counter(
+                _result_key(nodeid=nodeid, result=result)
+                for nodeid, results in self.session.results_by_nodeid.items()
+                for result in results
+            )
+            v2 = Counter(
+                _result_key(nodeid=delivery.nodeid, result=validated.result)
+                for delivery in self._controller.deliveries.values()
+                for validated in delivery.envelope.results
+            )
+        except (ShadowTransportError, TypeError, ValueError, RuntimeError) as exc:
+            self._record_fault(
+                code="reconciliation-error",
+                reason=(
+                    f"shadow semantic reconciliation failed with {safe_type_name(exc)}"
+                ),
+            )
+            return
+        if v1 == v2:
+            return
+        missing = sum((v1 - v2).values())
+        extra = sum((v2 - v1).values())
+        self._record_fault(
+            code="result-divergence",
+            reason=(
+                "shadow Result multiset diverged from authoritative v1 "
+                f"(missing={missing}, extra={extra})"
+            ),
+        )
+
+    def _record_fault(self, *, code: str, reason: str) -> None:
+        if code in self._controller.fault_codes:
+            return
+        self._controller.fault_codes.add(code)
+        safe_reason = bounded_text(reason)
+        logger.warning("RAMPART xdist v2 shadow: %s", safe_reason)
+        self.session.mark_incomplete(reason=safe_reason)
+
+    @staticmethod
+    def _node_worker_id(node: object) -> str | None:
+        gateway = getattr(node, "gateway", None)
+        worker_id = getattr(gateway, "id", None)
+        return worker_id if type(worker_id) is str and worker_id else None
+
+
+SHADOW_RUNTIME_KEY = pytest.StashKey[XdistShadowRuntime]()

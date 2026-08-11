@@ -67,6 +67,11 @@ from rampart.pytest_plugin._xdist import (
     is_xdist_controller,
     is_xdist_worker,
 )
+from rampart.pytest_plugin._xdist_shadow import (
+    SHADOW_RUNTIME_KEY,
+    SHADOW_RUNTIME_PLUGIN_NAME,
+    XdistShadowRuntime,
+)
 from rampart.reporting.sink import ReportSink
 
 if TYPE_CHECKING:
@@ -251,8 +256,18 @@ def pytest_configure(config: pytest.Config) -> None:
 
     register_default_handler_factory(_default_handler_factory)
 
-    config.stash[_rampart_key] = RampartSession()
+    rampart_session = RampartSession()
+    config.stash[_rampart_key] = rampart_session
     config.stash[_session_start_key] = time.monotonic()
+    shadow_runtime = XdistShadowRuntime(
+        config=config,
+        session=rampart_session,
+    )
+    config.pluginmanager.register(
+        shadow_runtime,
+        name=SHADOW_RUNTIME_PLUGIN_NAME,
+    )
+    config.stash[SHADOW_RUNTIME_KEY] = shadow_runtime
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
@@ -262,6 +277,10 @@ def pytest_unconfigure(config: pytest.Config) -> None:
         config (pytest.Config): The pytest configuration object.
     """
     clear_default_handler_factory()
+    shadow_runtime = config.stash.get(SHADOW_RUNTIME_KEY, None)
+    if shadow_runtime is not None:
+        config.pluginmanager.unregister(shadow_runtime)
+        del config.stash[SHADOW_RUNTIME_KEY]
     if _rampart_key in config.stash:
         del config.stash[_rampart_key]
     if _session_start_key in config.stash:
@@ -483,7 +502,19 @@ def _rampart_collect(  # pytest discovers this via autouse=True
     yield
     deactivate_collector(token)
     if rampart_session is not None:
-        _absorb_results(rampart_session=rampart_session, node=node, collector=collector)
+        absorbed = _absorb_results(
+            rampart_session=rampart_session,
+            node=node,
+            collector=collector,
+        )
+        shadow_runtime = request.config.stash.get(SHADOW_RUNTIME_KEY, None)
+        if shadow_runtime is not None:
+            if absorbed is None:
+                shadow_runtime.record_source_failure(
+                    result_count=len(collector.results),
+                )
+            else:
+                shadow_runtime.remember_results(item=node, results=absorbed)
 
     # Note: collector.results returns a copy of the internal list,
     # so reading it after deactivation and absorption is safe.

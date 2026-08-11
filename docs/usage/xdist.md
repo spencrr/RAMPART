@@ -45,6 +45,51 @@ serialize → workeroutput    serialize → workeroutput
 
 The result: **one** `JsonFileReportSink` output file, **one** call to `MyCustomSink.emit_async`, and accurate population statistics over the full result set.
 
+### V2 shadow validation
+
+RAMPART also sends a **shadow-only** v2 copy of each completed item's Results on
+its teardown `TestReport`. This incremental channel validates a future
+transport design; it does not supply Results to terminal output, JSON reports,
+sinks, trial gates, or population statistics. The v1 bulk worker payload above
+remains authoritative for every user-visible report.
+
+Each nonempty item attempt carries one private JSON envelope:
+
+```json
+{
+  "schema_version": 2,
+  "sequence": 7,
+  "produced": 1,
+  "results": [],
+  "dropped": [
+    {
+      "index": 0,
+      "reason": "size_limit",
+      "serialized_bytes": 73400320
+    }
+  ]
+}
+```
+
+- `sequence` is monotonic and worker-local. The delivery identity is
+  `(worker_id, sequence)`; a Result adds its zero-based index within the
+  attempted tuple.
+- The envelope does not carry a worker ID or node ID. The controller trusts
+  the `worker_id` and `nodeid` reconstructed by pytest-xdist.
+- Duplicate delivery of identical content is idempotent. Reusing an identity
+  for different content is a transport conflict.
+- A zero-Result item emits no envelope and consumes no sequence.
+- A clean worker sends a separate constant-size manifest with envelope,
+  sequence, Result, and drop counts. Missing manifests, gaps, count
+  mismatches, malformed data, and worker loss mark the run incomplete.
+
+On a clean no-drop run, the controller compares semantic v1 and v2 Result
+multisets. Only RAMPART's node, result-index, and source-worker bookkeeping is
+excluded; Result content and multiplicity, including textual evidence, must
+match. Any divergence or v2 drop forces an otherwise-successful run to exit
+nonzero through the same incomplete-run enforcement used by v1 failures. The
+v1 Result population is never replaced or supplemented by shadow data.
+
 ---
 
 ## Trial Tests with xdist
@@ -230,6 +275,14 @@ rampart_xdist_max_bytes = 134217728
 
 Workers that exceed the cap log a warning and emit a truncation marker. The controller records the affected worker as incomplete in `TestRunReport.metadata`.
 
+The same configured value also caps each v2 shadow report attribute without
+changing the v1 rule above. V2 measures the actual compact JSON envelope in
+UTF-8 bytes. An individually oversized Result becomes a bounded drop record
+while fitting siblings remain; when combined Results exceed the cap, v2 keeps
+a deterministic prefix and records the remainder as drops. The final
+attribute never exceeds the cap and is never split across multiple report
+properties. Every drop marks the shadow divergent/incomplete.
+
 ---
 
 ## Incomplete Runs
@@ -262,7 +315,8 @@ report.metadata["dist_mode"]      # "load", "loadgroup", etc.
 ## Durability limitations
 
 The current worker→controller transport flushes a worker's results only at its
-clean `pytest_sessionfinish`. This has two consequences you should be aware of:
+clean `pytest_sessionfinish`. Because v1 remains authoritative, this has two
+user-visible consequences:
 
 - **A worker killed mid-run loses its already-finished results.** Because results
   are shipped in a single batch at session end, a worker that crashes, is killed
@@ -274,12 +328,17 @@ clean `pytest_sessionfinish`. This has two consequences you should be aware of:
   `--rampart-xdist-max-bytes`, the **entire** worker payload is dropped (and the
   worker marked incomplete), rather than only the single oversized transcript.
 
-Both behaviors are deliberate fail-closed choices for this release. A durable
-per-worker transport (incremental JSONL shards that survive a killed worker, with
-the size cap applied per-record) is in progress as a follow-up change; until it
-lands, use `--dist=loadgroup` only when your trial groups need worker cohesion (see
-[Choosing `loadgroup` vs `load`](#choosing-loadgroup-vs-load)) and size your cap to
-your largest expected worker payload.
+The v2 shadow channel can retain Results whose teardown reports reached the
+controller before a worker died, and its per-item cap can retain siblings around
+an oversized Result. Those shadow Results remain internal on this release:
+worker loss or a drop still marks the run incomplete, while emitted reports
+continue to contain only the v1 population. This deliberate observation period
+must reconcile cleanly before any later production cutover.
+
+Until then, use `--dist=loadgroup` only when your trial groups need worker
+cohesion (see [Choosing `loadgroup` vs `load`](#choosing-loadgroup-vs-load)) and
+size the cap for both your largest expected worker payload and largest expected
+single-item Result envelope.
 
 ---
 
@@ -288,9 +347,10 @@ your largest expected worker payload.
 - Sinks discovered through the **fixture fallback** on the controller cannot depend
   on other pytest fixtures — use the `pytest_rampart_sinks` hook instead (see
   [Registering Sinks](#registering-sinks-the-pytest_rampart_sinks-hook)).
-- Results from a worker that dies before `pytest_sessionfinish` are lost, and an
-  over-cap worker payload is dropped wholesale (see
-  [Durability limitations](#durability-limitations)).
+- User-visible Results from a worker that dies before `pytest_sessionfinish`
+  are lost, and an over-cap v1 worker payload is dropped wholesale. Incremental
+  v2 copies may remain in internal shadow state but never backfill the report
+  (see [Durability limitations](#durability-limitations)).
 - Mixed RAMPART versions across controller and workers are unsupported; install the
   same version everywhere.
 - `pytest-xdist` itself does not support interactive debugging (`--pdb`, `--trace`);
