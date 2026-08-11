@@ -70,7 +70,8 @@ class TrialBatch:
 
         Raises:
             TypeError: If Results are not provided as a tuple of Result objects.
-            ValueError: If the ID, count, threshold, length, or status is invalid.
+            ValueError: If the ID, count, threshold, length, identity, or status
+                is invalid.
         """
         if not _is_canonical_uuid4(self.batch_id):
             msg = "batch_id must be a canonical UUID4 string."
@@ -89,6 +90,10 @@ class TrialBatch:
         if not all(type(result.status) is SafetyStatus for result in self.results):
             msg = "Every Result status must be a SafetyStatus."
             raise ValueError(msg)
+        previous: list[Result] = []
+        for result in self.results:
+            _validate_result_identity(result=result, previous=previous)
+            previous.append(result)
 
         counts = Counter(result.status for result in self.results)
         pass_rate = counts[SafetyStatus.SAFE] / count
@@ -244,7 +249,7 @@ def _validate_result_identity(*, result: Result, previous: list[Result]) -> None
         ValueError: If the Result identity was already returned.
     """
     if any(result is prior for prior in previous):
-        msg = "Each trial execution must return a distinct Result object."
+        msg = "Trial batches require distinct Result object identities."
         raise ValueError(msg)
 
 

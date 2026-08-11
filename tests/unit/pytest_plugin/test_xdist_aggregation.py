@@ -19,7 +19,6 @@ from xml.etree import ElementTree as ET  # ruff: ignore[suspicious-xml-etree-imp
 import pytest
 
 from rampart.pytest_plugin._xdist_shadow import REPORT_ATTRIBUTE
-from rampart.pytest_plugin.plugin import _TRIAL_MARKER_DEPRECATION_MESSAGE
 
 if TYPE_CHECKING:
     from _pytest.pytester import Pytester, RunResult
@@ -28,6 +27,13 @@ if TYPE_CHECKING:
 pytest_plugins = ["pytester"]
 
 pytestmark = pytest.mark.slow
+
+_EXPECTED_TRIAL_MARKER_DEPRECATION_MESSAGE = (
+    "The clone-based @pytest.mark.trial marker is deprecated and will be removed "
+    "in 0.3.0. Migrate to async batching and preserve CI enforcement: "
+    "batch = await execute_trials_async(execution_factory=..., adapter=..., "
+    "count=..., threshold=...); assert batch."
+)
 
 
 _CONFTEST = """\
@@ -1436,7 +1442,7 @@ class TestTrialMarkerDeprecation:
             if "clone-based @pytest.mark.trial marker is deprecated" in line
         ]
         assert len(warning_lines) == 1
-        assert _TRIAL_MARKER_DEPRECATION_MESSAGE in warning_lines[0]
+        assert _EXPECTED_TRIAL_MARKER_DEPRECATION_MESSAGE in warning_lines[0]
         assert any("PytestDeprecationWarning" in line for line in warning_lines)
 
     def test_warning_error_is_contained_after_report(

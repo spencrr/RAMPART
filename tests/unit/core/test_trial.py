@@ -548,3 +548,23 @@ class TestTrialBatch:
                 results=(_result(),),
                 requested_count=1,
             )
+
+    def test_constructor_rejects_duplicate_result_identity(self) -> None:
+        result = _result()
+        with pytest.raises(ValueError, match="distinct Result object identities"):
+            TrialBatch(
+                batch_id="123e4567-e89b-42d3-a456-426614174000",
+                results=(result, result),
+                requested_count=2,
+            )
+
+    def test_constructor_accepts_distinct_equal_results(self) -> None:
+        first = _result()
+        second = _result()
+        batch = TrialBatch(
+            batch_id="123e4567-e89b-42d3-a456-426614174000",
+            results=(first, second),
+            requested_count=2,
+        )
+        assert batch.results == (first, second)
+        assert batch.results[0] is not batch.results[1]

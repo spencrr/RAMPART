@@ -112,8 +112,9 @@ _STATUS_LABELS: dict[SafetyStatus, str] = {
 }
 _TRIAL_MARKER_DEPRECATION_MESSAGE = (
     "The clone-based @pytest.mark.trial marker is deprecated and will be removed "
-    "in 0.3.0. Migrate to execute_trials_async(execution_factory=..., adapter=..., "
-    "count=..., threshold=...)."
+    "in 0.3.0. Migrate to async batching and preserve CI enforcement: "
+    "batch = await execute_trials_async(execution_factory=..., adapter=..., "
+    "count=..., threshold=...); assert batch."
 )
 
 

@@ -114,8 +114,9 @@ context; custom post-execution handlers should not depend on seeing it.
     window and will be removed in `0.3.0`. Its exact warning is:
 
     > The clone-based @pytest.mark.trial marker is deprecated and will be removed
-    > in 0.3.0. Migrate to execute_trials_async(execution_factory=...,
-    > adapter=..., count=..., threshold=...).
+    > in 0.3.0. Migrate to async batching and preserve CI enforcement:
+    > batch = await execute_trials_async(execution_factory=..., adapter=...,
+    > count=..., threshold=...); assert batch.
 
 The deprecated marker still clones a test into separate pytest items and keeps
 its older stricter semantics: any `UNSAFE` clone fails the aggregate, missing

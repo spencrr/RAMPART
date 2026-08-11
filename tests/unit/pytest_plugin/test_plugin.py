@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Never, cast
 from unittest.mock import MagicMock
@@ -32,7 +33,6 @@ from rampart.pytest_plugin._collection import (
 )
 from rampart.pytest_plugin._session import RampartSession
 from rampart.pytest_plugin.plugin import (
-    _TRIAL_MARKER_DEPRECATION_MESSAGE,
     _absorb_results,
     _call_results_key,
     _emit_sinks,
@@ -57,6 +57,14 @@ from rampart.reporting.sink import ReportSink, TestRunReport
 
 if TYPE_CHECKING:
     from _pytest.terminal import TerminalReporter
+
+_EXPECTED_TRIAL_MARKER_DEPRECATION_MESSAGE = (
+    "The clone-based @pytest.mark.trial marker is deprecated and will be removed "
+    "in 0.3.0. Migrate to async batching and preserve CI enforcement: "
+    "batch = await execute_trials_async(execution_factory=..., adapter=..., "
+    "count=..., threshold=...); assert batch."
+)
+_REPO_ROOT = Path(__file__).parents[3]
 
 
 class _HostileRepr:
@@ -1420,7 +1428,20 @@ class TestTrialMarkerDeprecation:
             pytest.PytestDeprecationWarning,
         ) as warnings:
             _warn_trial_marker_deprecated(rampart_session=rampart_session)
-        assert str(warnings[0].message) == _TRIAL_MARKER_DEPRECATION_MESSAGE
+        assert str(warnings[0].message) == _EXPECTED_TRIAL_MARKER_DEPRECATION_MESSAGE
+
+    def test_documented_warning_matches_exact_contract(self) -> None:
+        text = (_REPO_ROOT / "docs/usage/pytest-integration.md").read_text(
+            encoding="utf-8",
+        )
+        warning_block = text.split("Its exact warning is:\n\n", maxsplit=1)[1].split(
+            "\n\n",
+            maxsplit=1,
+        )[0]
+        documented = " ".join(
+            line.removeprefix("    > ").strip() for line in warning_block.splitlines()
+        )
+        assert documented == _EXPECTED_TRIAL_MARKER_DEPRECATION_MESSAGE
 
     def test_noop_without_trial_specs(self, recwarn: pytest.WarningsRecorder) -> None:
         _warn_trial_marker_deprecated(rampart_session=RampartSession())
