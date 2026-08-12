@@ -912,11 +912,12 @@ def _validate_result(
     if _NODEID_METADATA_KEY in metadata or _SOURCE_WORKER_METADATA_KEY in metadata:
         msg = "Shadow Result must not embed authoritative route metadata."
         raise ShadowTransportError(msg)
-    _require_int(
-        value=metadata.get(_RESULT_INDEX_METADATA_KEY),
-        minimum=0,
-        context="Shadow Result scheduling index",
-    )
+    if _RESULT_INDEX_METADATA_KEY in metadata:
+        _require_int(
+            value=metadata[_RESULT_INDEX_METADATA_KEY],
+            minimum=0,
+            context="Shadow Result scheduling index",
+        )
     try:
         result = _deserialize_result(data=typed)
     except WorkerOutputError as exc:

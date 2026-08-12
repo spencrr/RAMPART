@@ -95,8 +95,9 @@ Each nonempty item attempt carries one private JSON envelope:
   zero-based `index`, so `(worker_id, sequence, index)` identifies one local
   slot and the two record lists exactly partition `0..produced-1`.
 - The structural slot is independent of Result metadata.
-  `_rampart_result_index` retains the cumulative scheduling index assigned by
-  the authoritative worker session; v2 does not rewrite or alias it.
+  When present, `_rampart_result_index` retains the cumulative scheduling index
+  assigned by the authoritative worker session; v2 does not rewrite, alias, or
+  synthesize it when a low-level input omits the key.
 - The envelope does not carry a worker ID or node ID. The controller trusts
   the `worker_id` and `nodeid` reconstructed by pytest-xdist.
 - Duplicate delivery of identical content is idempotent. Reusing an identity

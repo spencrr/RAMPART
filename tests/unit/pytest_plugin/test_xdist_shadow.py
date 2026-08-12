@@ -71,12 +71,11 @@ def _make_result(
     summary: str = "summary",
     metadata: dict[str, Any] | None = None,
 ) -> Result:
-    result_metadata = {"_rampart_result_index": 0, **(metadata or {})}
     return Result(
         status=SafetyStatus.SAFE,
         summary=summary,
         observability_level=ObservabilityLevel.RESPONSE_ONLY,
-        metadata=result_metadata,
+        metadata=metadata or {},
     )
 
 
@@ -546,24 +545,6 @@ class TestEnvelopeValidation:
                 nodeid="test.py::test_result_order",
             )
 
-    def test_result_requires_cumulative_scheduling_index(self) -> None:
-        built = build_envelope(
-            results=(_make_result(),),
-            nodeid="test.py::test_scheduling_index",
-            sequence=1,
-            limit=DEFAULT_SIZE_LIMIT_BYTES,
-        )
-        assert built.encoded is not None
-        raw = json.loads(built.encoded)
-        del raw["results"][0]["result"]["metadata"]["_rampart_result_index"]
-
-        with pytest.raises(ShadowTransportError, match="scheduling index"):
-            parse_envelope(
-                encoded=json.dumps(raw),
-                limit=DEFAULT_SIZE_LIMIT_BYTES,
-                nodeid="test.py::test_scheduling_index",
-            )
-
     def test_drop_indexes_must_be_increasing(self) -> None:
         raw = {
             "schema_version": SHADOW_SCHEMA_VERSION,
@@ -668,7 +649,6 @@ class TestEnvelopeValidation:
         result = Result(
             status=SafetyStatus.SAFE,
             summary="html",
-            metadata={"_rampart_result_index": 0},
             turns=[
                 Turn(
                     request=Request(
@@ -775,6 +755,56 @@ class TestEnvelopeValidation:
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
                 nodeid="test.py::test_reason",
+            )
+
+
+class TestSchedulingIndexValidation:
+    def test_absent_scheduling_index_round_trips_without_synthesis(self) -> None:
+        nodeid = "test.py::test_absent_scheduling_index"
+        result = _make_result()
+        built = build_envelope(
+            results=(result,),
+            nodeid=nodeid,
+            sequence=1,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+        assert built.encoded is not None
+        raw = json.loads(built.encoded)
+        assert "_rampart_result_index" not in raw["results"][0]["result"]["metadata"]
+
+        _, session, runtime = _controller_runtime()
+        runtime.pytest_runtest_logreport(
+            _make_report(encoded=built.encoded, nodeid=nodeid)
+        )
+
+        delivery = next(iter(runtime._controller.deliveries.values()))
+        [validated] = delivery.envelope.results
+        assert "_rampart_result_index" not in validated.result.metadata
+        assert _result_key(nodeid=nodeid, result=result) == _result_key(
+            nodeid=nodeid,
+            result=validated.result,
+        )
+        assert session.is_incomplete is False
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, -1, "0", 0.0, None],
+        ids=["bool", "negative", "string", "float", "none"],
+    )
+    def test_present_scheduling_index_is_strict(self, value: object) -> None:
+        built = build_envelope(
+            results=(_make_result(metadata={"_rampart_result_index": value}),),
+            nodeid="test.py::test_scheduling_index",
+            sequence=1,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+        assert built.encoded is not None
+
+        with pytest.raises(ShadowTransportError, match="scheduling index"):
+            parse_envelope(
+                encoded=built.encoded,
+                limit=DEFAULT_SIZE_LIMIT_BYTES,
+                nodeid="test.py::test_scheduling_index",
             )
 
 
