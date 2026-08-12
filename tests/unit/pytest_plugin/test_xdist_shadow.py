@@ -1341,6 +1341,25 @@ class TestSemanticNormalization:
             result=right,
         )
 
+    def test_trial_batch_metadata_remains_semantically_significant(self) -> None:
+        left = _make_result(
+            metadata={
+                "_rampart_result_index": 0,
+                "_rampart_trial_batch_index": 0,
+            }
+        )
+        right = _make_result(
+            metadata={
+                "_rampart_result_index": 9,
+                "_rampart_trial_batch_index": 1,
+            }
+        )
+
+        assert _result_key(
+            nodeid="test.py::test_trial_key",
+            result=left,
+        ) != _result_key(nodeid="test.py::test_trial_key", result=right)
+
     def test_textual_evidence_difference_is_preserved(self) -> None:
         left = _make_result(summary="line\none")
         right = _make_result(summary="line\n two")

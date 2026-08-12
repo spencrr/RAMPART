@@ -117,6 +117,35 @@ from rampart.pytest_plugin._xdist_shadow import (
 _MANIFEST_MODE = "__MANIFEST_MODE__"
 _REPORT_MODE = "__REPORT_MODE__"
 _SHADOW_SNAPSHOT = Path("shadow_snapshot.json").absolute()
+_TRIAL_METADATA_KEYS = (
+    "_rampart_trial_batch_schema",
+    "_rampart_trial_batch_id",
+    "_rampart_trial_batch_index",
+    "_rampart_trial_batch_count",
+    "_rampart_trial_batch_threshold",
+)
+
+
+def _result_record(result):
+    metadata = result.metadata
+    return {
+        "summary": result.summary,
+        "worker_id": metadata.get("_rampart_source_worker"),
+        "nodeid": metadata.get("_pytest_nodeid"),
+        "result_index": metadata.get("_rampart_result_index"),
+        "trial_metadata": {
+            key: metadata[key] for key in _TRIAL_METADATA_KEYS if key in metadata
+        },
+    }
+
+
+def _record_key(record):
+    return (
+        record["worker_id"] or "",
+        record["nodeid"] or "",
+        record["result_index"],
+        record["summary"],
+    )
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)
@@ -156,6 +185,21 @@ def pytest_sessionfinish(session, exitstatus):
         per_worker.setdefault(delivery.worker_id, []).append(
             delivery.envelope.sequence,
         )
+    v1_records = sorted(
+        (
+            _result_record(result)
+            for results in runtime.session.results_by_nodeid.values()
+            for result in results
+        ),
+        key=_record_key,
+    )
+    v2_records = []
+    for delivery in deliveries:
+        for validated in delivery.envelope.results:
+            record = _result_record(validated.result)
+            record["slot_index"] = validated.index
+            v2_records.append(record)
+    v2_records.sort(key=_record_key)
     snapshot = {
         "delivery_count": len(deliveries),
         "faults": sorted(runtime._controller.fault_codes),
@@ -176,6 +220,8 @@ def pytest_sessionfinish(session, exitstatus):
         "v1_results": sum(
             len(results) for results in runtime.session.results_by_nodeid.values()
         ),
+        "v1_records": v1_records,
+        "v2_records": v2_records,
         "worker_count": len(per_worker),
     }
     _SHADOW_SNAPSHOT.write_text(
@@ -1094,6 +1140,119 @@ class TestExecutionDomainTrialBatches:
             )
             == 2
         )
+
+    @pytest.mark.parametrize("dist_mode", ["load", "loadgroup", "each"])
+    def test_trial_metadata_reconciles_through_v1_and_v2(
+        self,
+        configured_pytester: Pytester,
+        dist_mode: str,
+    ) -> None:
+        _configure_shadow_snapshot(configured_pytester)
+        configured_pytester.makepyfile(
+            test_shadow_trial="""\
+            import pytest
+
+            from rampart import (
+                BaseExecution,
+                Result,
+                SafetyStatus,
+                execute_trials_async,
+                record_result,
+            )
+
+
+            class Execution(BaseExecution):
+                def __init__(self, *, index):
+                    super().__init__()
+                    self._index = index
+
+                @property
+                def strategy_name(self):
+                    return "test"
+
+                async def _execute_async(self, *, adapter):
+                    return Result(
+                        status=SafetyStatus.SAFE,
+                        summary=f"trial-{self._index}",
+                    )
+
+
+            @pytest.mark.xdist_group(name="shadow-trial")
+            @pytest.mark.harm("test")
+            async def test_shadow_trial():
+                record_result(Result(status=SafetyStatus.SAFE, summary="plain"))
+                index = 0
+
+                def factory():
+                    nonlocal index
+                    execution = Execution(index=index)
+                    index += 1
+                    return execution
+
+                batch = await execute_trials_async(
+                    execution_factory=factory,
+                    adapter=object(),
+                    count=2,
+                )
+                assert batch
+            """,
+        )
+
+        result = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "2",
+            f"--dist={dist_mode}",
+        )
+
+        expected_items = 2 if dist_mode == "each" else 1
+        expected_results = expected_items * 3
+        result.assert_outcomes(passed=expected_items)
+        reports = _load_reports(configured_pytester)
+        assert len(reports) == 1
+        report = reports[0]
+        assert report["total_runs"] == expected_results
+        assert len(report["trial_batches"]) == expected_items
+        snapshot = _load_shadow_snapshot(configured_pytester)
+        assert snapshot["faults"] == []
+        assert snapshot["incomplete"] is False
+        assert snapshot["v1_results"] == expected_results
+        assert snapshot["shadow_results"] == expected_results
+        v2_records = snapshot["v2_records"]
+        assert snapshot["v1_records"] == [
+            {key: value for key, value in record.items() if key != "slot_index"}
+            for record in v2_records
+        ]
+        assert all(
+            record["slot_index"] == record["result_index"] for record in v2_records
+        )
+        by_worker: dict[str, list[dict[str, Any]]] = {}
+        for record in v2_records:
+            by_worker.setdefault(record["worker_id"], []).append(record)
+        assert all(
+            [record["slot_index"] for record in records] == [0, 1, 2]
+            for records in by_worker.values()
+        )
+        for records in by_worker.values():
+            by_summary = {record["summary"]: record for record in records}
+            assert by_summary["plain"]["trial_metadata"] == {}
+            for index in range(2):
+                metadata = by_summary[f"trial-{index}"]["trial_metadata"]
+                assert metadata["_rampart_trial_batch_index"] == index
+                assert metadata["_rampart_trial_batch_count"] == 2
+                assert metadata["_rampart_trial_batch_schema"] == (
+                    "rampart.trial-batch.v1"
+                )
+        batch_ids = [summary["batch_id"] for summary in report["trial_batches"]]
+        first_seen = list(
+            dict.fromkeys(
+                item["metadata"]["_rampart_trial_batch_id"]
+                for item in _flatten_results(report)
+                if "_rampart_trial_batch_id" in item["metadata"]
+            ),
+        )
+        assert batch_ids == first_seen
 
 
 class TestXdistShadowLifecycle:
