@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-"""Tests for the xdist v2 shadow transport."""
+"""Tests for the authoritative xdist v2 Result transport."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import rampart.pytest_plugin._xdist_shadow as shadow_module
+import rampart.pytest_plugin._xdist_transport as transport_module
 from rampart.core.result import Result, SafetyStatus
 from rampart.core.types import (
     ObservabilityLevel,
@@ -24,17 +24,21 @@ from rampart.core.types import (
 )
 from rampart.pytest_plugin._collection import ResultCollector
 from rampart.pytest_plugin._session import RampartSession
-from rampart.pytest_plugin._xdist import DEFAULT_SIZE_LIMIT_BYTES, SIZE_LIMIT_OPTION
-from rampart.pytest_plugin._xdist_shadow import (
+from rampart.pytest_plugin._xdist import (
+    DEFAULT_SIZE_LIMIT_BYTES,
+    SIZE_LIMIT_OPTION,
+    TRIAL_SPECS_SCHEMA_VERSION,
+    TRIAL_SPECS_WORKEROUTPUT_KEY,
+)
+from rampart.pytest_plugin._xdist_transport import (
+    MANIFEST_KEY,
     REPORT_ATTRIBUTE,
-    SHADOW_MANIFEST_KEY,
-    SHADOW_SCHEMA_VERSION,
+    SCHEMA_VERSION,
     EnvelopeBuild,
-    ShadowSizeError,
-    ShadowTransportError,
-    XdistShadowRuntime,
+    TransportError,
+    TransportSizeError,
+    XdistResultTransport,
     _freeze_json,
-    _result_key,
     build_envelope,
     parse_envelope,
     validate_manifest,
@@ -79,15 +83,30 @@ def _make_result(
     )
 
 
+def _semantic_key(result: Result) -> object:
+    built = build_envelope(
+        results=(result,),
+        nodeid="test.py::test_semantic_key",
+        sequence=1,
+        limit=DEFAULT_SIZE_LIMIT_BYTES,
+    )
+    assert built.encoded is not None
+    return parse_envelope(
+        encoded=built.encoded,
+        limit=DEFAULT_SIZE_LIMIT_BYTES,
+        nodeid="test.py::test_semantic_key",
+    ).semantic_key
+
+
 def _make_report(
     *,
     encoded: object,
-    nodeid: str = "test_shadow.py::test_item",
+    nodeid: str = "test_transport.py::test_item",
     worker_id: object = "worker-a",
 ) -> pytest.TestReport:
     report = pytest.TestReport(
         nodeid=nodeid,
-        location=("test_shadow.py", 1, "test_item"),
+        location=("test_transport.py", 1, "test_item"),
         keywords={},
         outcome="passed",
         longrepr=None,
@@ -106,7 +125,7 @@ def _make_manifest(
     results_dropped: int = 0,
 ) -> dict[str, int]:
     return {
-        "schema_version": SHADOW_SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION,
         "envelopes_sent": envelopes_sent,
         "last_sequence": last_sequence,
         "results_sent": results_sent,
@@ -118,10 +137,21 @@ def _make_node(
     *,
     manifest: object | None = None,
     worker_id: object = "worker-a",
+    include_trial_specs: bool = True,
+    trial_specs_payload: object | None = None,
 ) -> SimpleNamespace:
     workeroutput = {}
     if manifest is not None:
-        workeroutput[SHADOW_MANIFEST_KEY] = manifest
+        workeroutput[MANIFEST_KEY] = manifest
+    if include_trial_specs:
+        workeroutput[TRIAL_SPECS_WORKEROUTPUT_KEY] = (
+            trial_specs_payload
+            if trial_specs_payload is not None
+            else {
+                "schema": TRIAL_SPECS_SCHEMA_VERSION,
+                "trial_specs": [],
+            }
+        )
     return SimpleNamespace(
         gateway=SimpleNamespace(id=worker_id),
         workeroutput=workeroutput,
@@ -131,7 +161,7 @@ def _make_node(
 def _controller_runtime(
     *,
     max_bytes: int = DEFAULT_SIZE_LIMIT_BYTES,
-) -> tuple[_Config, RampartSession, XdistShadowRuntime]:
+) -> tuple[_Config, RampartSession, XdistResultTransport]:
     config = _Config(controller=True, max_bytes=max_bytes)
     session = RampartSession()
     return config, session, _make_runtime(config=config, session=session)
@@ -141,19 +171,19 @@ def _make_runtime(
     *,
     config: _Config,
     session: RampartSession,
-) -> XdistShadowRuntime:
+) -> XdistResultTransport:
     typed_config: Any = config
-    return XdistShadowRuntime(config=typed_config, session=session)
+    return XdistResultTransport(config=typed_config, session=session)
 
 
-def _finish_runtime(*, runtime: XdistShadowRuntime, config: _Config) -> None:
+def _finish_runtime(*, runtime: XdistResultTransport, config: _Config) -> None:
     pytest_session: Any = SimpleNamespace(config=config)
     runtime.pytest_sessionfinish(pytest_session, 0)
 
 
 def _run_worker_makereport(
     *,
-    runtime: XdistShadowRuntime,
+    runtime: XdistResultTransport,
     item: MagicMock,
 ) -> pytest.TestReport:
     report = _make_report(encoded="")
@@ -292,8 +322,10 @@ class TestEnvelopeBuild:
         assert constrained.encoded is not None
         constrained_raw = json.loads(constrained.encoded)
         [drop] = constrained_raw["dropped"]
-        assert drop["serialized_bytes"] == shadow_module._encoded_size(record)
-        assert drop["serialized_bytes"] > shadow_module._encoded_size(record["result"])
+        assert drop["serialized_bytes"] == transport_module._encoded_size(record)
+        assert drop["serialized_bytes"] > transport_module._encoded_size(
+            record["result"]
+        )
 
     def test_combined_cap_retains_deterministic_prefix(self) -> None:
         results = tuple(_make_result(summary=str(index) * 120) for index in range(4))
@@ -366,7 +398,7 @@ class TestEnvelopeBuild:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        original = shadow_module._encode_json
+        original = transport_module._encode_json
         encoded_volume = 0
 
         def _measured(value: object) -> str:
@@ -375,7 +407,7 @@ class TestEnvelopeBuild:
             encoded_volume += len(encoded.encode("utf-8"))
             return encoded
 
-        monkeypatch.setattr(shadow_module, "_encode_json", _measured)
+        monkeypatch.setattr(transport_module, "_encode_json", _measured)
         built = build_envelope(
             results=tuple(_make_result(summary=str(index)) for index in range(200)),
             nodeid="test.py::test_linear",
@@ -399,7 +431,7 @@ class TestEnvelopeValidation:
         raw = json.loads(built.encoded)
         raw["schema_version"] = 99
 
-        with pytest.raises(ShadowTransportError, match="unsupported"):
+        with pytest.raises(TransportError, match="unsupported"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -415,7 +447,7 @@ class TestEnvelopeValidation:
         ],
     )
     def test_malformed_json_is_rejected(self, encoded: str) -> None:
-        with pytest.raises(ShadowTransportError):
+        with pytest.raises(TransportError):
             parse_envelope(
                 encoded=encoded,
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -423,7 +455,7 @@ class TestEnvelopeValidation:
             )
 
     def test_attribute_size_is_guarded_before_parsing(self) -> None:
-        with pytest.raises(ShadowSizeError, match="10-byte cap"):
+        with pytest.raises(TransportSizeError, match="10-byte cap"):
             parse_envelope(
                 encoded="x" * 11,
                 limit=10,
@@ -431,7 +463,7 @@ class TestEnvelopeValidation:
             )
 
     def test_invalid_utf8_text_is_rejected_without_escaping(self) -> None:
-        with pytest.raises(ShadowTransportError, match="UTF-8"):
+        with pytest.raises(TransportError, match="UTF-8"):
             parse_envelope(
                 encoded="\ud800",
                 limit=10,
@@ -440,14 +472,14 @@ class TestEnvelopeValidation:
 
     def test_bool_sequence_is_rejected(self) -> None:
         raw = {
-            "schema_version": SHADOW_SCHEMA_VERSION,
+            "schema_version": SCHEMA_VERSION,
             "sequence": True,
             "produced": 1,
             "results": [],
             "dropped": [{"index": 0, "reason": "size_limit", "serialized_bytes": 10}],
         }
 
-        with pytest.raises(ShadowTransportError, match="sequence"):
+        with pytest.raises(TransportError, match="sequence"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -456,14 +488,14 @@ class TestEnvelopeValidation:
 
     def test_produced_count_mismatch_is_rejected(self) -> None:
         raw = {
-            "schema_version": SHADOW_SCHEMA_VERSION,
+            "schema_version": SCHEMA_VERSION,
             "sequence": 1,
             "produced": 2,
             "results": [],
             "dropped": [{"index": 0, "reason": "size_limit", "serialized_bytes": 10}],
         }
 
-        with pytest.raises(ShadowTransportError, match="produced"):
+        with pytest.raises(TransportError, match="produced"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -481,7 +513,7 @@ class TestEnvelopeValidation:
         raw = json.loads(built.encoded)
         raw["results"][1]["index"] = 0
 
-        with pytest.raises(ShadowTransportError, match="partition"):
+        with pytest.raises(TransportError, match="partition"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -519,7 +551,7 @@ class TestEnvelopeValidation:
         else:
             record["result"] = []
 
-        with pytest.raises(ShadowTransportError):
+        with pytest.raises(TransportError):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -538,7 +570,7 @@ class TestEnvelopeValidation:
         raw["results"][0]["index"] = 1
         raw["results"][1]["index"] = 0
 
-        with pytest.raises(ShadowTransportError, match="increasing"):
+        with pytest.raises(TransportError, match="increasing"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -547,7 +579,7 @@ class TestEnvelopeValidation:
 
     def test_drop_indexes_must_be_increasing(self) -> None:
         raw = {
-            "schema_version": SHADOW_SCHEMA_VERSION,
+            "schema_version": SCHEMA_VERSION,
             "sequence": 1,
             "produced": 2,
             "results": [],
@@ -557,7 +589,7 @@ class TestEnvelopeValidation:
             ],
         }
 
-        with pytest.raises(ShadowTransportError, match="drop indexes"):
+        with pytest.raises(TransportError, match="drop indexes"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -583,7 +615,7 @@ class TestEnvelopeValidation:
             }
         ]
 
-        with pytest.raises(ShadowTransportError, match="partition"):
+        with pytest.raises(TransportError, match="partition"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -602,7 +634,7 @@ class TestEnvelopeValidation:
         raw = json.loads(built.encoded)
         raw["results"][0]["result"]["metadata"][key] = "spoofed"
 
-        with pytest.raises(ShadowTransportError, match="route metadata"):
+        with pytest.raises(TransportError, match="route metadata"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -620,7 +652,7 @@ class TestEnvelopeValidation:
         raw = json.loads(built.encoded)
         raw["results"][0]["result"]["summary"] = 7
 
-        with pytest.raises(ShadowTransportError, match="summary"):
+        with pytest.raises(TransportError, match="summary"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -638,14 +670,14 @@ class TestEnvelopeValidation:
         raw = json.loads(built.encoded)
         raw["results"][0]["result"]["unexpected"] = "value"
 
-        with pytest.raises(ShadowTransportError, match="exactly"):
+        with pytest.raises(TransportError, match="exactly"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
                 nodeid="test.py::test_extra",
             )
 
-    def test_valid_non_text_payload_survives_v1_normalization(self) -> None:
+    def test_valid_non_text_payload_survives_transport_normalization(self) -> None:
         result = Result(
             status=SafetyStatus.SAFE,
             summary="html",
@@ -714,14 +746,14 @@ class TestEnvelopeValidation:
             nested = [nested]
         raw["results"][0]["result"]["metadata"]["deep"] = nested
 
-        with pytest.raises(ShadowTransportError, match="depth"):
+        with pytest.raises(TransportError, match="depth"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
                 nodeid="test.py::test_depth",
             )
 
-    def test_v1_maximum_metadata_depth_is_accepted(self) -> None:
+    def test_maximum_metadata_depth_is_accepted(self) -> None:
         nested: object = "leaf"
         for _ in range(7):
             nested = [nested]
@@ -743,14 +775,14 @@ class TestEnvelopeValidation:
 
     def test_unknown_drop_reason_is_rejected(self) -> None:
         raw = {
-            "schema_version": SHADOW_SCHEMA_VERSION,
+            "schema_version": SCHEMA_VERSION,
             "sequence": 1,
             "produced": 1,
             "results": [],
             "dropped": [{"index": 0, "reason": "other", "serialized_bytes": 10}],
         }
 
-        with pytest.raises(ShadowTransportError, match="unsupported"):
+        with pytest.raises(TransportError, match="unsupported"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -780,10 +812,10 @@ class TestSchedulingIndexValidation:
         delivery = next(iter(runtime._controller.deliveries.values()))
         [validated] = delivery.envelope.results
         assert "_rampart_result_index" not in validated.result.metadata
-        assert _result_key(nodeid=nodeid, result=result) == _result_key(
-            nodeid=nodeid,
-            result=validated.result,
-        )
+        [reported] = session.build_report().results
+        assert "_rampart_result_index" not in reported.metadata
+        assert reported.metadata["_pytest_nodeid"] == nodeid
+        assert reported.metadata["_rampart_source_worker"] == "worker-a"
         assert session.is_incomplete is False
 
     @pytest.mark.parametrize(
@@ -800,7 +832,7 @@ class TestSchedulingIndexValidation:
         )
         assert built.encoded is not None
 
-        with pytest.raises(ShadowTransportError, match="scheduling index"):
+        with pytest.raises(TransportError, match="scheduling index"):
             parse_envelope(
                 encoded=built.encoded,
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
@@ -836,14 +868,14 @@ class TestManifestValidation:
         raw: dict[str, object] = dict(_make_manifest())
         raw.update(mutation)
 
-        with pytest.raises(ShadowTransportError):
+        with pytest.raises(TransportError):
             validate_manifest(raw)
 
     def test_missing_manifest_field_is_rejected(self) -> None:
         raw = _make_manifest()
         del raw["results_sent"]
 
-        with pytest.raises(ShadowTransportError, match="exactly"):
+        with pytest.raises(TransportError, match="exactly"):
             validate_manifest(raw)
 
 
@@ -890,7 +922,7 @@ class TestWorkerRuntime:
         _finish_runtime(runtime=runtime, config=config)
 
         assert not hasattr(report, REPORT_ATTRIBUTE)
-        assert config.workeroutput[SHADOW_MANIFEST_KEY] == _make_manifest(
+        assert config.workeroutput[MANIFEST_KEY] == _make_manifest(
             envelopes_sent=0,
             last_sequence=0,
             results_sent=0,
@@ -908,7 +940,7 @@ class TestWorkerRuntime:
         _finish_runtime(runtime=runtime, config=config)
 
         assert not hasattr(report, REPORT_ATTRIBUTE)
-        assert config.workeroutput[SHADOW_MANIFEST_KEY] == _make_manifest(
+        assert config.workeroutput[MANIFEST_KEY] == _make_manifest(
             envelopes_sent=0,
             last_sequence=0,
             results_sent=0,
@@ -935,6 +967,7 @@ class TestControllerRuntime:
         runtime.pytest_runtest_logreport(report)
 
         assert len(runtime._controller.deliveries) == 1
+        assert session.build_report().total_runs == 1
         assert session.is_incomplete is False
 
     def test_semantically_equal_duplicate_json_is_idempotent(self) -> None:
@@ -962,6 +995,7 @@ class TestControllerRuntime:
         )
 
         assert len(runtime._controller.deliveries) == 1
+        assert session.build_report().total_runs == 1
         assert session.is_incomplete is False
 
     def test_conflicting_duplicate_fails_closed(self) -> None:
@@ -995,6 +1029,9 @@ class TestControllerRuntime:
         )
 
         assert len(runtime._controller.deliveries) == 1
+        assert [result.summary for result in session.build_report().results] == [
+            "first"
+        ]
         assert session.is_incomplete is True
         assert any("conflicting" in reason for reason in session.incomplete_reasons)
 
@@ -1035,6 +1072,10 @@ class TestControllerRuntime:
         )
 
         assert len(runtime._controller.deliveries) == 1
+        assert [result.summary for result in session.build_report().results] == [
+            "slot-a",
+            "slot-b",
+        ]
         assert session.is_incomplete is True
         assert any("conflicting" in reason for reason in session.incomplete_reasons)
 
@@ -1076,7 +1117,7 @@ class TestControllerRuntime:
             del kwargs
             raise RuntimeError("unexpected validator failure")
 
-        monkeypatch.setattr(shadow_module, "parse_envelope", _fail)
+        monkeypatch.setattr(transport_module, "parse_envelope", _fail)
 
         runtime.pytest_runtest_logreport(_make_report(encoded="{}"))
 
@@ -1100,9 +1141,6 @@ class TestControllerRuntime:
             runtime.pytest_runtest_logreport(
                 _make_report(encoded=built.encoded, nodeid=nodeid)
             )
-            session.merge_worker_results(
-                results_by_nodeid={nodeid: [_make_result(summary=nodeid)]}
-            )
         runtime.pytest_testnodedown(
             _make_node(
                 manifest=_make_manifest(
@@ -1116,9 +1154,10 @@ class TestControllerRuntime:
         _finish_runtime(runtime=runtime, config=config)
 
         assert session.is_incomplete is False
+        assert [result.summary for result in session.build_report().results] == nodeids
 
     def test_sequence_gap_marks_incomplete(self) -> None:
-        _, session, runtime = _controller_runtime()
+        config, session, runtime = _controller_runtime()
         built = build_envelope(
             results=(_make_result(),),
             nodeid="test.py::test_gap",
@@ -1137,12 +1176,13 @@ class TestControllerRuntime:
             ),
             None,
         )
+        _finish_runtime(runtime=runtime, config=config)
 
         assert session.is_incomplete is True
         assert any("sequence" in reason for reason in session.incomplete_reasons)
 
     def test_manifest_result_count_mismatch_marks_incomplete(self) -> None:
-        _, session, runtime = _controller_runtime()
+        config, session, runtime = _controller_runtime()
         built = build_envelope(
             results=(_make_result(),),
             nodeid="test.py::test_count",
@@ -1158,12 +1198,13 @@ class TestControllerRuntime:
             ),
             None,
         )
+        _finish_runtime(runtime=runtime, config=config)
 
         assert session.is_incomplete is True
         assert any("Result count" in reason for reason in session.incomplete_reasons)
 
     def test_manifest_drop_count_mismatch_marks_incomplete(self) -> None:
-        _, session, runtime = _controller_runtime()
+        config, session, runtime = _controller_runtime()
         built = build_envelope(
             results=(_make_result(),),
             nodeid="test.py::test_drop_count",
@@ -1179,6 +1220,7 @@ class TestControllerRuntime:
             ),
             None,
         )
+        _finish_runtime(runtime=runtime, config=config)
 
         assert session.is_incomplete is True
         assert any("drop count" in reason for reason in session.incomplete_reasons)
@@ -1195,14 +1237,14 @@ class TestControllerRuntime:
         _, session, runtime = _controller_runtime()
 
         runtime.pytest_testnodedown(
-            _make_node(manifest={"schema_version": SHADOW_SCHEMA_VERSION}),
+            _make_node(manifest={"schema_version": SCHEMA_VERSION}),
             None,
         )
 
         assert session.is_incomplete is True
         assert any("manifest" in reason for reason in session.incomplete_reasons)
 
-    def test_worker_loss_preserves_delivered_shadow_results(self) -> None:
+    def test_worker_loss_preserves_delivered_results(self) -> None:
         _, session, runtime = _controller_runtime()
         built = build_envelope(
             results=(_make_result(summary="delivered"),),
@@ -1223,6 +1265,9 @@ class TestControllerRuntime:
         assert len(runtime._controller.deliveries) == 1
         delivery = next(iter(runtime._controller.deliveries.values()))
         assert delivery.envelope.results[0].result.summary == "delivered"
+        assert [result.summary for result in session.build_report().results] == [
+            "delivered"
+        ]
         assert session.is_incomplete is True
 
     def test_drop_record_preserves_survivors_and_fails_closed(self) -> None:
@@ -1245,6 +1290,10 @@ class TestControllerRuntime:
 
         delivery = next(iter(runtime._controller.deliveries.values()))
         assert [item.result.summary for item in delivery.envelope.results] == [
+            "first",
+            "third",
+        ]
+        assert [result.summary for result in session.build_report().results] == [
             "first",
             "third",
         ]
@@ -1271,16 +1320,6 @@ class TestControllerRuntime:
             _make_node(manifest=_make_manifest()),
             None,
         )
-        session.merge_worker_results(
-            results_by_nodeid={
-                nodeid: [
-                    _make_result(
-                        summary="same",
-                        metadata={"_rampart_result_index": 7},
-                    )
-                ]
-            }
-        )
 
         _finish_runtime(runtime=runtime, config=config)
 
@@ -1288,37 +1327,13 @@ class TestControllerRuntime:
         [validated] = delivery.envelope.results
         assert validated.index == 0
         assert validated.result.metadata["_rampart_result_index"] == 7
+        [reported] = session.build_report().results
+        assert reported.metadata["_rampart_result_index"] == 7
         assert session.is_incomplete is False
-
-    def test_semantic_divergence_marks_incomplete(self) -> None:
-        config, session, runtime = _controller_runtime()
-        nodeid = "test.py::test_divergence"
-        built = build_envelope(
-            results=(_make_result(summary="v2"),),
-            nodeid=nodeid,
-            sequence=1,
-            limit=DEFAULT_SIZE_LIMIT_BYTES,
-        )
-        assert built.encoded is not None
-        runtime.pytest_runtest_logreport(
-            _make_report(encoded=built.encoded, nodeid=nodeid)
-        )
-        runtime.pytest_testnodedown(
-            _make_node(manifest=_make_manifest()),
-            None,
-        )
-        session.merge_worker_results(
-            results_by_nodeid={nodeid: [_make_result(summary="v1")]}
-        )
-
-        _finish_runtime(runtime=runtime, config=config)
-
-        assert session.is_incomplete is True
-        assert any("diverged" in reason for reason in session.incomplete_reasons)
 
 
 class TestSemanticNormalization:
-    def test_transport_metadata_is_excluded(self) -> None:
+    def test_controller_route_metadata_is_excluded(self) -> None:
         left = _make_result(
             metadata={
                 "_pytest_nodeid": "left",
@@ -1330,16 +1345,19 @@ class TestSemanticNormalization:
         right = _make_result(
             metadata={
                 "_pytest_nodeid": "right",
-                "_rampart_result_index": 9,
+                "_rampart_result_index": 1,
                 "_rampart_source_worker": "worker-right",
                 "evidence": "same",
             }
         )
 
-        assert _result_key(nodeid="test.py::test_key", result=left) == _result_key(
-            nodeid="test.py::test_key",
-            result=right,
-        )
+        assert _semantic_key(left) == _semantic_key(right)
+
+    def test_scheduling_index_remains_semantically_significant(self) -> None:
+        left = _make_result(metadata={"_rampart_result_index": 1})
+        right = _make_result(metadata={"_rampart_result_index": 9})
+
+        assert _semantic_key(left) != _semantic_key(right)
 
     def test_trial_batch_metadata_remains_semantically_significant(self) -> None:
         left = _make_result(
@@ -1350,24 +1368,18 @@ class TestSemanticNormalization:
         )
         right = _make_result(
             metadata={
-                "_rampart_result_index": 9,
+                "_rampart_result_index": 0,
                 "_rampart_trial_batch_index": 1,
             }
         )
 
-        assert _result_key(
-            nodeid="test.py::test_trial_key",
-            result=left,
-        ) != _result_key(nodeid="test.py::test_trial_key", result=right)
+        assert _semantic_key(left) != _semantic_key(right)
 
     def test_textual_evidence_difference_is_preserved(self) -> None:
         left = _make_result(summary="line\none")
         right = _make_result(summary="line\n two")
 
-        assert _result_key(
-            nodeid="test.py::test_text",
-            result=left,
-        ) != _result_key(nodeid="test.py::test_text", result=right)
+        assert _semantic_key(left) != _semantic_key(right)
 
     def test_list_order_and_multiplicity_are_preserved(self) -> None:
         assert _freeze_json(["a", "b"]) != _freeze_json(["b", "a"])

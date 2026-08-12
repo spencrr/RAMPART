@@ -1,23 +1,16 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-"""xdist support for RAMPART's pytest plugin.
+"""Shared pytest-xdist support and temporary clone metadata transport.
 
-Provides serialization, deserialization, and controller-side merge
-logic for running RAMPART under pytest-xdist. Workers serialize their
-``Result`` objects into ``config.workeroutput``; the controller merges
-worker payloads in ``pytest_testnodedown`` and emits a single unified
-report at session end.
-
-Worker payloads use JSON-safe primitives. Deserialization validates schema
-version, enum values, and metadata depth while preserving textual evidence.
-Terminal presentation safety is enforced only at terminal and logging
-boundaries.
+Authoritative Results travel incrementally through teardown reports. This
+module retains their full-fidelity projection codec, xdist detection and
+configuration helpers, the deprecated clone trial-spec channel, and controller
+sink discovery.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 from datetime import datetime
@@ -64,14 +57,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION: str = "rampart.xdist.v1"
-WORKEROUTPUT_KEY: str = "rampart_xdist_v1"
+TRIAL_SPECS_SCHEMA_VERSION: str = "rampart.xdist.trial-specs.v1"
+TRIAL_SPECS_WORKEROUTPUT_KEY: str = "rampart_xdist_trial_specs_v1"
 SIZE_LIMIT_OPTION: str = "rampart_xdist_max_bytes"
 DEFAULT_SIZE_LIMIT_BYTES: int = 64 * 1024 * 1024
 MAX_METADATA_DEPTH: int = 6
 
-_TRUNCATED_MARKER: str = "rampart_truncated"
 _TRANSPORT_ERROR_MARKER: str = "rampart_transport_error"
+_TRIAL_SPEC_KEYS: frozenset[str] = frozenset(
+    {"base_nodeid", "clone_nodeid", "threshold"},
+)
+_TRIAL_SPECS_PAYLOAD_KEYS: frozenset[str] = frozenset({"schema", "trial_specs"})
+_TRIAL_SPECS_ERROR_PAYLOAD_KEYS: frozenset[str] = frozenset(
+    {"schema", "trial_specs", _TRANSPORT_ERROR_MARKER},
+)
 
 
 class WorkerOutputError(Exception):
@@ -80,10 +79,6 @@ class WorkerOutputError(Exception):
 
 class SchemaVersionError(WorkerOutputError):
     """Raised when a worker payload has missing or unknown schema version."""
-
-
-class SizeLimitError(WorkerOutputError):
-    """Raised when a worker payload exceeds the configured size cap."""
 
 
 class TrialSpecValidationError(WorkerOutputError):
@@ -559,26 +554,6 @@ def _serialize_trial_spec(
     }
 
 
-def _serialize_results_by_nodeid(
-    *,
-    session: RampartSession,
-) -> dict[str, list[dict[str, Any]]]:
-    """Serialize all worker Results grouped by pytest node ID.
-
-    Args:
-        session (RampartSession): The worker session state.
-
-    Returns:
-        dict[str, list[dict[str, Any]]]: Serialized Results keyed by node ID.
-    """
-    serialized: dict[str, list[dict[str, Any]]] = {}
-    for nodeid, results in session.results_by_nodeid.items():
-        serialized[nodeid] = [
-            _serialize_result(result=r, nodeid=nodeid) for r in results
-        ]
-    return serialized
-
-
 def _serialize_trial_specs(*, session: RampartSession) -> list[dict[str, str | float]]:
     """Serialize all worker trial specifications.
 
@@ -597,78 +572,27 @@ def _serialize_trial_specs(*, session: RampartSession) -> list[dict[str, str | f
     ]
 
 
-def _build_worker_payload(
+def _build_trial_specs_payload(
     *,
-    results_by_nodeid: dict[str, list[dict[str, Any]]],
     trial_specs: list[dict[str, str | float]],
     transport_error: TrialSpecValidationError | None = None,
 ) -> dict[str, Any]:
-    """Build a payload from independently serialized sections.
+    """Build the temporary exact clone trial-spec payload.
 
     Args:
-        results_by_nodeid (dict[str, list[dict[str, Any]]]): Serialized Results.
         trial_specs (list[dict[str, str | float]]): Serialized trial specs.
         transport_error (TrialSpecValidationError | None): Trial transport error.
 
     Returns:
-        dict[str, Any]: The current-schema worker payload.
+        dict[str, Any]: The temporary trial-spec worker payload.
     """
     payload: dict[str, Any] = {
-        "schema": SCHEMA_VERSION,
-        "results_by_nodeid": results_by_nodeid,
+        "schema": TRIAL_SPECS_SCHEMA_VERSION,
         "trial_specs": trial_specs,
     }
     if transport_error is not None:
-        payload[_TRANSPORT_ERROR_MARKER] = str(transport_error)
+        payload[_TRANSPORT_ERROR_MARKER] = bounded_text(str(transport_error))
     return payload
-
-
-def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
-    """Serialize a worker's RampartSession state for transport to the controller.
-
-    Args:
-        session (RampartSession): The worker's session state.
-
-    Returns:
-        dict[str, Any]: A current-schema, JSON-safe worker payload.
-
-    Raises:
-        TrialSpecValidationError: If an internal trial threshold is invalid.
-    """
-    results_by_nodeid = _serialize_results_by_nodeid(session=session)
-    trial_specs = _serialize_trial_specs(session=session)
-    return _build_worker_payload(
-        results_by_nodeid=results_by_nodeid,
-        trial_specs=trial_specs,
-    )
-
-
-def _validate_schema(*, data: object) -> dict[str, Any]:
-    """Validate that ``data`` is a worker payload of the expected schema.
-
-    Returns:
-        dict[str, Any]: The validated payload as a typed dict.
-
-    Raises:
-        SchemaVersionError: If the ``schema`` key is missing or unknown.
-        WorkerOutputError: If ``data`` is not a dict.
-    """
-    if type(data) is not dict:
-        msg = _expected_type_message(expected="dict worker payload", value=data)
-        raise WorkerOutputError(msg)
-    typed = cast("dict[str, Any]", data)
-    schema = typed.get("schema")
-    if schema is None:
-        msg = "Worker payload missing required 'schema' key."
-        raise SchemaVersionError(msg)
-    if type(schema) is not str or schema != SCHEMA_VERSION:
-        msg = bounded_text(
-            f"Worker payload schema {bounded_repr(schema)} does not match "
-            f"controller schema {bounded_repr(SCHEMA_VERSION)}; rejecting to avoid "
-            "best-effort parsing of an unknown format."
-        )
-        raise SchemaVersionError(msg)
-    return typed
 
 
 def _deserialize_safety_status(*, value: object) -> SafetyStatus:
@@ -1091,144 +1015,54 @@ def _deserialize_result(*, data: object) -> Result:
     )
 
 
-def deserialize_worker_data(*, data: object) -> dict[str, list[Result]]:
-    """Deserialize a worker payload back into a ``results_by_nodeid`` mapping.
-
-    Performs strict schema validation: missing ``schema`` key, unknown
-    versions, and malformed enum values all raise ``WorkerOutputError``
-    (or subclass). Caller should catch and mark the run incomplete
-    rather than letting the exception propagate to pytest.
-
-    Each result's ``metadata["_pytest_nodeid"]`` and
-    ``metadata["_rampart_result_index"]`` are set authoritatively from the
-    outer mapping key and list position so cross-worker ordering is total
-    and independent of any (untrusted) serialized values.
-
-    Args:
-        data (object): The deserialized JSON object from
-            ``node.workeroutput``.
-
-    Returns:
-        dict[str, list[Result]]: Results grouped by nodeid.
-
-    Raises:
-        SchemaVersionError: Missing or unknown schema version.
-        WorkerOutputError: Malformed payload (type errors, bad enums).
-    """
-    typed = _validate_schema(data=data)
-    if "results_by_nodeid" not in typed:
-        msg = f"Worker missing required 'results_by_nodeid' for {SCHEMA_VERSION}."
-        raise WorkerOutputError(msg)
-    raw_results = typed["results_by_nodeid"]
-    if type(raw_results) is not dict:
-        msg = _expected_type_message(
-            expected="dict for results_by_nodeid",
-            value=raw_results,
-        )
-        raise WorkerOutputError(msg)
-    out: dict[str, list[Result]] = {}
-    for nodeid, results_data in dict.items(cast("dict[Any, Any]", raw_results)):
-        if type(nodeid) is not str:
-            msg = _expected_type_message(
-                expected="nonempty string key for results_by_nodeid",
-                value=nodeid,
-            )
-            raise WorkerOutputError(msg)
-        if not nodeid:
-            msg = "results_by_nodeid keys must not be empty."
-            raise WorkerOutputError(msg)
-        if type(results_data) is not list:
-            msg = _expected_type_message(
-                expected=f"list for results_by_nodeid[{bounded_repr(nodeid)}]",
-                value=results_data,
-            )
-            raise WorkerOutputError(msg)
-        deserialized: list[Result] = []
-        for index, raw_result in enumerate(cast("list[Any]", results_data)):
-            result = _deserialize_result(data=raw_result)
-            result.metadata["_pytest_nodeid"] = nodeid
-            result.metadata["_rampart_result_index"] = index
-            deserialized.append(result)
-        out[nodeid] = deserialized
-    return out
-
-
 def deserialize_trial_specs(*, data: object) -> dict[str, TrialSpec]:
-    """Deserialize the ``trial_specs`` section of a worker payload.
+    """Deserialize the exact temporary clone trial-spec payload.
 
-    The current schema requires the block; an empty list represents a
-    worker with no trials. Every entry must be structurally valid and
-    contain a valid threshold.
+    An empty list represents a worker with no deprecated clone trials.
+    Result blocks and all other extra fields are rejected.
 
     Args:
-        data (object): The deserialized JSON object from
-            ``node.workeroutput``.
+        data (object): The value stored under the trial-spec workeroutput key.
 
     Returns:
         dict[str, TrialSpec]: Trial specs keyed by clone node ID.
 
     Raises:
         SchemaVersionError: Missing or unknown schema version.
-        WorkerOutputError: ``data`` is not a dict payload.
-        TrialSpecValidationError: A current-schema threshold is invalid.
+        WorkerOutputError: ``data`` is not an exact supported payload.
+        TrialSpecValidationError: A trial entry or error marker is invalid.
     """
-    typed = _validate_schema(data=data)
-    if "trial_specs" not in typed:
-        msg = f"Worker payload missing required 'trial_specs' for {SCHEMA_VERSION}."
-        raise TrialSpecValidationError(msg)
-    raw_specs = typed["trial_specs"]
-    if not isinstance(raw_specs, list):
-        msg = _expected_type_message(
-            expected="list for trial_specs",
-            value=raw_specs,
-        )
-        raise TrialSpecValidationError(msg)
+    typed = _validate_trial_specs_payload(data=data)
+    raw_specs = cast("list[object]", typed["trial_specs"])
     out: dict[str, TrialSpec] = {}
-    for index, spec in enumerate(cast("list[Any]", raw_specs)):
-        if not isinstance(spec, dict):
-            msg = _expected_type_message(
-                expected=f"dict for trial_specs[{index}]",
-                value=spec,
-            )
-            raise TrialSpecValidationError(msg)
-        spec_dict = cast("dict[str, Any]", spec)
-        clone_nodeid = spec_dict.get("clone_nodeid")
-        base_nodeid = spec_dict.get("base_nodeid")
-        if type(clone_nodeid) is not str or type(base_nodeid) is not str:
-            msg = f"trial_specs[{index}] requires string clone_nodeid and base_nodeid."
-            raise TrialSpecValidationError(msg)
-        if not clone_nodeid or not base_nodeid:
-            msg = f"trial_specs[{index}] node IDs must not be empty."
-            raise TrialSpecValidationError(msg)
-        threshold = _validate_trial_threshold(
-            value=spec_dict.get("threshold"),
-            context=f"Trial threshold for {bounded_repr(clone_nodeid)}",
+    for index, raw_spec in enumerate(raw_specs):
+        clone_nodeid, spec = _deserialize_trial_spec(
+            value=raw_spec,
+            index=index,
         )
-        out[clone_nodeid] = TrialSpec(
-            base_nodeid=base_nodeid,
-            threshold=threshold,
-        )
+        if clone_nodeid in out:
+            msg = f"trial_specs contains duplicate clone_nodeid at index {index}."
+            raise TrialSpecValidationError(msg)
+        out[clone_nodeid] = spec
     return out
 
 
-def finalize_worker(*, config: pytest.Config, session: RampartSession) -> None:
-    """Serialize the worker's session state into ``config.workeroutput``.
+def finalize_trial_specs_worker(
+    *,
+    config: pytest.Config,
+    session: RampartSession,
+) -> None:
+    """Write only deprecated clone metadata into workeroutput.
 
-    Called from ``pytest_sessionfinish`` on each xdist worker. The
-    worker skips sink emission entirely; the controller is responsible
-    for the final report.
+    Authoritative Results are never serialized here. An explicit error payload
+    is written before an invalid internal trial specification is re-raised.
 
     Args:
         config (pytest.Config): The pytest configuration object.
         session (RampartSession): The worker's session state.
 
     Raises:
-        TrialSpecValidationError: If a trial threshold is invalid. An
-            explicit transport-error marker is written before raising.
-        SizeLimitError: If the serialized payload exceeds the
-            configured cap. The truncation marker is still written to
-            ``workeroutput`` before the exception is raised so the
-            controller can record the run as incomplete.
+        TrialSpecValidationError: If an internal trial spec is invalid.
     """
     if not is_xdist_worker(config=config):
         return
@@ -1236,199 +1070,115 @@ def finalize_worker(*, config: pytest.Config, session: RampartSession) -> None:
         "dict[str, Any]",
         config.workeroutput,  # ty: ignore[unresolved-attribute]
     )
-    results_by_nodeid = _serialize_results_by_nodeid(session=session)
-    trial_error: TrialSpecValidationError | None = None
     try:
         trial_specs = _serialize_trial_specs(session=session)
     except TrialSpecValidationError as exc:
-        trial_specs = []
-        trial_error = exc
-    payload = _build_worker_payload(
-        results_by_nodeid=results_by_nodeid,
-        trial_specs=trial_specs,
-        transport_error=trial_error,
-    )
-    encoded = json.dumps(payload, default=str)
-    size = len(encoded.encode("utf-8"))
-    limit = _size_limit(config=config)
-    if size > limit:
-        workeroutput[WORKEROUTPUT_KEY] = {
-            "schema": SCHEMA_VERSION,
-            _TRUNCATED_MARKER: True,
-            "size_bytes": size,
-            "limit_bytes": limit,
-        }
-        msg = (
-            f"Worker payload size {size} bytes exceeds cap of {limit}; "
-            f"truncated. Increase --{SIZE_LIMIT_OPTION.replace('_', '-')} "
-            f"(or the {SIZE_LIMIT_OPTION} ini option) to raise the cap."
+        workeroutput[TRIAL_SPECS_WORKEROUTPUT_KEY] = _build_trial_specs_payload(
+            trial_specs=[],
+            transport_error=exc,
         )
-        raise SizeLimitError(msg)
-    logger.debug("Worker payload size: %d bytes", size)
-    workeroutput[WORKEROUTPUT_KEY] = payload
-    if trial_error is not None:
-        raise trial_error
+        raise
+    workeroutput[TRIAL_SPECS_WORKEROUTPUT_KEY] = _build_trial_specs_payload(
+        trial_specs=trial_specs,
+    )
 
 
-def _safe_deserialize_trial_specs(
+def _validate_trial_specs_payload(*, data: object) -> dict[str, Any]:
+    """Return one exact supported temporary trial-spec payload.
+
+    Raises:
+        SchemaVersionError: If the schema does not match.
+        TrialSpecValidationError: If the payload structure is invalid.
+        WorkerOutputError: If the payload is not an exact dictionary.
+    """
+    if type(data) is not dict:
+        msg = _expected_type_message(
+            expected="exact trial-spec payload dict",
+            value=data,
+        )
+        raise WorkerOutputError(msg)
+    typed = cast("dict[object, Any]", data)
+    keys = frozenset(dict.keys(typed))
+    if any(type(key) is not str for key in keys):
+        msg = "Trial-spec payload keys must be exact strings."
+        raise TrialSpecValidationError(msg)
+    if keys not in {_TRIAL_SPECS_PAYLOAD_KEYS, _TRIAL_SPECS_ERROR_PAYLOAD_KEYS}:
+        msg = "Trial-spec payload contains unsupported or missing fields."
+        raise TrialSpecValidationError(msg)
+    schema = typed["schema"]
+    if type(schema) is not str or schema != TRIAL_SPECS_SCHEMA_VERSION:
+        msg = bounded_text(
+            f"Trial-spec schema {bounded_repr(schema)} does not match "
+            f"{bounded_repr(TRIAL_SPECS_SCHEMA_VERSION)}."
+        )
+        raise SchemaVersionError(msg)
+    raw_specs = typed["trial_specs"]
+    if type(raw_specs) is not list:
+        msg = _expected_type_message(
+            expected="exact list for trial_specs",
+            value=raw_specs,
+        )
+        raise TrialSpecValidationError(msg)
+    if _TRANSPORT_ERROR_MARKER in typed:
+        _raise_trial_transport_error(
+            error=typed[_TRANSPORT_ERROR_MARKER],
+            raw_specs=cast("list[object]", raw_specs),
+        )
+    return cast("dict[str, Any]", typed)
+
+
+def _raise_trial_transport_error(*, error: object, raw_specs: list[object]) -> None:
+    """Raise the explicit worker-side trial transport failure.
+
+    Raises:
+        TrialSpecValidationError: Always, with validated bounded context.
+    """
+    if type(error) is not str or not error:
+        msg = "Trial-spec transport error must be a nonempty exact string."
+        raise TrialSpecValidationError(msg)
+    if raw_specs:
+        msg = "Trial-spec error payload must not include trial specs."
+        raise TrialSpecValidationError(msg)
+    msg = f"Worker trial-spec serialization failed: {bounded_text(error)}"
+    raise TrialSpecValidationError(msg)
+
+
+def _deserialize_trial_spec(
     *,
-    session: RampartSession,
-    payload: object,
-    worker_id_str: str,
-) -> dict[str, TrialSpec]:
-    """Deserialize trial specs from a worker payload without raising.
-
-    A missing or corrupt block must not block result merging, but it marks
-    the controller run incomplete.
-
-    Args:
-        session (RampartSession): The controller session to mark incomplete.
-        payload (object): The deserialized worker payload.
-        worker_id_str (str): Worker identifier for logging.
+    value: object,
+    index: int,
+) -> tuple[str, TrialSpec]:
+    """Deserialize one exact trial-spec record.
 
     Returns:
-        dict[str, TrialSpec]: Specs keyed by clone nodeid (possibly empty).
+        tuple[str, TrialSpec]: Clone node ID and validated specification.
+
+    Raises:
+        TrialSpecValidationError: If the record is malformed.
     """
-    try:
-        return deserialize_trial_specs(data=payload)
-    except WorkerOutputError as exc:
-        logger.warning(
-            "Failed to deserialize trial specs from worker %s: %s",
-            escape_terminal_controls(worker_id_str),
-            escape_terminal_controls(str(exc)),
+    if type(value) is not dict:
+        msg = _expected_type_message(
+            expected=f"exact dict for trial_specs[{index}]",
+            value=value,
         )
-        session.mark_incomplete(
-            reason=f"worker {worker_id_str} trial spec validation failed: {exc}",
-        )
-        return {}
-
-
-def _tag_source_worker(
-    *,
-    results_by_nodeid: dict[str, list[Result]],
-    worker_id_str: str,
-) -> None:
-    """Tag each merged result with the worker it came from.
-
-    Used as the final ordering tie-breaker so the same nodeid arriving
-    from multiple workers (e.g. ``--dist=each``) stays totally ordered.
-
-    Args:
-        results_by_nodeid (dict[str, list[Result]]): The deserialized
-            worker results to tag in place.
-        worker_id_str (str): The originating worker identifier.
-    """
-    for results in results_by_nodeid.values():
-        for result in results:
-            result.metadata["_rampart_source_worker"] = worker_id_str
-
-
-def handle_testnodedown(
-    *,
-    session: RampartSession,
-    node: object,
-    error: object,
-) -> None:
-    """Merge a finished worker's results into the controller session.
-
-    Called from ``pytest_testnodedown`` on the controller for each
-    worker that completes. Failures (missing payload, deserialization
-    errors, worker crashes) are recorded via ``mark_incomplete`` rather
-    than raised, so a single bad worker does not abort report emission.
-
-    Args:
-        session (RampartSession): The controller's session state.
-        node: The xdist node object (has ``workeroutput`` attribute).
-        error: The shutdown error from xdist, or None on clean exit.
-    """
-    worker_id = getattr(node, "gateway", None)
-    worker_id_str = str(getattr(worker_id, "id", node)) if worker_id else str(node)
-    display_worker_id = escape_terminal_controls(worker_id_str)
-    if error is not None:
-        logger.warning(
-            "Worker %s reported shutdown error; report will be incomplete: %s",
-            display_worker_id,
-            escape_terminal_controls(str(error)),
-        )
-        session.mark_incomplete(reason=f"worker {worker_id_str} error: {error}")
-        return
-    workeroutput = getattr(node, "workeroutput", None)
-    if not isinstance(workeroutput, dict):
-        logger.warning(
-            "Worker %s exited without workeroutput; report will be incomplete.",
-            display_worker_id,
-        )
-        session.mark_incomplete(reason=f"worker {worker_id_str} missing workeroutput")
-        return
-    payload: Any = cast("dict[str, Any]", workeroutput).get(WORKEROUTPUT_KEY)
-    if payload is None:
-        logger.warning(
-            "Worker %s did not produce RAMPART output; report will be incomplete.",
-            display_worker_id,
-        )
-        session.mark_incomplete(reason=f"worker {worker_id_str} missing RAMPART output")
-        return
-    typed_payload_dict: dict[str, Any] | None = (
-        cast("dict[str, Any]", payload) if isinstance(payload, dict) else None
+        raise TrialSpecValidationError(msg)
+    typed = cast("dict[object, object]", value)
+    if frozenset(dict.keys(typed)) != _TRIAL_SPEC_KEYS:
+        msg = f"trial_specs[{index}] must contain exactly three supported fields."
+        raise TrialSpecValidationError(msg)
+    clone_nodeid = typed["clone_nodeid"]
+    base_nodeid = typed["base_nodeid"]
+    if type(clone_nodeid) is not str or type(base_nodeid) is not str:
+        msg = f"trial_specs[{index}] requires exact string node IDs."
+        raise TrialSpecValidationError(msg)
+    if not clone_nodeid or not base_nodeid:
+        msg = f"trial_specs[{index}] node IDs must not be empty."
+        raise TrialSpecValidationError(msg)
+    threshold = _validate_trial_threshold(
+        value=typed["threshold"],
+        context=f"Trial threshold for {bounded_repr(clone_nodeid)}",
     )
-    if typed_payload_dict is not None and typed_payload_dict.get(_TRUNCATED_MARKER):
-        logger.error(
-            "Worker %s payload was truncated due to size cap; "
-            "report will be incomplete.",
-            display_worker_id,
-        )
-        session.mark_incomplete(
-            reason=f"worker {worker_id_str} payload truncated (size cap)",
-        )
-        return
-    transport_error = (
-        typed_payload_dict.get(_TRANSPORT_ERROR_MARKER)
-        if typed_payload_dict is not None
-        else None
-    )
-    try:
-        results_by_nodeid = deserialize_worker_data(data=cast("object", payload))
-    except WorkerOutputError as exc:
-        logger.error(  # ruff: ignore[error-instead-of-exception] — sanitized trace
-            "Failed to deserialize worker %s output; report will be incomplete: %s",
-            display_worker_id,
-            format_exception_for_terminal(exc),
-        )
-        session.mark_incomplete(
-            reason=f"worker {worker_id_str} deserialization failed: {exc}",
-        )
-        return
-    trial_specs = (
-        {}
-        if transport_error is not None
-        else _safe_deserialize_trial_specs(
-            session=session,
-            payload=cast("object", payload),
-            worker_id_str=worker_id_str,
-        )
-    )
-    _tag_source_worker(
-        results_by_nodeid=results_by_nodeid,
-        worker_id_str=worker_id_str,
-    )
-    session.merge_worker_results(results_by_nodeid=results_by_nodeid)
-    if trial_specs:
-        session.merge_trial_specs(trial_specs=trial_specs)
-    if transport_error is not None:
-        reason = bounded_text(transport_error)
-        logger.error(
-            "Worker %s RAMPART transport validation failed: %s",
-            display_worker_id,
-            reason,
-        )
-        session.mark_incomplete(
-            reason=f"worker {worker_id_str} transport validation failed: {reason}",
-        )
-    logger.info(
-        "Merged %d result group(s) from worker %s.",
-        len(results_by_nodeid),
-        display_worker_id,
-    )
+    return clone_nodeid, TrialSpec(base_nodeid=base_nodeid, threshold=threshold)
 
 
 def discover_sinks_from_conftest(*, config: pytest.Config) -> list[ReportSink]:

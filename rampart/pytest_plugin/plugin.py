@@ -58,20 +58,18 @@ from rampart.pytest_plugin._session import RampartSession, TrialSpec
 from rampart.pytest_plugin._xdist import (
     DEFAULT_SIZE_LIMIT_BYTES,
     SIZE_LIMIT_OPTION,
-    SizeLimitError,
     TrialSpecValidationError,
     discover_sinks_from_conftest,
-    finalize_worker,
+    finalize_trial_specs_worker,
     get_dist_mode,
     get_worker_count,
-    handle_testnodedown,
     is_xdist_controller,
     is_xdist_worker,
 )
-from rampart.pytest_plugin._xdist_shadow import (
-    SHADOW_RUNTIME_KEY,
-    SHADOW_RUNTIME_PLUGIN_NAME,
-    XdistShadowRuntime,
+from rampart.pytest_plugin._xdist_transport import (
+    RUNTIME_KEY,
+    RUNTIME_PLUGIN_NAME,
+    XdistResultTransport,
 )
 from rampart.reporting.sink import ReportSink
 
@@ -90,7 +88,6 @@ __all__ = [
     "pytest_runtest_makereport",
     "pytest_sessionfinish",
     "pytest_terminal_summary",
-    "pytest_testnodedown",
     "pytest_unconfigure",
 ]
 
@@ -226,15 +223,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         type=int,
         default=None,
         help=(
-            "Maximum size in bytes of a worker's serialized result payload "
-            f"under pytest-xdist (default: {DEFAULT_SIZE_LIMIT_BYTES})."
+            "Maximum UTF-8 size in bytes of each authoritative RAMPART Result "
+            "envelope under pytest-xdist "
+            f"(default: {DEFAULT_SIZE_LIMIT_BYTES})."
         ),
     )
     parser.addini(
         SIZE_LIMIT_OPTION,
         help=(
-            "Maximum size in bytes of a worker's serialized result payload "
-            f"under pytest-xdist (default: {DEFAULT_SIZE_LIMIT_BYTES})."
+            "Maximum UTF-8 size in bytes of each authoritative RAMPART Result "
+            "envelope under pytest-xdist "
+            f"(default: {DEFAULT_SIZE_LIMIT_BYTES})."
         ),
         default=None,
     )
@@ -266,15 +265,15 @@ def pytest_configure(config: pytest.Config) -> None:
     rampart_session = RampartSession()
     config.stash[_rampart_key] = rampart_session
     config.stash[_session_start_key] = time.monotonic()
-    shadow_runtime = XdistShadowRuntime(
+    transport = XdistResultTransport(
         config=config,
         session=rampart_session,
     )
     config.pluginmanager.register(
-        shadow_runtime,
-        name=SHADOW_RUNTIME_PLUGIN_NAME,
+        transport,
+        name=RUNTIME_PLUGIN_NAME,
     )
-    config.stash[SHADOW_RUNTIME_KEY] = shadow_runtime
+    config.stash[RUNTIME_KEY] = transport
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
@@ -284,10 +283,10 @@ def pytest_unconfigure(config: pytest.Config) -> None:
         config (pytest.Config): The pytest configuration object.
     """
     clear_default_handler_factory()
-    shadow_runtime = config.stash.get(SHADOW_RUNTIME_KEY, None)
-    if shadow_runtime is not None:
-        config.pluginmanager.unregister(shadow_runtime)
-        del config.stash[SHADOW_RUNTIME_KEY]
+    transport = config.stash.get(RUNTIME_KEY, None)
+    if transport is not None:
+        config.pluginmanager.unregister(transport)
+        del config.stash[RUNTIME_KEY]
     if _rampart_key in config.stash:
         del config.stash[_rampart_key]
     if _session_start_key in config.stash:
@@ -514,14 +513,14 @@ def _rampart_collect(  # pytest discovers this via autouse=True
             node=node,
             collector=collector,
         )
-        shadow_runtime = request.config.stash.get(SHADOW_RUNTIME_KEY, None)
-        if shadow_runtime is not None:
+        transport = request.config.stash.get(RUNTIME_KEY, None)
+        if transport is not None:
             if absorbed is None:
-                shadow_runtime.record_source_failure(
+                transport.record_source_failure(
                     result_count=len(collector.results),
                 )
             else:
-                shadow_runtime.remember_results(item=node, results=absorbed)
+                transport.remember_results(item=node, results=absorbed)
 
     # Note: collector.results returns a copy of the internal list,
     # so reading it after deactivation and absorption is safe.
@@ -853,10 +852,10 @@ def pytest_sessionfinish(
 
     Dispatches between three modes:
 
-    - xdist worker: serialize results to ``config.workeroutput`` and
-      skip sink emission (the controller emits the unified report).
-    - xdist controller: trials already aggregated against the merged
-      ``_results_by_nodeid``; resolve sinks via the
+    - xdist worker: publish only clean-finish clone metadata and skip sink
+      emission (the controller receives Results incrementally).
+    - xdist controller: authoritative Results are already appended from
+      teardown envelopes; resolve sinks via the
       ``pytest_rampart_sinks`` hook (falling back to conftest discovery),
       evaluate gates, and emit.
     - non-xdist: original single-process pipeline (aggregate, gate,
@@ -882,8 +881,11 @@ def pytest_sessionfinish(
 
     if is_xdist_worker(config=session.config):
         try:
-            finalize_worker(config=session.config, session=rampart_session)
-        except (SizeLimitError, TrialSpecValidationError) as exc:
+            finalize_trial_specs_worker(
+                config=session.config,
+                session=rampart_session,
+            )
+        except TrialSpecValidationError as exc:
             logger.warning("%s", exc)
         return
 
@@ -913,28 +915,6 @@ def pytest_sessionfinish(
         rampart_session.add_sinks(sinks=_resolve_hook_sinks(config=session.config))
     _emit_sinks(rampart_session=rampart_session)
     _warn_trial_marker_deprecated(rampart_session=rampart_session)
-
-
-@pytest.hookimpl(optionalhook=True)
-def pytest_testnodedown(node: object, error: object) -> None:
-    """Merge a finished xdist worker's results into the controller session.
-
-    Thin delegate to ``_xdist.handle_testnodedown`` so plugin.py stays
-    focused on hook registration. Registered as ``optionalhook`` so
-    pytest does not warn when pytest-xdist is not installed.
-
-    Args:
-        node: The xdist worker node that has finished.
-        error: The shutdown error reported by xdist, or None on
-            clean exit.
-    """
-    config = getattr(node, "config", None)
-    if config is None:
-        return
-    rampart_session = config.stash.get(_rampart_key, None)
-    if rampart_session is None:
-        return
-    handle_testnodedown(session=rampart_session, node=node, error=error)
 
 
 def _record_xdist_metadata(

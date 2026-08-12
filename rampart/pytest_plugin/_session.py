@@ -75,6 +75,15 @@ def _result_sort_key(result: Result) -> tuple[str, int, str]:
 
 
 @dataclass(frozen=True, kw_only=True)
+class _TransportPosition:
+    """Internal structural identity for one transported Result."""
+
+    worker_id: str
+    sequence: int
+    local_slot: int
+
+
+@dataclass(frozen=True, kw_only=True)
 class TrialSpec:
     """Trial-clone metadata captured at collection time.
 
@@ -155,6 +164,9 @@ class RampartSession:
         self._incomplete: bool = False
         self._incomplete_reasons: list[str] = []
         self._report_metadata: dict[str, object] = {}
+        self._transport_positions: dict[int, _TransportPosition] = {}
+        self._append_ordinals: dict[int, int] = {}
+        self._next_append_ordinal: int = 0
 
     @property
     def sinks(self) -> list[ReportSink]:
@@ -249,8 +261,7 @@ class RampartSession:
         )
 
         collected = collector.results
-        node_results = self._results_by_nodeid.setdefault(node.nodeid, [])
-        result_index_offset = len(node_results)
+        result_index_offset = len(self._results_by_nodeid.get(node.nodeid, ()))
         tagged: list[Result] = []
         for result_index, original_result in enumerate(collected):
             # Shallow copy is sufficient because we reconstruct all
@@ -264,9 +275,53 @@ class RampartSession:
             if harm_category is not None and result.harm_category is None:
                 result.harm_category = harm_category
             tagged.append(result)
-        self._results.extend(tagged)
-        node_results.extend(tagged)
-        self._cached_report = None
+        self._append_results(nodeid=node.nodeid, results=tagged)
+        return tuple(tagged)
+
+    def append_transported_results(
+        self,
+        *,
+        nodeid: str,
+        source_worker: str,
+        sequence: int,
+        results: Sequence[tuple[int, Result]],
+    ) -> tuple[Result, ...]:
+        """Append one validated xdist envelope's successful Result records.
+
+        Controller route metadata is applied to shallow Result copies while
+        worker scheduling metadata remains untouched. Envelope sequence and
+        local slots are retained only in internal ordering state.
+
+        Args:
+            nodeid (str): Authoritative node ID reconstructed by pytest-xdist.
+            source_worker (str): Authoritative xdist worker identifier.
+            sequence (int): Positive worker-local envelope sequence.
+            results (Sequence[tuple[int, Result]]): Validated local slots and
+                their Results.
+
+        Returns:
+            tuple[Result, ...]: The exact Result copies appended to the session.
+
+        Raises:
+            ValueError: If route or structural identity is invalid.
+            TypeError: If a transported value is not a Result.
+        """
+        self._validate_transport_route(
+            nodeid=nodeid,
+            source_worker=source_worker,
+            sequence=sequence,
+        )
+        tagged, positions = self._stage_transported_results(
+            nodeid=nodeid,
+            source_worker=source_worker,
+            sequence=sequence,
+            results=results,
+        )
+        self._append_results(
+            nodeid=nodeid,
+            results=tagged,
+            transport_positions=positions,
+        )
         return tuple(tagged)
 
     def record_trial_group(
@@ -364,21 +419,28 @@ class RampartSession:
         self,
         *,
         trial_specs: Mapping[str, TrialSpec],
-    ) -> None:
+    ) -> tuple[str, ...]:
         """Merge trial specs received from an xdist worker payload.
 
         Idempotent: re-merging identical specs is a no-op. Spec values
-        from workers should match the controller's own collection
-        because the same plugin code runs in every process; we merge
-        defensively so the controller can aggregate correctly even
-        when its own collection state is unavailable.
+        from workers should match because the same plugin code runs in every
+        process. Conflicting values never replace the first trusted spec.
 
         Args:
             trial_specs (Mapping[str, TrialSpec]): Specs keyed by
                 clone node ID.
+
+        Returns:
+            tuple[str, ...]: Clone node IDs whose specs conflicted.
         """
+        conflicts: list[str] = []
         for clone_nodeid, spec in trial_specs.items():
-            self._trial_specs.setdefault(clone_nodeid, spec)
+            existing = self._trial_specs.get(clone_nodeid)
+            if existing is None:
+                self._trial_specs[clone_nodeid] = spec
+            elif existing != spec:
+                conflicts.append(clone_nodeid)
+        return tuple(conflicts)
 
     @property
     def has_results(self) -> bool:
@@ -394,26 +456,6 @@ class RampartSession:
     def trial_specs(self) -> dict[str, TrialSpec]:
         """Read-only view of registered trial specs, keyed by clone node ID."""
         return dict(self._trial_specs)
-
-    def merge_worker_results(
-        self,
-        *,
-        results_by_nodeid: dict[str, list[Result]],
-    ) -> None:
-        """Merge an xdist worker's results into this session.
-
-        Extends both the flat ``_results`` list and the
-        ``_results_by_nodeid`` mapping. Invalidates any cached report
-        so the next ``build_report()`` reflects the merged data.
-
-        Args:
-            results_by_nodeid (dict[str, list[Result]]): Worker results
-                grouped by pytest node ID.
-        """
-        for nodeid, results in results_by_nodeid.items():
-            self._results.extend(results)
-            self._results_by_nodeid.setdefault(nodeid, []).extend(results)
-        self._cached_report = None
 
     def mark_emitted(self) -> None:
         """Mark the session as having attempted report emission."""
@@ -451,10 +493,11 @@ class RampartSession:
         or when metadata is updated.
 
         Results are sorted by ``(_pytest_nodeid, _rampart_result_index,
-        _rampart_source_worker)`` for a total, deterministic ordering across
-        xdist worker completion orders. ``_pytest_nodeid`` falls back to
-        ``_pytest_test_name`` and ``_rampart_source_worker`` is absent
-        (constant) outside xdist, so single-process ordering is unaffected.
+        _rampart_source_worker)`` plus private envelope sequence/local-slot
+        tie breakers for a total, deterministic ordering across xdist arrival
+        orders. ``_pytest_nodeid`` falls back to ``_pytest_test_name`` and
+        transport positions are absent outside xdist, so single-process
+        ordering is unaffected.
 
         These leading-underscore keys are RAMPART scheduling bookkeeping,
         namespaced to avoid colliding with user-supplied result metadata.
@@ -464,7 +507,7 @@ class RampartSession:
         """
         if self._cached_report is not None:
             return self._cached_report
-        sorted_results = sorted(self._results, key=_result_sort_key)
+        sorted_results = sorted(self._results, key=self._stored_result_sort_key)
         trial_batches, trial_diagnostics = _summarize_trial_batches(
             results=sorted_results,
         )
@@ -490,3 +533,119 @@ class RampartSession:
             trial_batches=trial_batches,
         )
         return self._cached_report
+
+    def _append_results(
+        self,
+        *,
+        nodeid: str,
+        results: Sequence[Result],
+        transport_positions: Sequence[_TransportPosition] | None = None,
+    ) -> None:
+        """Append staged Results to every session view and invalidate caches.
+
+        Raises:
+            ValueError: If transport positions do not align with Results.
+        """
+        staged_results = list(results)
+        positions = (
+            [None] * len(staged_results)
+            if transport_positions is None
+            else list(transport_positions)
+        )
+        if len(positions) != len(staged_results):
+            msg = "Transport positions must align one-to-one with Results."
+            raise ValueError(msg)
+        start = self._next_append_ordinal
+        ordinals = {
+            id(result): start + offset for offset, result in enumerate(staged_results)
+        }
+        positioned = {
+            id(result): position
+            for result, position in zip(staged_results, positions, strict=True)
+            if position is not None
+        }
+        node_results = self._results_by_nodeid.setdefault(nodeid, [])
+        self._results.extend(staged_results)
+        node_results.extend(staged_results)
+        self._append_ordinals.update(ordinals)
+        self._transport_positions.update(positioned)
+        self._next_append_ordinal += len(staged_results)
+        self._cached_report = None
+
+    def _stored_result_sort_key(
+        self,
+        result: Result,
+    ) -> tuple[str, int, str, int, int, int]:
+        """Return deterministic report ordering with private route tie breakers."""
+        position = self._transport_positions.get(id(result))
+        sequence = position.sequence if position is not None else -1
+        local_slot = position.local_slot if position is not None else -1
+        ordinal = self._append_ordinals.get(id(result), -1)
+        return (*_result_sort_key(result), sequence, local_slot, ordinal)
+
+    @staticmethod
+    def _validate_transport_route(
+        *,
+        nodeid: str,
+        source_worker: str,
+        sequence: int,
+    ) -> None:
+        """Validate authoritative route identity before staging Results.
+
+        Raises:
+            ValueError: If any route component is invalid.
+        """
+        if type(nodeid) is not str or not nodeid:
+            msg = "Transported Result nodeid must be a nonempty exact string."
+            raise ValueError(msg)
+        if type(source_worker) is not str or not source_worker:
+            msg = "Transported Result worker must be a nonempty exact string."
+            raise ValueError(msg)
+        if type(sequence) is not int or sequence < 1:
+            msg = "Transported Result sequence must be an integer >= 1."
+            raise ValueError(msg)
+
+    @staticmethod
+    def _stage_transported_results(
+        *,
+        nodeid: str,
+        source_worker: str,
+        sequence: int,
+        results: Sequence[tuple[int, Result]],
+    ) -> tuple[list[Result], list[_TransportPosition]]:
+        """Copy, route-tag, and structurally validate transported Results.
+
+        Returns:
+            tuple[list[Result], list[_TransportPosition]]: Staged Result copies
+                and their aligned private transport positions.
+
+        Raises:
+            TypeError: If any value is not a Result.
+            ValueError: If local slots are invalid.
+        """
+        tagged: list[Result] = []
+        positions: list[_TransportPosition] = []
+        previous_slot = -1
+        for local_slot, original_result in results:
+            if type(local_slot) is not int or local_slot <= previous_slot:
+                msg = "Transported Result local slots must be increasing integers."
+                raise ValueError(msg)
+            if not isinstance(original_result, Result):
+                msg = "Transported values must be Result instances."
+                raise TypeError(msg)
+            result = copy.copy(original_result)
+            result.metadata = {
+                **result.metadata,
+                "_pytest_nodeid": nodeid,
+                "_rampart_source_worker": source_worker,
+            }
+            tagged.append(result)
+            positions.append(
+                _TransportPosition(
+                    worker_id=source_worker,
+                    sequence=sequence,
+                    local_slot=local_slot,
+                ),
+            )
+            previous_slot = local_slot
+        return tagged, positions

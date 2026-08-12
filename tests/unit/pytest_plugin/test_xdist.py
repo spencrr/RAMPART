@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-"""Tests for the RAMPART xdist support module."""
+"""Tests for shared xdist support and temporary clone metadata transport."""
 
 from __future__ import annotations
 
@@ -9,18 +9,13 @@ import json
 import logging
 import math
 from datetime import UTC, datetime
-from typing import Any, Never
+from typing import Any, Never, cast
 from unittest.mock import MagicMock
 
 import pytest
 from _pytest.config import PytestPluginManager
 
-from rampart.core.result import (
-    HarmCategory,
-    InjectionRecord,
-    Result,
-    SafetyStatus,
-)
+from rampart.core.result import HarmCategory, InjectionRecord, Result, SafetyStatus
 from rampart.core.trial import (
     TRIAL_BATCH_COUNT_KEY,
     TRIAL_BATCH_ID_KEY,
@@ -34,7 +29,6 @@ from rampart.core.types import (
     EvalResult,
     ObservabilityLevel,
     Payload,
-    PayloadFormat,
     Request,
     Response,
     SideEffect,
@@ -45,28 +39,24 @@ from rampart.pytest_plugin._session import RampartSession, TrialSpec
 from rampart.pytest_plugin._xdist import (
     DEFAULT_SIZE_LIMIT_BYTES,
     MAX_METADATA_DEPTH,
-    SCHEMA_VERSION,
     SIZE_LIMIT_OPTION,
-    WORKEROUTPUT_KEY,
-    SchemaVersionError,
-    SizeLimitError,
+    TRIAL_SPECS_SCHEMA_VERSION,
+    TRIAL_SPECS_WORKEROUTPUT_KEY,
     TrialSpecValidationError,
     WorkerOutputError,
+    _deserialize_result,
     _registered_plugin_name,
+    _serialize_result,
     _to_json_safe,
     deserialize_trial_specs,
-    deserialize_worker_data,
     discover_sinks_from_conftest,
-    finalize_worker,
+    finalize_trial_specs_worker,
     get_dist_mode,
     get_worker_count,
-    handle_testnodedown,
     is_xdist_controller,
     is_xdist_worker,
-    serialize_worker_data,
 )
-from rampart.pytest_plugin.plugin import _enforce_incomplete_exit_status
-from rampart.reporting.sink import ReportSink, TestRunReport
+from rampart.reporting.sink import ReportSink
 
 
 class _HostileRepr:
@@ -75,12 +65,6 @@ class _HostileRepr:
 
     def __str__(self) -> str:
         raise RuntimeError("str failed")
-
-    def __iter__(self) -> Never:
-        raise RuntimeError("iter failed")
-
-    def __len__(self) -> int:
-        raise RuntimeError("len failed")
 
 
 class _HostileString(str):  # ruff: ignore[subclass-builtin]
@@ -98,31 +82,11 @@ class _HostileString(str):  # ruff: ignore[subclass-builtin]
 
 
 class _HostileList(list):  # ruff: ignore[subclass-builtin]
-    def __repr__(self) -> str:
-        raise RuntimeError("repr failed")
-
-    def __str__(self) -> str:
-        raise RuntimeError("str failed")
-
     def __iter__(self) -> Never:
         raise RuntimeError("iter failed")
 
     def __len__(self) -> int:
         raise RuntimeError("len failed")
-
-
-class _HostileMeta(type):
-    def __getattribute__(cls, name: str) -> object:
-        if name == "__name__":
-            raise RuntimeError("name failed")
-        return type.__getattribute__(
-            cls,
-            name,
-        )
-
-
-class _HostileTypeName(metaclass=_HostileMeta):
-    pass
 
 
 class _HostilePlugin:
@@ -152,15 +116,6 @@ class _HostileError(Exception):
         raise SystemExit("str invoked")
 
 
-def _assert_no_terminal_controls(value: str) -> None:
-    assert all(
-        ord(character) >= 0x20
-        and ord(character) != 0x7F
-        and not 0x80 <= ord(character) <= 0x9F
-        for character in value
-    )
-
-
 def _make_plugin_config(*, plugins: list[tuple[object, object]]) -> MagicMock:
     config = MagicMock()
     config.pluginmanager.list_name_plugin.return_value = plugins
@@ -172,8 +127,6 @@ def _make_result(
     status: SafetyStatus = SafetyStatus.SAFE,
     summary: str = "summary",
     harm_category: HarmCategory | str | None = None,
-    strategy: str = "xpia",
-    duration_seconds: float = 1.0,
     metadata: dict[str, Any] | None = None,
     turns: list[Turn] | None = None,
     injections: list[InjectionRecord] | None = None,
@@ -183,51 +136,12 @@ def _make_result(
         status=status,
         summary=summary,
         turns=turns or [],
-        duration_seconds=duration_seconds,
         harm_category=harm_category,
-        strategy=strategy,
+        strategy="xpia",
         observability_level=observability_level,
         injections=injections or [],
         metadata=metadata or {},
     )
-
-
-def _make_turn(
-    *,
-    prompt: str = "hi",
-    text: str = "ok",
-    eval_result: EvalResult | None = None,
-    turn_number: int = 0,
-    timestamp: datetime | None = None,
-    driver_reasoning: str = "",
-) -> Turn:
-    return Turn(
-        request=Request(prompt=prompt),
-        response=Response(text=text),
-        eval_result=eval_result,
-        turn_number=turn_number,
-        timestamp=timestamp,
-        driver_reasoning=driver_reasoning,
-    )
-
-
-def _make_eval_result(
-    *,
-    outcome: EvalOutcome = EvalOutcome.DETECTED,
-    confidence: float = 0.9,
-    evidence: list[str] | None = None,
-    rationale: str = "because",
-) -> EvalResult:
-    return EvalResult(
-        outcome=outcome,
-        confidence=confidence,
-        evidence=evidence or [],
-        rationale=rationale,
-    )
-
-
-def _hostile_text(label: str) -> str:
-    return f"{label}\x1b[31m\t\n\r\x7f\x9b雪"
 
 
 def _make_config(
@@ -240,7 +154,7 @@ def _make_config(
 ) -> Any:
     config = MagicMock()
     if is_worker:
-        config.workerinput = {"workerid": "gw0"}
+        config.workerinput = {"workerid": "worker-a"}
     else:
         del config.workerinput
     config.option = MagicMock()
@@ -259,15 +173,16 @@ def _make_config(
     return config
 
 
-def _make_session_with_results(
-    *,
-    results_by_nodeid: dict[str, list[Result]],
-) -> RampartSession:
-    session = RampartSession()
-    session._results_by_nodeid = dict(results_by_nodeid)
-    for results in results_by_nodeid.values():
-        session._results.extend(results)
-    return session
+def _round_trip(result: Result, *, nodeid: str = "test.py::test_item") -> Result:
+    payload = _serialize_result(result=result, nodeid=nodeid)
+    return _deserialize_result(data=json.loads(json.dumps(payload)))
+
+
+def _valid_trial_payload(*, specs: object = None) -> dict[str, object]:
+    return {
+        "schema": TRIAL_SPECS_SCHEMA_VERSION,
+        "trial_specs": [] if specs is None else specs,
+    }
 
 
 def _format_record(record: logging.LogRecord) -> str:
@@ -275,1517 +190,290 @@ def _format_record(record: logging.LogRecord) -> str:
 
 
 class TestDetection:
-    def test_is_xdist_worker_true_when_workerinput_present(self) -> None:
-        config = _make_config(is_worker=True)
-        assert is_xdist_worker(config=config) is True
+    def test_worker_detection_uses_workerinput(self) -> None:
+        assert is_xdist_worker(config=_make_config(is_worker=True)) is True
+        assert is_xdist_worker(config=_make_config()) is False
 
-    def test_is_xdist_worker_false_when_workerinput_absent(self) -> None:
-        config = _make_config(is_worker=False)
-        assert is_xdist_worker(config=config) is False
+    def test_controller_detection_uses_active_endpoints(self) -> None:
+        assert (
+            is_xdist_controller(
+                config=_make_config(numprocesses=2, dist="load"),
+            )
+            is True
+        )
+        assert (
+            is_xdist_controller(
+                config=_make_config(dist="load", tx=["popen"]),
+            )
+            is True
+        )
 
-    def test_is_xdist_controller_true_with_numprocesses(self) -> None:
-        config = _make_config(numprocesses=2, dist="load")
-        assert is_xdist_controller(config=config) is True
+    def test_controller_detection_excludes_workers_and_inactive_dist(self) -> None:
+        assert (
+            is_xdist_controller(
+                config=_make_config(is_worker=True, numprocesses=2, dist="load"),
+            )
+            is False
+        )
+        assert is_xdist_controller(config=_make_config(dist="load")) is False
+        assert (
+            is_xdist_controller(
+                config=_make_config(numprocesses=2, dist="no"),
+            )
+            is False
+        )
 
-    def test_is_xdist_controller_true_with_tx_without_numprocesses(self) -> None:
-        config = _make_config(dist="load", tx=["popen", "popen"])
-        assert is_xdist_controller(config=config) is True
-
-    def test_is_xdist_controller_false_when_dist_without_endpoints(self) -> None:
-        config = _make_config(dist="load")
-        assert is_xdist_controller(config=config) is False
-
-    def test_is_xdist_controller_false_with_zero_numprocesses(self) -> None:
-        config = _make_config(numprocesses=0, dist="no")
-        assert is_xdist_controller(config=config) is False
-
-    def test_is_xdist_controller_false_when_no_numprocesses(self) -> None:
-        config = _make_config(numprocesses=None)
-        assert is_xdist_controller(config=config) is False
-
-    def test_is_xdist_controller_false_for_worker(self) -> None:
-        config = _make_config(is_worker=True, numprocesses=2)
-        assert is_xdist_controller(config=config) is False
-
-    def test_get_dist_mode_default(self) -> None:
-        config = _make_config()
-        assert get_dist_mode(config=config) == "no"
-
-    def test_get_dist_mode_loadgroup(self) -> None:
-        config = _make_config(dist="loadgroup")
+    def test_dist_mode_and_worker_count(self) -> None:
+        config = _make_config(numprocesses=3, dist="loadgroup")
         assert get_dist_mode(config=config) == "loadgroup"
-
-    def test_get_worker_count_returns_numprocesses(self) -> None:
-        config = _make_config(numprocesses=4)
-        assert get_worker_count(config=config) == 4
-
-    def test_get_worker_count_zero_when_inactive(self) -> None:
-        config = _make_config()
-        assert get_worker_count(config=config) == 0
+        assert get_worker_count(config=config) == 3
 
 
 class TestToJsonSafe:
-    def test_passes_primitives_unchanged(self) -> None:
-        assert _to_json_safe(value=42) == 42
-        assert _to_json_safe(value="hello") == "hello"
-        assert _to_json_safe(value=True) is True
-        assert _to_json_safe(value=None) is None
-        assert _to_json_safe(value=31.4) == pytest.approx(31.4)
-
-    def test_nan_coerced_to_none(self) -> None:
-        assert _to_json_safe(value=float("nan")) is None
-
-    def test_inf_coerced_to_none(self) -> None:
-        assert _to_json_safe(value=float("inf")) is None
-        assert _to_json_safe(value=float("-inf")) is None
-
-    def test_dict_recursed(self) -> None:
-        result = _to_json_safe(value={"a": 1, "b": {"c": "x"}})
-        assert result == {"a": 1, "b": {"c": "x"}}
-
-    def test_list_recursed(self) -> None:
-        result = _to_json_safe(value=[1, "two", [3]])
-        assert result == [1, "two", [3]]
-
-    def test_tuple_becomes_list(self) -> None:
-        result = _to_json_safe(value=(1, 2, 3))
-        assert result == [1, 2, 3]
-
-    def test_custom_object_coerced_via_repr(self) -> None:
-        class Obj:
-            def __repr__(self) -> str:
-                return "<Obj>"
-
-        assert _to_json_safe(value=Obj()) == "<Obj>"
-
-    def test_depth_limit_coerces_to_repr(self) -> None:
-        nested: dict[str, Any] = {"v": "leaf"}
-        for _ in range(MAX_METADATA_DEPTH + 2):
-            nested = {"v": nested}
-        result = _to_json_safe(value=nested)
-        json.dumps(result)  # must be JSON-safe
-
-
-class TestSerializationRoundTrip:
-    def test_simple_result_round_trip(self) -> None:
-        result = _make_result(summary="hi", harm_category=HarmCategory.JAILBREAK)
-        session = _make_session_with_results(
-            results_by_nodeid={"test::a": [result]},
-        )
-        payload = serialize_worker_data(session=session)
-        json.dumps(payload, default=str)
-        recovered = deserialize_worker_data(data=payload)
-        assert "test::a" in recovered
-        assert recovered["test::a"][0].safe is True
-        assert recovered["test::a"][0].status is SafetyStatus.SAFE
-        assert recovered["test::a"][0].harm_category is HarmCategory.JAILBREAK
-
-    def test_status_enum_round_trip(self) -> None:
-        for status in SafetyStatus:
-            result = _make_result(status=status)
-            session = _make_session_with_results(
-                results_by_nodeid={"n": [result]},
-            )
-            payload = serialize_worker_data(session=session)
-            recovered = deserialize_worker_data(data=payload)
-            assert recovered["n"][0].status is status
-
-    def test_observability_level_round_trip(self) -> None:
-        for level in ObservabilityLevel:
-            result = _make_result(observability_level=level)
-            session = _make_session_with_results(
-                results_by_nodeid={"n": [result]},
-            )
-            payload = serialize_worker_data(session=session)
-            recovered = deserialize_worker_data(data=payload)
-            assert recovered["n"][0].observability_level is level
-
-    def test_harm_category_plain_string_round_trip(self) -> None:
-        result = _make_result(harm_category="custom_product_risk")
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [result]},
-        )
-        payload = serialize_worker_data(session=session)
-        recovered = deserialize_worker_data(data=payload)
-        assert recovered["n"][0].harm_category == "custom_product_risk"
-
-    def test_turns_with_eval_result_round_trip(self) -> None:
-        eval_result = _make_eval_result(
-            outcome=EvalOutcome.NOT_DETECTED,
-            confidence=0.7,
-            evidence=["e1", "e2"],
-            rationale="r",
-        )
-        turn = _make_turn(eval_result=eval_result, turn_number=1)
-        result = _make_result(turns=[turn])
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [result]},
-        )
-        payload = serialize_worker_data(session=session)
-        recovered = deserialize_worker_data(data=payload)
-        assert recovered["n"][0].turns[0].eval_result is not None
-        outcome = recovered["n"][0].turns[0].eval_result.outcome
-        assert outcome is EvalOutcome.NOT_DETECTED
-        assert recovered["n"][0].turns[0].eval_result.evidence == ["e1", "e2"]
-
-    def test_datetime_round_trip(self) -> None:
-        when = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-        turn = _make_turn(timestamp=when)
-        result = _make_result(turns=[turn])
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [result]},
-        )
-        payload = serialize_worker_data(session=session)
-        recovered = deserialize_worker_data(data=payload)
-        assert recovered["n"][0].turns[0].timestamp == when
-
-    def test_injections_round_trip(self) -> None:
-        injection = InjectionRecord(payload_id="p1", surface_name="OneDrive")
-        result = _make_result(injections=[injection])
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [result]},
-        )
-        payload = serialize_worker_data(session=session)
-        recovered = deserialize_worker_data(data=payload)
-        assert recovered["n"][0].injections[0].payload_id == "p1"
-        assert recovered["n"][0].injections[0].surface_name == "OneDrive"
-
-    def test_response_with_tool_calls_round_trip(self) -> None:
-        tool_call = ToolCall(name="send_email", arguments={"to": "a@b.c"})
-        response = Response(text="ok", tool_calls=[tool_call])
-        turn = Turn(request=Request(prompt="hi"), response=response)
-        result = _make_result(turns=[turn])
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [result]},
-        )
-        payload = serialize_worker_data(session=session)
-        recovered = deserialize_worker_data(data=payload)
-        assert recovered["n"][0].turns[0].response.tool_calls[0].name == "send_email"
-        assert recovered["n"][0].turns[0].response.tool_calls[0].arguments == {
-            "to": "a@b.c",
+    def test_primitives_and_nested_collections_round_trip(self) -> None:
+        value = {"a": [1, "two", True, None], "b": (3, 4)}
+        assert _to_json_safe(value=value) == {
+            "a": [1, "two", True, None],
+            "b": [3, 4],
         }
 
-    def test_response_with_side_effects_round_trip(self) -> None:
-        side_effect = SideEffect(kind="http", details={"url": "http://x"})
-        response = Response(text="ok", side_effects=[side_effect])
-        turn = Turn(request=Request(prompt="hi"), response=response)
-        result = _make_result(turns=[turn])
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [result]},
-        )
-        payload = serialize_worker_data(session=session)
-        recovered = deserialize_worker_data(data=payload)
-        assert recovered["n"][0].turns[0].response.side_effects[0].kind == "http"
+    def test_nonfinite_float_becomes_none(self) -> None:
+        assert _to_json_safe(value=math.nan) is None
+        assert _to_json_safe(value=math.inf) is None
 
-    def test_metadata_round_trip(self) -> None:
-        result = _make_result(metadata={"test_name": "t1", "tries": 3})
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [result]},
-        )
-        payload = serialize_worker_data(session=session)
-        recovered = deserialize_worker_data(data=payload)
-        assert recovered["n"][0].metadata["test_name"] == "t1"
-        assert recovered["n"][0].metadata["tries"] == 3
+    def test_custom_value_uses_repr(self) -> None:
+        class Value:
+            def __repr__(self) -> str:
+                return "<value>"
 
-    def test_trial_batch_metadata_round_trips_without_schema_change(self) -> None:
+        assert _to_json_safe(value=Value()) == "<value>"
+
+    def test_depth_limit_remains_json_safe(self) -> None:
+        nested: dict[str, Any] = {"value": "leaf"}
+        for _ in range(MAX_METADATA_DEPTH + 2):
+            nested = {"value": nested}
+        json.dumps(_to_json_safe(value=nested))
+
+
+class TestResultCodec:
+    def test_status_observability_and_harm_round_trip(self) -> None:
+        for status in SafetyStatus:
+            for level in ObservabilityLevel:
+                result = _round_trip(
+                    _make_result(
+                        status=status,
+                        harm_category=HarmCategory.JAILBREAK,
+                        observability_level=level,
+                    ),
+                )
+                assert result.status is status
+                assert result.observability_level is level
+                assert result.harm_category is HarmCategory.JAILBREAK
+
+    def test_nested_evidence_round_trip(self) -> None:
+        timestamp = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        attachment = Payload(content="payload\n\x1b", metadata={"order": [2, 1]})
+        tool_call = ToolCall(
+            name="send_email",
+            arguments={"to": "a@example.test"},
+            result="sent",
+            timestamp=timestamp,
+        )
+        side_effect = SideEffect(kind="http", details={"status": 201})
+        evaluation = EvalResult(
+            outcome=EvalOutcome.DETECTED,
+            confidence=0.9,
+            evidence=["line\none", "\x1braw"],
+            rationale="because",
+        )
+        turn = Turn(
+            request=Request(prompt="prompt", attachments=[attachment]),
+            response=Response(
+                text="response",
+                tool_calls=[tool_call],
+                side_effects=[side_effect],
+                metadata={"nested": {"flag": True}},
+            ),
+            eval_result=evaluation,
+            timestamp=timestamp,
+            driver_reasoning="reasoning",
+        )
+        original = _make_result(
+            summary="summary\n\x1b",
+            turns=[turn],
+            injections=[InjectionRecord(payload_id="p1", surface_name="OneDrive")],
+            metadata={"user": {"values": [1, 1, 2]}},
+        )
+
+        recovered = _round_trip(original)
+
+        assert recovered.summary == original.summary
+        assert recovered.turns[0].request.attachments[0].metadata == {"order": [2, 1]}
+        assert recovered.turns[0].response.tool_calls[0].arguments == {
+            "to": "a@example.test"
+        }
+        assert recovered.turns[0].response.side_effects[0].details == {"status": 201}
+        assert recovered.turns[0].eval_result is not None
+        assert recovered.turns[0].eval_result.evidence == ["line\none", "\x1braw"]
+        assert recovered.injections[0].surface_name == "OneDrive"
+        assert recovered.metadata == original.metadata
+
+    def test_trial_batch_metadata_round_trip(self) -> None:
         metadata = {
             TRIAL_BATCH_SCHEMA_KEY: TRIAL_BATCH_SCHEMA,
             TRIAL_BATCH_ID_KEY: "123e4567-e89b-42d3-a456-426614174000",
             TRIAL_BATCH_INDEX_KEY: 0,
             TRIAL_BATCH_COUNT_KEY: 1,
             TRIAL_BATCH_THRESHOLD_KEY: 1.0,
+            "_rampart_result_index": 7,
         }
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(metadata=metadata)]},
+        assert _round_trip(_make_result(metadata=metadata)).metadata == metadata
+
+    def test_codec_payload_is_pure_json(self) -> None:
+        payload = _serialize_result(
+            result=_make_result(metadata={"tuple": (1, 2)}),
+            nodeid="test.py::test_json",
         )
-
-        payload = serialize_worker_data(session=session)
-        recovered = deserialize_worker_data(data=payload)
-
-        assert payload["schema"] == SCHEMA_VERSION
-        assert recovered["n"][0].metadata | metadata == recovered["n"][0].metadata
-        assert (
-            recovered["n"][0].metadata[TRIAL_BATCH_ID_KEY]
-            == metadata[TRIAL_BATCH_ID_KEY]
-        )
-
-    def test_preserves_every_textual_evidence_field(  # ruff: ignore[too-many-locals]
-        self,
-    ) -> None:
-        argument_key = _hostile_text("argument-key")
-        detail_key = _hostile_text("detail-key")
-        payload_metadata_key = _hostile_text("payload-metadata-key")
-        response_metadata_key = _hostile_text("response-metadata-key")
-        result_metadata_key = _hostile_text("result-metadata-key")
-        attachment = Payload(
-            content=_hostile_text("payload-content"),
-            id=_hostile_text("payload-id"),
-            metadata={
-                payload_metadata_key: {"nested": _hostile_text("payload-metadata")}
-            },
-        )
-        tool_call = ToolCall(
-            name=_hostile_text("tool-name"),
-            arguments={
-                argument_key: {"nested": _hostile_text("argument-value")},
-            },
-            result=_hostile_text("tool-result"),
-        )
-        side_effect = SideEffect(
-            kind=_hostile_text("side-effect-kind"),
-            details={
-                detail_key: {"nested": _hostile_text("side-effect-detail")},
-            },
-        )
-        response = Response(
-            text=_hostile_text("response"),
-            tool_calls=[tool_call],
-            side_effects=[side_effect],
-            metadata={
-                response_metadata_key: {"nested": _hostile_text("response-metadata")}
-            },
-        )
-        eval_result = EvalResult(
-            outcome=EvalOutcome.DETECTED,
-            evidence=[_hostile_text("evidence")],
-            rationale=_hostile_text("rationale"),
-        )
-        turn = Turn(
-            request=Request(prompt=_hostile_text("prompt"), attachments=[attachment]),
-            response=response,
-            eval_result=eval_result,
-            driver_reasoning=_hostile_text("driver-reasoning"),
-        )
-        result = _make_result(
-            summary=_hostile_text("summary"),
-            harm_category=_hostile_text("harm-category"),
-            strategy=_hostile_text("strategy"),
-            turns=[turn],
-            injections=[
-                InjectionRecord(
-                    payload_id=_hostile_text("injection-payload-id"),
-                    surface_name=_hostile_text("injection-surface"),
-                ),
-            ],
-            metadata={
-                result_metadata_key: {"nested": _hostile_text("result-metadata")}
-            },
-        )
-        nodeid = _hostile_text("test.py::test-evidence")
-        session = _make_session_with_results(results_by_nodeid={nodeid: [result]})
-
-        payload = json.loads(json.dumps(serialize_worker_data(session=session)))
-        recovered = deserialize_worker_data(data=payload)[nodeid][0]
-
-        assert recovered.summary == result.summary
-        assert recovered.harm_category == result.harm_category
-        assert recovered.strategy == result.strategy
-        assert (
-            recovered.metadata[result_metadata_key]
-            == result.metadata[result_metadata_key]
-        )
-        assert recovered.metadata["_pytest_nodeid"] == nodeid
-        recovered_turn = recovered.turns[0]
-        assert recovered_turn.request.prompt == turn.request.prompt
-        recovered_attachment = recovered_turn.request.attachments[0]
-        assert recovered_attachment.content == attachment.content
-        assert recovered_attachment.id == attachment.id
-        assert (
-            recovered_attachment.metadata[payload_metadata_key]
-            == (attachment.metadata[payload_metadata_key])
-        )
-        assert recovered_turn.response.text == response.text
-        recovered_tool_call = recovered_turn.response.tool_calls[0]
-        assert recovered_tool_call.name == tool_call.name
-        assert (
-            recovered_tool_call.arguments[argument_key]
-            == tool_call.arguments[argument_key]
-        )
-        assert recovered_tool_call.result == tool_call.result
-        recovered_side_effect = recovered_turn.response.side_effects[0]
-        assert recovered_side_effect.kind == side_effect.kind
-        assert (
-            recovered_side_effect.details[detail_key] == side_effect.details[detail_key]
-        )
-        assert (
-            recovered_turn.response.metadata[response_metadata_key]
-            == (response.metadata[response_metadata_key])
-        )
-        assert recovered_turn.eval_result is not None
-        assert recovered_turn.eval_result.evidence == eval_result.evidence
-        assert recovered_turn.eval_result.rationale == eval_result.rationale
-        assert recovered_turn.driver_reasoning == turn.driver_reasoning
-        assert recovered.injections[0].payload_id == result.injections[0].payload_id
-        assert recovered.injections[0].surface_name == result.injections[0].surface_name
-
-
-class TestDeserializationValidation:
-    def test_rejects_non_dict_payload(self) -> None:
-        with pytest.raises(WorkerOutputError, match="Expected dict"):
-            deserialize_worker_data(data="not-a-dict")
-
-    def test_rejects_missing_schema_key(self) -> None:
-        with pytest.raises(SchemaVersionError, match="missing required 'schema'"):
-            deserialize_worker_data(data={"results_by_nodeid": {}})
-
-    def test_rejects_unknown_schema_version(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": "rampart.xdist.v999",
-            "results_by_nodeid": {},
-        }
-        with pytest.raises(SchemaVersionError, match="does not match"):
-            deserialize_worker_data(data=payload)
-
-    def test_accepts_empty_results_block(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {},
-        }
-        assert deserialize_worker_data(data=payload) == {}
-
-    def test_rejects_missing_results_block(self) -> None:
-        with pytest.raises(WorkerOutputError, match="missing required"):
-            deserialize_worker_data(data={"schema": SCHEMA_VERSION})
-
-    def test_rejects_non_list_result_group(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {"node": {}},
-        }
-        with pytest.raises(WorkerOutputError, match="Expected list"):
-            deserialize_worker_data(data=payload)
-
-    @pytest.mark.parametrize("nodeid", [1, ""], ids=["non-string", "empty"])
-    def test_rejects_invalid_result_group_key(self, nodeid: object) -> None:
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {nodeid: []},
-        }
-        with pytest.raises(WorkerOutputError):
-            deserialize_worker_data(data=payload)
-
-    def test_result_group_key_diagnostic_is_terminal_safe(self) -> None:
-        controlled_type = type("Bad\r\n\x1b]0;name\x07\x80", (), {})
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {controlled_type(): []},
-        }
-        with pytest.raises(WorkerOutputError) as exc_info:
-            deserialize_worker_data(data=payload)
-        _assert_no_terminal_controls(str(exc_info.value))
-        assert len(str(exc_info.value)) < 200
-
-    def test_hostile_schema_repr_does_not_escape_validation(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": _HostileTypeName(),
-            "results_by_nodeid": {},
-        }
-        with pytest.raises(SchemaVersionError) as exc_info:
-            deserialize_worker_data(data=payload)
-        assert len(str(exc_info.value)) < 200
-
-    def test_schema_type_name_controls_are_escaped(self) -> None:
-        controlled_type = type("Bad\r\n\x1b]0;name\x07\x80", (), {})
-        payload: dict[str, Any] = {
-            "schema": controlled_type(),
-            "results_by_nodeid": {},
-        }
-        with pytest.raises(SchemaVersionError) as exc_info:
-            deserialize_worker_data(data=payload)
-        _assert_no_terminal_controls(str(exc_info.value))
-
-    def test_rejects_malformed_safety_status(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {
-                "n": [
-                    {
-                        "safe": True,
-                        "status": "not-a-status",
-                        "summary": "x",
-                        "observability_level": "response_only",
-                    },
-                ],
-            },
-        }
-        with pytest.raises(WorkerOutputError, match="Unknown SafetyStatus"):
-            deserialize_worker_data(data=payload)
-
-    def test_hostile_enum_repr_does_not_escape_or_chain(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {
-                "n": [
-                    {
-                        "status": _HostileString("not-a-status"),
-                        "observability_level": "response_only",
-                    },
-                ],
-            },
-        }
-        with pytest.raises(WorkerOutputError) as exc_info:
-            deserialize_worker_data(data=payload)
-        assert exc_info.value.__cause__ is None
-        assert len(str(exc_info.value)) < 200
-
-    def test_rejects_malformed_observability_level(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {
-                "n": [
-                    {
-                        "safe": True,
-                        "status": "safe",
-                        "summary": "x",
-                        "observability_level": "not-a-level",
-                    },
-                ],
-            },
-        }
-        with pytest.raises(WorkerOutputError, match="Unknown ObservabilityLevel"):
-            deserialize_worker_data(data=payload)
-
-    def test_long_enum_diagnostic_is_bounded(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {
-                "n": [
-                    {
-                        "status": "x" * 10_000,
-                        "observability_level": "response_only",
-                    },
-                ],
-            },
-        }
-        with pytest.raises(WorkerOutputError) as exc_info:
-            deserialize_worker_data(data=payload)
-        assert exc_info.value.__cause__ is None
-        assert exc_info.value.__suppress_context__ is True
-        assert len(str(exc_info.value)) < 200
-
-    def test_long_datetime_diagnostic_is_bounded(self) -> None:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={
-                "n": [
-                    _make_result(
-                        turns=[
-                            _make_turn(
-                                timestamp=datetime.now(tz=UTC),
-                            ),
-                        ],
-                    ),
-                ],
-            },
-        )
-        payload = serialize_worker_data(session=worker_session)
-        payload["results_by_nodeid"]["n"][0]["turns"][0]["timestamp"] = "x" * 10_000
-        with pytest.raises(WorkerOutputError) as exc_info:
-            deserialize_worker_data(data=payload)
-        assert exc_info.value.__cause__ is None
-        assert exc_info.value.__suppress_context__ is True
-        assert len(str(exc_info.value)) < 200
-
-
-class TestTransportValidation:
-    def test_nan_inf_in_duration_coerced_to_zero(self) -> None:
-        session = _make_session_with_results(
-            results_by_nodeid={
-                "n": [_make_result(duration_seconds=float("nan"))],
-            },
-        )
-        payload = serialize_worker_data(session=session)
-        encoded = json.dumps(payload, default=str)
-        assert "NaN" not in encoded
-        recovered = deserialize_worker_data(data=payload)
-        assert math.isfinite(recovered["n"][0].duration_seconds)
-
-    def test_payload_artifact_path_preserved_in_metadata(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {
-                "n": [
-                    {
-                        "safe": True,
-                        "status": "safe",
-                        "summary": "x",
-                        "observability_level": "response_only",
-                        "turns": [
-                            {
-                                "request": {
-                                    "prompt": None,
-                                    "attachments": [
-                                        {
-                                            "content": "c",
-                                            "id": "p1",
-                                            "format": "pdf",
-                                            "artifact": "/worker/local/path.pdf",
-                                            "metadata": {},
-                                        },
-                                    ],
-                                },
-                                "response": {"text": "ok"},
-                            },
-                        ],
-                    },
-                ],
-            },
-        }
-        result = deserialize_worker_data(data=payload)["n"][0]
-        attachment = result.turns[0].request.attachments[0]
-        assert attachment.format is PayloadFormat.TEXT
-        assert attachment.artifact is None
-        assert (
-            attachment.metadata["_rampart_worker_artifact_path"]
-            == "/worker/local/path.pdf"
-        )
-        assert attachment.metadata["_rampart_worker_format"] == "pdf"
-
-    def test_serialized_payload_is_pure_json(self) -> None:
-        result = _make_result(
-            metadata={"obj": object()},
-            harm_category=HarmCategory.JAILBREAK,
-        )
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [result]},
-        )
-        payload = serialize_worker_data(session=session)
-        encoded = json.dumps(payload)
-        decoded = json.loads(encoded)
-        assert decoded["schema"] == SCHEMA_VERSION
-
-    def test_non_serializable_metadata_coerced_with_warning(
-        self,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        class Obj:
-            def __repr__(self) -> str:
-                return "<Obj>"
-
-        result = _make_result(metadata={"obj": Obj()})
-        nodeid = "my\x1b\n::node\x9b"
-        session = _make_session_with_results(
-            results_by_nodeid={nodeid: [result]},
-        )
-        with caplog.at_level(logging.WARNING):
-            payload = serialize_worker_data(session=session)
-        recovered = deserialize_worker_data(data=payload)
-        assert recovered[nodeid][0].metadata["obj"] == "<Obj>"
-        message = next(
-            record.getMessage()
-            for record in caplog.records
-            if "Converted" in record.getMessage()
-        )
-        assert r"my\x1b\x0a::node\x9b" in message
-        assert "\x1b" not in message
-        assert "\n" not in message
-
-
-class TestMerge:
-    def test_merge_extends_results(self) -> None:
-        session = RampartSession()
-        session.merge_worker_results(
-            results_by_nodeid={
-                "n1": [_make_result(summary="r1")],
-            },
-        )
-        session.merge_worker_results(
-            results_by_nodeid={
-                "n2": [_make_result(summary="r2")],
-            },
-        )
-        assert len(session._results) == 2
-        assert "n1" in session._results_by_nodeid
-        assert "n2" in session._results_by_nodeid
-
-    def test_merge_extends_same_node_results(self) -> None:
-        session = RampartSession()
-        session.merge_worker_results(
-            results_by_nodeid={"n": [_make_result(summary="first")]},
-        )
-        session.merge_worker_results(
-            results_by_nodeid={"n": [_make_result(summary="second")]},
-        )
-        assert [result.summary for result in session.results_by_nodeid["n"]] == [
-            "first",
-            "second",
-        ]
-        assert session.build_report().total_runs == 2
-
-    def test_merge_invalidates_cached_report(self) -> None:
-        session = RampartSession()
-        session.merge_worker_results(
-            results_by_nodeid={"n1": [_make_result()]},
-        )
-        first = session.build_report()
-        session.merge_worker_results(
-            results_by_nodeid={"n2": [_make_result()]},
-        )
-        second = session.build_report()
-        assert first is not second
-        assert second.total_runs == 2
-
-    def test_build_report_orders_results_by_test_name(self) -> None:
-        session = RampartSession()
-        session.merge_worker_results(
-            results_by_nodeid={
-                "z": [
-                    _make_result(summary="z", metadata={"_pytest_test_name": "z_test"}),
-                ],
-                "a": [
-                    _make_result(summary="a", metadata={"_pytest_test_name": "a_test"}),
-                ],
-            },
-        )
-        report = session.build_report()
-        names = [r.metadata["_pytest_test_name"] for r in report.results]
-        assert names == sorted(names)
-
-    def test_mark_incomplete_surfaces_in_report_metadata(self) -> None:
-        session = RampartSession()
-        session.merge_worker_results(
-            results_by_nodeid={"n": [_make_result()]},
-        )
-        session.mark_incomplete(reason="worker gw0 crashed")
-        report = session.build_report()
-        assert report.metadata["incomplete"] is True
-        assert "worker gw0 crashed" in report.metadata["incomplete_reasons"]
-
-    def test_emitted_idempotency_flag(self) -> None:
-        session = RampartSession()
-        assert session.is_emitted is False
-        session.mark_emitted()
-        assert session.is_emitted is True
-
-
-class TestHandleTestnodedown:
-    def test_records_incomplete_on_error(self) -> None:
-        session = RampartSession()
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        handle_testnodedown(
-            session=session,
-            node=node,
-            error="boom",
-        )
-        assert session.is_incomplete is True
-
-    def test_worker_error_log_is_escaped_but_report_reason_is_raw(
-        self,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        session = RampartSession()
-        node = MagicMock()
-        worker_id = "gw\x1b\n0\x9b"
-        error = "boom\x1b\r\x7f\x9b"
-        node.gateway.id = worker_id
-
-        with caplog.at_level(logging.WARNING):
-            handle_testnodedown(session=session, node=node, error=error)
-
-        message = caplog.records[-1].getMessage()
-        assert r"gw\x1b\x0a0\x9b" in message
-        assert r"boom\x1b\x0d\x7f\x9b" in message
-        assert "\x1b" not in message
-        assert "\n" not in message
-        assert session.build_report().metadata["incomplete_reasons"] == [
-            f"worker {worker_id} error: {error}",
-        ]
-
-    def test_records_incomplete_on_missing_workeroutput(self) -> None:
-        session = RampartSession()
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = None
-        handle_testnodedown(session=session, node=node, error=None)
-        assert session.is_incomplete is True
-
-    def test_records_incomplete_on_missing_rampart_key(self) -> None:
-        session = RampartSession()
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {}
-        handle_testnodedown(session=session, node=node, error=None)
-        assert session.is_incomplete is True
-
-    def test_records_incomplete_on_deserialization_failure(self) -> None:
-        session = RampartSession()
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: {"schema": "wrong-version"}}
-        handle_testnodedown(session=session, node=node, error=None)
-        assert session.is_incomplete is True
-
-    def test_deserialization_log_escapes_traceback_but_reason_is_raw(
-        self,
-        caplog: pytest.LogCaptureFixture,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        raw_error = "deserialize\x1b\t\n\r\x7f\x9b"
-        raw_worker_id = "gw\x1b\n\x9b"
-        error = WorkerOutputError(raw_error)
-
-        def _raise_worker_output(*, data: object) -> dict[str, list[Result]]:
-            del data
-            raise error
-
-        monkeypatch.setattr(
-            "rampart.pytest_plugin._xdist.deserialize_worker_data",
-            _raise_worker_output,
-        )
-        session = RampartSession()
-        node = MagicMock()
-        node.gateway.id = raw_worker_id
-        node.workeroutput = {
-            WORKEROUTPUT_KEY: {
-                "schema": SCHEMA_VERSION,
-                "results_by_nodeid": {},
-            },
-        }
-
-        with caplog.at_level(logging.ERROR):
-            handle_testnodedown(session=session, node=node, error=None)
-
-        formatted = _format_record(caplog.records[-1])
-        assert r"gw\x1b\x0a\x9b" in formatted
-        assert r"WorkerOutputError: deserialize\x1b\x09\x0a\x0d\x7f\x9b" in formatted
-        assert "Traceback (most recent call last):" in formatted
-        assert "\x1b" not in formatted
-        assert "\t" not in formatted
-        assert "\n" not in formatted
-        assert "\r" not in formatted
-        assert "\x7f" not in formatted
-        assert "\x9b" not in formatted
-        assert session.build_report().metadata["incomplete_reasons"] == [
-            f"worker {raw_worker_id} deserialization failed: {raw_error}",
-        ]
-
-    def test_records_incomplete_on_truncated_payload(self) -> None:
-        session = RampartSession()
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {
-            WORKEROUTPUT_KEY: {
-                "schema": SCHEMA_VERSION,
-                "rampart_truncated": True,
-            },
-        }
-        handle_testnodedown(session=session, node=node, error=None)
-        assert session.is_incomplete is True
-
-    def test_records_incomplete_on_transport_validation_error(self) -> None:
-        session = RampartSession()
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {
-            WORKEROUTPUT_KEY: {
-                "schema": SCHEMA_VERSION,
-                "results_by_nodeid": {},
-                "trial_specs": [],
-                "rampart_transport_error": "invalid trial threshold",
-            },
-        }
-        handle_testnodedown(session=session, node=node, error=None)
-        assert session.is_incomplete is True
-        assert "transport validation failed" in session.incomplete_reasons[0]
-
-
-class TestHandleTestnodedownResultsValidation:
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            {"schema": SCHEMA_VERSION, "trial_specs": []},
-            {
-                "schema": SCHEMA_VERSION,
-                "results_by_nodeid": {"node": {}},
-                "trial_specs": [],
-            },
-            {
-                "schema": SCHEMA_VERSION,
-                "results_by_nodeid": {1: []},
-                "trial_specs": [],
-            },
-            {
-                "schema": SCHEMA_VERSION,
-                "results_by_nodeid": {"": []},
-                "trial_specs": [],
-            },
-        ],
-        ids=["missing-block", "non-list-group", "non-string-key", "empty-key"],
-    )
-    def test_malformed_results_fail_closed(self, payload: dict[str, Any]) -> None:
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        rampart_session = RampartSession()
-
-        handle_testnodedown(
-            session=rampart_session,
-            node=node,
-            error=None,
-        )
-
-        assert rampart_session.is_incomplete is True
-        assert rampart_session.has_results is False
-        assert "deserialization failed" in rampart_session.incomplete_reasons[0]
-        _assert_no_terminal_controls(rampart_session.incomplete_reasons[0])
-        pytest_session = MagicMock()
-        pytest_session.exitstatus = pytest.ExitCode.OK
-        _enforce_incomplete_exit_status(
-            session=pytest_session,
-            rampart_session=rampart_session,
-        )
-        assert pytest_session.exitstatus == pytest.ExitCode.TESTS_FAILED
-
-    def test_empty_results_block_is_complete(self) -> None:
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {
-            WORKEROUTPUT_KEY: {
-                "schema": SCHEMA_VERSION,
-                "results_by_nodeid": {},
-                "trial_specs": [],
-            },
-        }
-        rampart_session = RampartSession()
-
-        handle_testnodedown(
-            session=rampart_session,
-            node=node,
-            error=None,
-        )
-
-        assert rampart_session.is_incomplete is False
-        assert rampart_session.has_results is False
-
-
-class TestHandleTestnodedownTransportDiagnostics:
-    def test_huge_transport_error_marker_is_bounded_and_incomplete(self) -> None:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="kept")]},
-        )
-        payload = serialize_worker_data(session=worker_session)
-        payload["rampart_transport_error"] = 10**5000
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        session = RampartSession()
-
-        handle_testnodedown(session=session, node=node, error=None)
-
-        assert session.is_incomplete is True
-        assert len(session.incomplete_reasons[0]) < 300
-        assert session.results_by_nodeid["n"][0].summary == "kept"
-
-    def test_hostile_transport_error_repr_is_bounded_and_incomplete(self) -> None:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="kept")]},
-        )
-        payload = serialize_worker_data(session=worker_session)
-        payload["rampart_transport_error"] = _HostileRepr()
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        session = RampartSession()
-
-        handle_testnodedown(session=session, node=node, error=None)
-
-        assert session.is_incomplete is True
-        assert len(session.incomplete_reasons[0]) < 300
-        assert session.results_by_nodeid["n"][0].summary == "kept"
-
-    def test_hostile_transport_error_string_is_bounded_and_incomplete(self) -> None:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="kept")]},
-        )
-        payload = serialize_worker_data(session=worker_session)
-        payload["rampart_transport_error"] = _HostileString("x" * 10_000)
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        session = RampartSession()
-
-        handle_testnodedown(session=session, node=node, error=None)
-
-        assert session.is_incomplete is True
-        assert len(session.incomplete_reasons[0]) < 300
-        assert session.results_by_nodeid["n"][0].summary == "kept"
-
-    def test_transport_error_controls_are_escaped(self) -> None:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="kept")]},
-        )
-        payload = serialize_worker_data(session=worker_session)
-        payload["rampart_transport_error"] = "\r\n\x1b[31m\x1b]0;bad\x07\x80"
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        session = RampartSession()
-
-        handle_testnodedown(session=session, node=node, error=None)
-
-        assert session.is_incomplete is True
-        _assert_no_terminal_controls(session.incomplete_reasons[0])
-        assert session.results_by_nodeid["n"][0].summary == "kept"
-
-    def test_transport_error_does_not_bypass_result_validation(self) -> None:
-        session = RampartSession()
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {
-            WORKEROUTPUT_KEY: {
-                "schema": SCHEMA_VERSION,
-                "results_by_nodeid": {"n": [{"status": "invalid"}]},
-                "trial_specs": [],
-                "rampart_transport_error": "invalid trial threshold",
-            },
-        }
-
-        handle_testnodedown(session=session, node=node, error=None)
-
-        assert session.is_incomplete is True
-        assert "deserialization failed" in session.incomplete_reasons[0]
-        assert session.has_results is False
-
-    @pytest.mark.parametrize("field", ["duration", "confidence"])
-    def test_transport_error_numeric_overflow_uses_result_failure_path(
-        self,
-        field: str,
-    ) -> None:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={
-                "n": [
-                    _make_result(
-                        turns=[
-                            _make_turn(
-                                eval_result=_make_eval_result(),
-                            ),
-                        ],
-                    ),
-                ],
-            },
-        )
-        payload = serialize_worker_data(session=worker_session)
-        raw_result = payload["results_by_nodeid"]["n"][0]
-        if field == "duration":
-            raw_result["duration_seconds"] = 10**5000
-        else:
-            raw_result["turns"][0]["eval_result"]["confidence"] = 10**5000
-        payload["rampart_transport_error"] = "invalid trial threshold"
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        session = RampartSession()
-
-        handle_testnodedown(session=session, node=node, error=None)
-
-        assert session.is_incomplete is True
-        assert "deserialization failed" in session.incomplete_reasons[0]
-        assert len(session.incomplete_reasons[0]) < 300
-        assert session.has_results is False
-
-    def test_finalizer_trial_error_preserves_results_and_forces_nonzero(
-        self,
-    ) -> None:
-        config = _make_config(is_worker=True)
-        workeroutput: dict[str, Any] = {}
-        config.workeroutput = workeroutput
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="kept")]},
-        )
-        worker_session.register_trial_spec(
-            clone_nodeid="n",
-            base_nodeid="base",
-            threshold=10**5000,
-        )
-
-        with pytest.raises(TrialSpecValidationError):
-            finalize_worker(config=config, session=worker_session)
-
-        payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
-        assert payload["trial_specs"] == []
-        assert payload["results_by_nodeid"]["n"][0]["summary"] == "kept"
-        assert "finite number in (0, 1]" in payload["rampart_transport_error"]
-        assert len(payload["rampart_transport_error"]) < 200
-
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = workeroutput
-        controller_session = RampartSession()
-        handle_testnodedown(session=controller_session, node=node, error=None)
-
-        flat_result = controller_session._results[0]
-        grouped_result = controller_session.results_by_nodeid["n"][0]
-        report_result = controller_session.build_report().results[0]
-        assert flat_result is grouped_result
-        assert flat_result is report_result
-        assert flat_result.summary == "kept"
-        assert controller_session.is_incomplete is True
-        assert "transport validation failed" in controller_session.incomplete_reasons[0]
-
-        pytest_session = MagicMock()
-        pytest_session.exitstatus = pytest.ExitCode.OK
-        _enforce_incomplete_exit_status(
-            session=pytest_session,
-            rampart_session=controller_session,
-        )
-        assert pytest_session.exitstatus == pytest.ExitCode.TESTS_FAILED
-
-    def test_missing_trial_specs_preserves_results_and_marks_incomplete(
-        self,
-    ) -> None:
-        config = _make_config(is_worker=True)
-        workeroutput: dict[str, Any] = {}
-        config.workeroutput = workeroutput
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="kept")]},
-        )
-        finalize_worker(config=config, session=worker_session)
-        payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
-        del payload["trial_specs"]
-
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = workeroutput
-        controller_session = RampartSession()
-        handle_testnodedown(session=controller_session, node=node, error=None)
-
-        assert controller_session.is_incomplete is True
-        assert (
-            "trial spec validation failed" in controller_session.incomplete_reasons[0]
-        )
-        assert controller_session.results_by_nodeid["n"][0].summary == "kept"
-        assert controller_session.build_report().total_runs == 1
-
-    def test_empty_trial_specs_preserves_results_without_incomplete(
-        self,
-    ) -> None:
-        config = _make_config(is_worker=True)
-        workeroutput: dict[str, Any] = {}
-        config.workeroutput = workeroutput
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="kept")]},
-        )
-        finalize_worker(config=config, session=worker_session)
-        payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
-        assert payload["trial_specs"] == []
-
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = workeroutput
-        controller_session = RampartSession()
-        handle_testnodedown(session=controller_session, node=node, error=None)
-
-        assert controller_session.is_incomplete is False
-        assert controller_session.results_by_nodeid["n"][0].summary == "kept"
-        assert controller_session.build_report().total_runs == 1
-
-    def test_invalid_received_threshold_marks_incomplete_and_merges_results(
-        self,
-    ) -> None:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="kept")]},
-        )
-        worker_session.register_trial_spec(
-            clone_nodeid="n",
-            base_nodeid="base",
-            threshold=0.5,
-        )
-        payload = serialize_worker_data(session=worker_session)
-        payload["trial_specs"][0]["threshold"] = float("nan")
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        session = RampartSession()
-
-        handle_testnodedown(session=session, node=node, error=None)
-
-        assert session.is_incomplete is True
-        assert "trial spec validation failed" in session.incomplete_reasons[0]
-        assert session.build_report().total_runs == 1
-        assert session.build_report().results[0].summary == "kept"
-
-    def test_malformed_trial_block_marks_incomplete_and_merges_results(
-        self,
-    ) -> None:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="kept")]},
-        )
-        payload = serialize_worker_data(session=worker_session)
-        payload["trial_specs"] = "corrupt"
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        session = RampartSession()
-
-        handle_testnodedown(session=session, node=node, error=None)
-
-        assert session.is_incomplete is True
-        assert "trial spec validation failed" in session.incomplete_reasons[0]
-        assert session.build_report().total_runs == 1
-
-    def test_merges_results_on_success(self) -> None:
-        session = RampartSession()
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="from-worker")]},
-        )
-        payload = serialize_worker_data(session=worker_session)
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        handle_testnodedown(session=session, node=node, error=None)
-        assert session.is_incomplete is False
-        assert len(session._results) == 1
-        assert session._results[0].summary == "from-worker"
-
-    def test_merges_trial_specs_on_success(self) -> None:
-        session = RampartSession()
-        worker_session = RampartSession()
-        worker_session.register_trial_spec(
-            clone_nodeid="test.py::test_x[trial-0]",
-            base_nodeid="test.py::test_x",
-            threshold=0.8,
-        )
-        worker_session.register_trial_spec(
-            clone_nodeid="test.py::test_x[trial-1]",
-            base_nodeid="test.py::test_x",
-            threshold=0.8,
-        )
-        payload = serialize_worker_data(session=worker_session)
-        node = MagicMock()
-        node.gateway.id = "gw1"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        handle_testnodedown(session=session, node=node, error=None)
-        assert session.is_incomplete is False
-        assert set(session.trial_specs) == {
-            "test.py::test_x[trial-0]",
-            "test.py::test_x[trial-1]",
-        }
-        assert (
-            session.trial_specs["test.py::test_x[trial-0]"].base_nodeid
-            == "test.py::test_x"
-        )
-        assert session.trial_specs[
-            "test.py::test_x[trial-0]"
-        ].threshold == pytest.approx(0.8)
-
-
-class TestOrderingDeterminism:
-    def _payload_node(
-        self,
-        *,
-        worker_id: str,
-        nodeid: str,
-        summary: str,
-    ) -> MagicMock:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={nodeid: [_make_result(summary=summary)]},
-        )
-        payload = serialize_worker_data(session=worker_session)
-        node = MagicMock()
-        node.gateway.id = worker_id
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        return node
-
-    def _merge_order(self, nodes: list[MagicMock]) -> list[str]:
-        session = RampartSession()
-        for node in nodes:
-            handle_testnodedown(session=session, node=node, error=None)
-        return [r.metadata["_pytest_nodeid"] for r in session.build_report().results]
-
-    def test_report_order_independent_of_worker_completion_order(self) -> None:
-        node_a = self._payload_node(
-            worker_id="gw0",
-            nodeid="pkg/test_a.py::test_a",
-            summary="a",
-        )
-        node_z = self._payload_node(
-            worker_id="gw1",
-            nodeid="pkg/test_z.py::test_z",
-            summary="z",
-        )
-        forward = self._merge_order([node_a, node_z])
-        reverse = self._merge_order([node_z, node_a])
-        assert forward == reverse
-        assert forward == ["pkg/test_a.py::test_a", "pkg/test_z.py::test_z"]
-
-    def test_deserialize_sets_authoritative_nodeid_and_index(self) -> None:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={
-                "pkg::t": [_make_result(summary="a"), _make_result(summary="b")],
-            },
-        )
-        payload = serialize_worker_data(session=worker_session)
-        results = deserialize_worker_data(data=payload)["pkg::t"]
-        assert [r.metadata["_pytest_nodeid"] for r in results] == ["pkg::t", "pkg::t"]
-        assert [r.metadata["_rampart_result_index"] for r in results] == [0, 1]
-
-    def test_handle_testnodedown_tags_source_worker(self) -> None:
-        worker_session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="x")]},
-        )
-        payload = serialize_worker_data(session=worker_session)
-        node = MagicMock()
-        node.gateway.id = "gw3"
-        node.workeroutput = {WORKEROUTPUT_KEY: payload}
-        session = RampartSession()
-        handle_testnodedown(session=session, node=node, error=None)
-        assert session._results[0].metadata["_rampart_source_worker"] == "gw3"
+        assert json.loads(json.dumps(payload))["metadata"]["tuple"] == [1, 2]
+
+    def test_invalid_enum_is_rejected(self) -> None:
+        payload = _serialize_result(result=_make_result(), nodeid="n")
+        payload["status"] = "unknown"
+        with pytest.raises(WorkerOutputError, match="SafetyStatus"):
+            _deserialize_result(data=payload)
 
 
 class TestTrialSpecs:
-    def test_serialize_round_trip(self) -> None:
+    def test_finalize_and_deserialize_round_trip(self) -> None:
+        config = _make_config(is_worker=True)
+        workeroutput: dict[str, object] = {}
+        config.workeroutput = workeroutput
         session = RampartSession()
         session.register_trial_spec(
-            clone_nodeid="t.py::a[trial-0]",
-            base_nodeid="t.py::a",
+            clone_nodeid="t.py::test_a[trial-0]",
+            base_nodeid="t.py::test_a",
             threshold=0.75,
         )
-        session.register_trial_spec(
-            clone_nodeid="t.py::a[trial-1]",
-            base_nodeid="t.py::a",
-            threshold=0.75,
-        )
-        payload = serialize_worker_data(session=session)
 
-        # Payload must survive a JSON round-trip (xdist transports JSON).
-        decoded = json.loads(json.dumps(payload))
-        specs = deserialize_trial_specs(data=decoded)
+        finalize_trial_specs_worker(config=config, session=session)
+        payload = workeroutput[TRIAL_SPECS_WORKEROUTPUT_KEY]
 
-        assert specs == {
-            "t.py::a[trial-0]": TrialSpec(base_nodeid="t.py::a", threshold=0.75),
-            "t.py::a[trial-1]": TrialSpec(base_nodeid="t.py::a", threshold=0.75),
+        assert deserialize_trial_specs(data=json.loads(json.dumps(payload))) == {
+            "t.py::test_a[trial-0]": TrialSpec(
+                base_nodeid="t.py::test_a",
+                threshold=0.75,
+            )
         }
 
-    def test_payload_without_trials_returns_empty_dict(self) -> None:
-        session = RampartSession()
-        payload = serialize_worker_data(session=session)
-        assert deserialize_trial_specs(data=payload) == {}
-
-    def test_payload_without_trial_specs_field_raises(self) -> None:
-        data = {"schema": SCHEMA_VERSION, "results_by_nodeid": {}}
-        with pytest.raises(TrialSpecValidationError, match="missing required"):
-            deserialize_trial_specs(data=data)
-
-    def test_serializes_explicit_default_threshold(self) -> None:
-        session = RampartSession()
-        session.register_trial_spec(
-            clone_nodeid="t.py::a[trial-0]",
-            base_nodeid="t.py::a",
-            threshold=TrialSpec.DEFAULT_THRESHOLD,
-        )
-        payload = serialize_worker_data(session=session)
-        assert payload["trial_specs"][0]["threshold"] == pytest.approx(1.0)
+    def test_empty_payload_is_valid(self) -> None:
+        assert deserialize_trial_specs(data=_valid_trial_payload()) == {}
 
     @pytest.mark.parametrize(
-        "trial_specs",
+        "payload",
         [
-            "not-a-list",
+            "not-a-dict",
+            {},
+            {"schema": "rampart.xdist.v1", "trial_specs": []},
+            {
+                "schema": TRIAL_SPECS_SCHEMA_VERSION,
+                "trial_specs": [],
+                "results_by_nodeid": {},
+            },
+            {"schema": TRIAL_SPECS_SCHEMA_VERSION, "trial_specs": "not-a-list"},
+        ],
+    )
+    def test_rejects_unknown_or_bulk_payloads(self, payload: object) -> None:
+        with pytest.raises(WorkerOutputError):
+            deserialize_trial_specs(data=payload)
+
+    @pytest.mark.parametrize(
+        "specs",
+        [
             ["not-a-dict"],
             [{"clone_nodeid": "", "base_nodeid": "b", "threshold": 0.5}],
-            [{"clone_nodeid": "x", "base_nodeid": 123, "threshold": 0.5}],
+            [{"clone_nodeid": "a", "base_nodeid": 3, "threshold": 0.5}],
+            [
+                {
+                    "clone_nodeid": "a",
+                    "base_nodeid": "b",
+                    "threshold": 0.5,
+                    "extra": True,
+                }
+            ],
+            [
+                {"clone_nodeid": "a", "base_nodeid": "b", "threshold": 0.5},
+                {"clone_nodeid": "a", "base_nodeid": "b", "threshold": 0.5},
+            ],
         ],
     )
-    def test_rejects_malformed_entries(self, trial_specs: object) -> None:
-        data: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {},
-            "trial_specs": trial_specs,
-        }
+    def test_rejects_malformed_or_duplicate_entries(self, specs: object) -> None:
         with pytest.raises(TrialSpecValidationError):
-            deserialize_trial_specs(data=data)
+            deserialize_trial_specs(data=_valid_trial_payload(specs=specs))
 
     @pytest.mark.parametrize(
         "threshold",
-        [
-            None,
-            "0.5",
-            True,
-            0.0,
-            -0.1,
-            1.1,
-            math.inf,
-            -math.inf,
-            math.nan,
-            10**400,
-        ],
+        [None, "0.5", True, 0.0, -0.1, 1.1, math.inf, math.nan, 10**400],
     )
-    def test_rejects_invalid_deserialized_threshold(self, threshold: object) -> None:
-        spec: dict[str, object] = {
+    def test_rejects_invalid_threshold(self, threshold: object) -> None:
+        spec = {
             "clone_nodeid": "a",
             "base_nodeid": "b",
-        }
-        if threshold is not None:
-            spec["threshold"] = threshold
-        data: dict[str, Any] = {
-            "schema": SCHEMA_VERSION,
-            "results_by_nodeid": {},
-            "trial_specs": [spec],
+            "threshold": threshold,
         }
         with pytest.raises(TrialSpecValidationError, match="finite number"):
-            deserialize_trial_specs(data=data)
+            deserialize_trial_specs(data=_valid_trial_payload(specs=[spec]))
 
-    @pytest.mark.parametrize(
-        "threshold",
-        [0.0, -0.1, 1.1, math.inf, -math.inf, math.nan, 10**400],
-    )
-    def test_rejects_invalid_serialized_threshold(self, threshold: float) -> None:
-        session = RampartSession()
-        session.register_trial_spec(
-            clone_nodeid="t.py::a[trial-0]",
-            base_nodeid="t.py::a",
-            threshold=threshold,
-        )
-        with pytest.raises(TrialSpecValidationError, match="finite number"):
-            serialize_worker_data(session=session)
-
-    def test_rejects_huge_serialized_threshold_with_bounded_error(self) -> None:
-        session = RampartSession()
-        session.register_trial_spec(
-            clone_nodeid="t.py::a[trial-0]",
-            base_nodeid="t.py::a",
-            threshold=10**5000,
-        )
+    def test_explicit_worker_error_is_bounded_and_rejected(self) -> None:
+        payload = {
+            **_valid_trial_payload(),
+            "rampart_transport_error": "x" * 1000,
+        }
         with pytest.raises(TrialSpecValidationError) as exc_info:
-            serialize_worker_data(session=session)
-        assert len(str(exc_info.value)) < 200
+            deserialize_trial_specs(data=payload)
+        assert len(str(exc_info.value)) < 300
 
-    def test_hostile_threshold_repr_does_not_escape_validation(self) -> None:
-        threshold: Any = _HostileRepr()
-        session = RampartSession()
-        session.register_trial_spec(
-            clone_nodeid="t.py::a[trial-0]",
-            base_nodeid="t.py::a",
-            threshold=threshold,
-        )
-        with pytest.raises(TrialSpecValidationError) as exc_info:
-            serialize_worker_data(session=session)
-        assert len(str(exc_info.value)) < 200
-
-    def test_hostile_container_hooks_are_not_invoked(self) -> None:
-        threshold: Any = _HostileList([_HostileRepr()])
-        session = RampartSession()
-        session.register_trial_spec(
-            clone_nodeid="n",
-            base_nodeid="b",
-            threshold=threshold,
-        )
-        with pytest.raises(TrialSpecValidationError) as exc_info:
-            serialize_worker_data(session=session)
-        assert "_HostileList" in str(exc_info.value)
-
-    def test_exact_container_diagnostic_does_not_traverse(self) -> None:
-        threshold: Any = [_HostileRepr()]
-        session = RampartSession()
-        session.register_trial_spec(
-            clone_nodeid="n",
-            base_nodeid="b",
-            threshold=threshold,
-        )
-        with pytest.raises(TrialSpecValidationError) as exc_info:
-            serialize_worker_data(session=session)
-        assert "<list len=1>" in str(exc_info.value)
-
-    def test_threshold_controls_are_escaped(self) -> None:
-        threshold: Any = "\r\n\x1b[31m\x1b]0;bad\x07\x80"
-        session = RampartSession()
-        session.register_trial_spec(
-            clone_nodeid="n",
-            base_nodeid="b",
-            threshold=threshold,
-        )
-        with pytest.raises(TrialSpecValidationError) as exc_info:
-            serialize_worker_data(session=session)
-        _assert_no_terminal_controls(str(exc_info.value))
-
-    def test_nested_huge_threshold_diagnostic_is_bounded(self) -> None:
-        threshold: Any = [10**5000]
-        session = RampartSession()
-        session.register_trial_spec(
-            clone_nodeid="t.py::a[trial-0]",
-            base_nodeid="t.py::a",
-            threshold=threshold,
-        )
-        with pytest.raises(TrialSpecValidationError) as exc_info:
-            serialize_worker_data(session=session)
-        assert len(str(exc_info.value)) < 200
-
-    def test_merge_is_idempotent(self) -> None:
-        session = RampartSession()
-        spec = TrialSpec(base_nodeid="b", threshold=0.5)
-        session.merge_trial_specs(trial_specs={"k": spec})
-        session.merge_trial_specs(trial_specs={"k": spec})
-        assert session.trial_specs == {"k": spec}
-
-    def test_merge_first_writer_wins(self) -> None:
+    def test_merge_is_idempotent_and_conflicts_do_not_overwrite(self) -> None:
         session = RampartSession()
         original = TrialSpec(base_nodeid="b1", threshold=0.5)
         replacement = TrialSpec(base_nodeid="b2", threshold=0.9)
-        session.merge_trial_specs(trial_specs={"k": original})
-        session.merge_trial_specs(trial_specs={"k": replacement})
-        # Defensive: the first registered spec wins so a worker can't
-        # silently override what the controller already saw at collection.
-        assert session.trial_specs["k"] == original
 
-    def test_invalid_payload_raises(self) -> None:
-        with pytest.raises(WorkerOutputError):
-            deserialize_trial_specs(data="not a dict")
+        assert session.merge_trial_specs(trial_specs={"k": original}) == ()
+        assert session.merge_trial_specs(trial_specs={"k": original}) == ()
+        assert session.merge_trial_specs(trial_specs={"k": replacement}) == ("k",)
+        assert session.trial_specs == {"k": original}
 
-
-class TestFinalizeWorker:
-    def test_no_op_on_controller(self) -> None:
-        config = _make_config(is_worker=False, numprocesses=2)
-        workeroutput: dict[str, Any] = {}
+    def test_finalize_writes_error_without_results(self) -> None:
+        config = _make_config(is_worker=True)
+        workeroutput: dict[str, object] = {}
         config.workeroutput = workeroutput
         session = RampartSession()
-        finalize_worker(config=config, session=session)
-        assert WORKEROUTPUT_KEY not in workeroutput
-
-    def test_writes_workeroutput_on_worker(self) -> None:
-        config = _make_config(is_worker=True)
-        workeroutput: dict[str, Any] = {}
-        config.workeroutput = workeroutput
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="x")]},
-        )
-        finalize_worker(config=config, session=session)
-        assert WORKEROUTPUT_KEY in workeroutput
-        payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
-        assert payload["schema"] == SCHEMA_VERSION
-        assert "results_by_nodeid" in payload
-
-    def test_truncates_oversize_payload(
-        self,
-    ) -> None:
-        config = _make_config(is_worker=True, max_bytes=1)
-        workeroutput: dict[str, Any] = {}
-        config.workeroutput = workeroutput
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result()]},
-        )
-        with pytest.raises(SizeLimitError):
-            finalize_worker(config=config, session=session)
-        payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
-        assert payload.get("rampart_truncated") is True
-
-    def test_invalid_trial_threshold_writes_transport_error(self) -> None:
-        config = _make_config(is_worker=True)
-        workeroutput: dict[str, Any] = {}
-        config.workeroutput = workeroutput
-        session = _make_session_with_results(
-            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        session.append_transported_results(
+            nodeid="n",
+            source_worker="worker-a",
+            sequence=1,
+            results=((0, _make_result(summary="must-not-be-serialized")),),
         )
         session.register_trial_spec(
-            clone_nodeid="t.py::a[trial-0]",
-            base_nodeid="t.py::a",
+            clone_nodeid="a",
+            base_nodeid="b",
             threshold=0.0,
         )
 
         with pytest.raises(TrialSpecValidationError):
-            finalize_worker(config=config, session=session)
+            finalize_trial_specs_worker(config=config, session=session)
 
-        payload: dict[str, Any] = workeroutput[WORKEROUTPUT_KEY]
-        assert "finite number in (0, 1]" in payload["rampart_transport_error"]
-        assert payload["results_by_nodeid"]["n"][0]["summary"] == "kept"
+        payload = workeroutput[TRIAL_SPECS_WORKEROUTPUT_KEY]
+        assert isinstance(payload, dict)
+        typed_payload = cast("dict[str, object]", payload)
+        assert "results_by_nodeid" not in typed_payload
+        assert typed_payload["trial_specs"] == []
+        assert "rampart_transport_error" in typed_payload
+
+    def test_finalize_is_noop_on_controller(self) -> None:
+        config = _make_config(numprocesses=2, dist="load")
+        config.workeroutput = {}
+        finalize_trial_specs_worker(config=config, session=RampartSession())
+        assert config.workeroutput == {}
 
 
 class TestSinkDiscovery:
@@ -1859,11 +547,9 @@ class TestSinkDiscovery:
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
         assert result == []
-        assert any(
-            "controller-side discovery" in r.getMessage() for r in caplog.records
-        )
+        assert "controller-side discovery" in caplog.records[-1].getMessage()
 
-    def test_list_subclass_candidate_is_not_iterated(
+    def test_list_subclass_is_not_iterated(
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
@@ -1874,7 +560,7 @@ class TestSinkDiscovery:
             result = discover_sinks_from_conftest(config=config)
         assert result == []
 
-    def test_sink_factory_exception_uses_traceback_fallback(
+    def test_factory_exception_uses_safe_traceback(
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
@@ -1885,9 +571,7 @@ class TestSinkDiscovery:
         plugin.rampart_sinks = failing_sinks
         config = _make_plugin_config(plugins=[("mod", plugin)])
         with caplog.at_level(logging.WARNING):
-            result = discover_sinks_from_conftest(config=config)
-
-        assert result == []
+            assert discover_sinks_from_conftest(config=config) == []
         formatted = _format_record(caplog.records[-1])
         assert "Traceback (most recent call last):" in formatted
         assert "_HostileError: <exception str() failed>" in formatted
@@ -2026,7 +710,8 @@ class TestSinkDeprecationWarning:
         )
         config = _make_plugin_config(plugins=[("mod", plugin)])
         with pytest.warns(
-            DeprecationWarning, match="rampart_sinks fixture is deprecated"
+            DeprecationWarning,
+            match="rampart_sinks fixture is deprecated",
         ):
             result = discover_sinks_from_conftest(config=config)
         assert sink in result
@@ -2051,42 +736,10 @@ class TestSinkDeprecationWarning:
         )
 
 
-class TestReportTestRunMetadata:
-    def test_set_report_metadata_appears_in_report(self) -> None:
-        session = RampartSession()
-        session.set_report_metadata(
-            metadata={"xdist_active": True, "worker_count": 2},
-        )
-        session.merge_worker_results(
-            results_by_nodeid={"n": [_make_result()]},
-        )
-        report = session.build_report()
-        assert report.metadata["xdist_active"] is True
-        assert report.metadata["worker_count"] == 2
-
-    def test_metadata_merges_across_calls(self) -> None:
-        session = RampartSession()
-        session.set_report_metadata(metadata={"a": 1})
-        session.set_report_metadata(metadata={"b": 2})
-        session.merge_worker_results(
-            results_by_nodeid={"n": [_make_result()]},
-        )
-        report = session.build_report()
-        assert report.metadata["a"] == 1
-        assert report.metadata["b"] == 2
-
-
 class TestConstants:
-    def test_default_size_limit_is_64mb(self) -> None:
+    def test_envelope_limit_defaults_to_64mb(self) -> None:
         assert DEFAULT_SIZE_LIMIT_BYTES == 64 * 1024 * 1024
 
-    def test_schema_version_is_v1(self) -> None:
-        assert SCHEMA_VERSION == "rampart.xdist.v1"
-
-    def test_workeroutput_key_namespaced(self) -> None:
-        assert WORKEROUTPUT_KEY.startswith("rampart_xdist")
-
-
-class TestTestRunReportTestable:
-    def test_test_run_report_excluded_from_collection(self) -> None:
-        assert TestRunReport.__test__ is False
+    def test_trial_workeroutput_is_narrowly_namespaced(self) -> None:
+        assert TRIAL_SPECS_SCHEMA_VERSION == "rampart.xdist.trial-specs.v1"
+        assert TRIAL_SPECS_WORKEROUTPUT_KEY == "rampart_xdist_trial_specs_v1"

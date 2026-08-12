@@ -330,6 +330,78 @@ class TestRampartSession:
         assert report.total_runs == 2
         assert report.population_summary().total_runs == 2
 
+    def test_transported_append_preserves_metadata_and_invalidates_report(self) -> None:
+        session = RampartSession()
+        cached = session.build_report()
+        original = Result(
+            status=SafetyStatus.SAFE,
+            summary="transported",
+            metadata={
+                "_rampart_result_index": 7,
+                "_rampart_trial_batch_index": 2,
+                "user": {"values": [2, 1]},
+            },
+        )
+
+        stored = session.append_transported_results(
+            nodeid="test_file.py::test_transport",
+            source_worker="worker-z",
+            sequence=3,
+            results=((4, original),),
+        )
+
+        [result] = stored
+        assert result is not original
+        assert original.metadata.get("_pytest_nodeid") is None
+        assert result.metadata["_pytest_nodeid"] == "test_file.py::test_transport"
+        assert result.metadata["_rampart_source_worker"] == "worker-z"
+        assert result.metadata["_rampart_result_index"] == 7
+        assert result.metadata["_rampart_trial_batch_index"] == 2
+        assert result.metadata["user"] == {"values": [2, 1]}
+        assert session.results_by_nodeid["test_file.py::test_transport"] == [result]
+        assert session.build_report() is not cached
+        assert session.build_report().results == [result]
+
+    def test_transported_route_orders_indexless_out_of_order_envelopes(self) -> None:
+        session = RampartSession()
+        nodeid = "test_file.py::test_retry"
+
+        session.append_transported_results(
+            nodeid=nodeid,
+            source_worker="worker-a",
+            sequence=2,
+            results=((0, Result(status=SafetyStatus.SAFE, summary="second")),),
+        )
+        session.append_transported_results(
+            nodeid=nodeid,
+            source_worker="worker-a",
+            sequence=1,
+            results=((0, Result(status=SafetyStatus.SAFE, summary="first")),),
+        )
+
+        assert [result.summary for result in session.build_report().results] == [
+            "first",
+            "second",
+        ]
+        assert all(
+            "_rampart_result_index" not in result.metadata
+            for result in session.build_report().results
+        )
+
+    def test_transported_append_rejects_nonincreasing_local_slots(self) -> None:
+        session = RampartSession()
+        with pytest.raises(ValueError, match="increasing"):
+            session.append_transported_results(
+                nodeid="test_file.py::test_slots",
+                source_worker="worker-a",
+                sequence=1,
+                results=(
+                    (1, Result(status=SafetyStatus.SAFE, summary="first")),
+                    (1, Result(status=SafetyStatus.SAFE, summary="conflict")),
+                ),
+            )
+        assert session.has_results is False
+
     def test_has_results_false_when_empty(self) -> None:
         session = RampartSession()
         assert not session.has_results
