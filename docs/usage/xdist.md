@@ -20,40 +20,44 @@ With `-n 4`, pytest spawns 4 worker processes that execute tests in parallel. RA
 ```
 Worker 1                    Worker 2                    Controller
 ─────────                   ─────────                   ──────────
-collect results             collect results
+complete item               complete item
     │                           │
-pytest_sessionfinish        pytest_sessionfinish
+teardown TestReport         teardown TestReport
     │                           │
-serialize → workeroutput    serialize → workeroutput
+v2 Result envelope          v2 Result envelope
     │                           │
     └───────────┬───────────────┘
                 ▼
+        pytest_runtest_logreport
+        validate + append immediately
+                │
+                ▼
         pytest_testnodedown (per worker)
-        deserialize + merge into
-        controller's RampartSession
+        validate clean-finish manifest
+        and deprecated clone metadata
                 │
                 ▼
         pytest_sessionfinish (controller)
+        reconcile delivery counts
         aggregate trials → evaluate gates → emit sinks
                 │
                 ▼
         Single unified TestRunReport
 ```
 
-- **Workers** collect [`Result`][rampart.core.result.Result] objects normally and serialize them into `config.workeroutput`. Workers do **not** emit reports.
-- **Controller** receives each worker's payload via the `pytest_testnodedown` hook, merges results into its own [`RampartSession`][rampart.pytest_plugin._session.RampartSession], and emits sinks once at session end.
+- **Workers** collect [`Result`][rampart.core.result.Result] objects normally and
+  attach one bounded v2 envelope to each nonempty item's teardown report.
+  Workers do **not** emit report sinks.
+- **Controller** validates each envelope and immediately appends its Results to
+  [`RampartSession`][rampart.pytest_plugin._session.RampartSession]. At session
+  end it reconciles clean-finish manifests, evaluates gates, and emits sinks
+  once.
 
 The result: **one** `JsonFileReportSink` output file, **one** call to `MyCustomSink.emit_async`, and accurate population statistics over the full result set.
 
-### V2 shadow validation
+### Authoritative v2 envelopes
 
-RAMPART also sends a **shadow-only** v2 copy of each completed item's Results on
-its teardown `TestReport`. This incremental channel validates a future
-transport design; it does not supply Results to terminal output, JSON reports,
-sinks, trial gates, or population statistics. The v1 bulk worker payload above
-remains authoritative for every user-visible report.
-
-Each nonempty item attempt carries one private JSON envelope:
+Each nonempty item attempt carries one private authoritative JSON envelope:
 
 ```json
 {
@@ -107,12 +111,13 @@ Each nonempty item attempt carries one private JSON envelope:
   sequence, Result, and drop counts. Missing manifests, gaps, count
   mismatches, malformed data, and worker loss mark the run incomplete.
 
-On a clean no-drop run, the controller compares semantic v1 and v2 Result
-multisets. Only RAMPART's node, result-index, and source-worker bookkeeping is
-excluded; Result content and multiplicity, including textual evidence, must
-match. Any divergence or v2 drop forces an otherwise-successful run to exit
-nonzero through the same incomplete-run enforcement used by v1 failures. The
-v1 Result population is never replaced or supplemented by shadow data.
+The controller accepts a valid envelope before waiting for worker shutdown.
+Exact duplicate delivery is idempotent; a conflicting duplicate faults without
+replacing the first accepted data. A later malformed envelope, missing
+manifest, worker crash, sequence/count mismatch, or dropped sibling marks the
+run incomplete but cannot remove Results that already arrived. This retained
+partial evidence is included in terminal output, JSON reports, custom sinks,
+trial summaries, and population statistics.
 
 ---
 
@@ -137,10 +142,10 @@ executions request a fresh adapter Session for each Result, but external agent
 and backend state may still persist. Custom executions control their own
 session behavior.
 
-Every worker transports ordinary Results through the unchanged
-`rampart.xdist.v1` schema. The controller reconstructs `TrialBatchSummary`
-objects from versioned primitive Result metadata and orders summaries by first
-Result occurrence, not by their random UUIDs.
+Every execution Result travels through the authoritative v2 item envelope.
+The controller reconstructs `TrialBatchSummary` objects from versioned
+primitive Result metadata and orders summaries by first Result occurrence, not
+by their random UUIDs.
 
 ### Deprecated clone marker with xdist
 
@@ -157,7 +162,11 @@ in `0.3.0`. Its old behavior is unchanged:
 Controller aggregation remains correct in every mode. The informational
 `--dist=loadgroup` warning remains for clone locality, and `--dist=each`
 continues to retain every worker attempt while gating the logical clone count.
-Do not use the marker for new tests.
+Until removal, workers send only clone node IDs, base node IDs, and thresholds
+through a temporary `rampart.xdist.trial-specs.v1` clean-finish payload.
+Missing or malformed clone metadata marks the run incomplete without
+discarding Results that arrived through v2. Do not use the marker for new
+tests.
 
 ---
 
@@ -243,18 +252,20 @@ from `config` values or environment variables there.
 
 ## Transport Validation and Evidence Fidelity
 
-Worker results cross the process boundary through pytest-xdist's
-`config.workeroutput`. RAMPART projects result data to JSON-safe primitives and
-applies the following transport validation and normalization:
+Worker Results cross the process boundary on pytest-xdist teardown reports.
+RAMPART projects Result data to JSON-safe primitives and applies the following
+transport validation and normalization:
 
-- **Schema version** — payloads with missing or unknown schema versions are rejected.
-- **Trial metadata** — the current `rampart.xdist.v1` schema requires
-  `trial_specs`; an empty list means the worker collected no trials. Missing or
-  malformed trial metadata marks the run incomplete without discarding Results
-  that already passed strict Result validation.
-- **Size** — worker payloads are capped at 64 MB by default.
-- **Value shape** — enum values, container depth, JSON-compatible metadata, and
-  finite numeric values are validated or normalized.
+- **Schema version** — envelopes and manifests with missing or unknown schema
+  versions are rejected.
+- **Structural identity** — worker sequence and local slots are validated
+  independently from Result scheduling metadata.
+- **Value shape** — exact enum values, container depth, JSON-compatible
+  metadata, finite numeric values, and full nested Result fields are validated.
+- **Route metadata** — the controller supplies node and source-worker identity;
+  envelopes cannot forge it.
+- **Deprecated clone metadata** — the separate temporary trial-spec payload is
+  exact-schema and cannot contain Results.
 - **Worker-local artifacts** — artifact paths are retained as opaque metadata
   strings; the controller does not access worker files.
 
@@ -280,15 +291,18 @@ Or in `pytest.ini` / `pyproject.toml`:
 rampart_xdist_max_bytes = 134217728
 ```
 
-Workers that exceed the cap log a warning and emit a truncation marker. The controller records the affected worker as incomplete in `TestRunReport.metadata`.
+The value caps each authoritative per-item envelope. RAMPART measures the
+actual compact JSON encoding in UTF-8 bytes, including structural wrappers. An
+individually oversized Result becomes a bounded drop record while fitting
+siblings remain; when combined Results exceed the cap, RAMPART keeps a
+deterministic prefix and records the remainder as drops. The final attribute
+never exceeds the cap and is never split across multiple report properties.
+If even an all-drop envelope cannot fit, no attribute is emitted and the clean
+manifest reports the omitted count. Every drop marks the run incomplete and
+forces an otherwise-successful run to exit nonzero.
 
-The same configured value also caps each v2 shadow report attribute without
-changing the v1 rule above. V2 measures the actual compact JSON envelope in
-UTF-8 bytes. An individually oversized Result becomes a bounded drop record
-while fitting siblings remain; when combined Results exceed the cap, v2 keeps
-a deterministic prefix and records the remainder as drops. The final
-attribute never exceeds the cap and is never split across multiple report
-properties. Every drop marks the shadow divergent/incomplete.
+The temporary deprecated clone trial-spec payload is not governed by this
+option and never carries Result data.
 
 ---
 
@@ -319,34 +333,21 @@ report.metadata["dist_mode"]      # "load", "loadgroup", etc.
 
 ---
 
-## Durability limitations
+## Durability boundaries
 
-The current worker→controller transport flushes a worker's results only at its
-clean `pytest_sessionfinish`. Because v1 remains authoritative, this has two
-user-visible consequences:
+Once a completed item's teardown envelope reaches the controller, its valid
+Results are retained even if that worker later crashes or fails clean-finish
+reconciliation. Reports remain explicitly incomplete and exit nonzero, but
+preserve the evidence that did arrive.
 
-- **A worker killed mid-run loses its already-finished results.** Because results
-  are shipped in a single batch at session end, a worker that crashes, is killed
-  (e.g. OOM, timeout, `-x` shutdown), or otherwise never reaches
-  `pytest_sessionfinish` contributes **nothing** — even tests it had already
-  completed. The run is marked incomplete (see [Incomplete Runs](#incomplete-runs)).
-- **The size cap drops the whole worker payload, not just the oversized record.**
-  When a worker's aggregate serialized payload exceeds
-  `--rampart-xdist-max-bytes`, the **entire** worker payload is dropped (and the
-  worker marked incomplete), rather than only the single oversized transcript.
+Results can still be absent when a worker dies before its teardown report is
+sent, when an individual Result exceeds the configured envelope cap, or when an
+envelope is malformed. These cases are reported through bounded incomplete
+reasons; they never trigger a fallback to clean-finish bulk Result data.
 
-The v2 shadow channel can retain Results whose teardown reports reached the
-controller before a worker died, and its per-item cap can retain siblings around
-an oversized Result. Those shadow Results remain internal on this release:
-worker loss or a drop still marks the run incomplete, while emitted reports
-continue to contain only the v1 population. This deliberate observation period
-must reconcile cleanly before any later production cutover.
-
-Until then, use `--dist=loadgroup` only when deprecated clone groups need worker
-cohesion (see
-[Deprecated clone marker with xdist](#deprecated-clone-marker-with-xdist)) and
-size the cap for both your largest expected worker payload and largest expected
-single-item Result envelope.
+The deprecated clone marker still depends on its small clean-finish trial-spec
+payload. Losing that payload fails the run closed, while independently
+delivered Results remain available.
 
 ---
 
@@ -355,10 +356,8 @@ single-item Result envelope.
 - Sinks discovered through the **fixture fallback** on the controller cannot depend
   on other pytest fixtures — use the `pytest_rampart_sinks` hook instead (see
   [Registering Sinks](#registering-sinks-the-pytest_rampart_sinks-hook)).
-- User-visible Results from a worker that dies before `pytest_sessionfinish`
-  are lost, and an over-cap v1 worker payload is dropped wholesale. Incremental
-  v2 copies may remain in internal shadow state but never backfill the report
-  (see [Durability limitations](#durability-limitations)).
+- Results from an item whose teardown report never reaches the controller
+  cannot be recovered (see [Durability boundaries](#durability-boundaries)).
 - Mixed RAMPART versions across controller and workers are unsupported; install the
   same version everywhere.
 - `pytest-xdist` itself does not support interactive debugging (`--pdb`, `--trace`);

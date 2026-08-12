@@ -209,11 +209,11 @@ When you call `Attacks.xpia(...).execute_async(adapter=...)` or `Probes.behavior
 This works via [`ExecutionEventHandler`][rampart.core.execution.ExecutionEventHandler] instances the plugin installs on every [`BaseExecution`][rampart.core.execution.BaseExecution] at construction time.
 
 Under pytest-xdist, the exact per-item tuple absorbed by this collector is also
-copied through an internal v2 shadow channel after fixture finalizers complete.
-The controller compares that shadow population with the authoritative v1 bulk
-population and fails the run on transport divergence. Shadow Results are not
-exposed to report sinks or terminal output; see
-[Parallel Execution](xdist.md#v2-shadow-validation).
+sent through the authoritative v2 teardown-report channel after fixture
+finalizers complete. The controller validates and appends each envelope
+immediately, so accepted Results remain available to terminal output and sinks
+even if the worker later crashes; the report is marked incomplete and exits
+nonzero. See [Parallel Execution](xdist.md#authoritative-v2-envelopes).
 
 ### Manual Recording
 

@@ -10,7 +10,7 @@ RAMPART exposes one pytest option for parallel-execution tuning. Other component
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--rampart-xdist-max-bytes` (CLI) / `rampart_xdist_max_bytes` (ini) | `67108864` (64 MB) | Maximum size of a worker's serialized result payload when running under [`pytest-xdist`](xdist.md). Workers exceeding the cap are recorded as incomplete in `TestRunReport.metadata`. |
+| `--rampart-xdist-max-bytes` (CLI) / `rampart_xdist_max_bytes` (ini) | `67108864` (64 MB) | Maximum UTF-8 size of each authoritative per-item Result envelope under [`pytest-xdist`](xdist.md). Oversized Results are reported as drops, fitting siblings remain, and the run is marked incomplete. |
 
 ---
 
@@ -116,5 +116,4 @@ manifest.declares_tool("send_email")  # True
 manifest.get_tool("send_email")       # ToolDeclaration(name="send_email", ...)
 manifest.get_tool("nonexistent")      # None
 ```
-
 

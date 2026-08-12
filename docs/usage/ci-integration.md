@@ -95,14 +95,11 @@ RAMPART is configured via pytest options and Python (sinks, adapters, payloads).
 
 ### `--rampart-xdist-max-bytes`
 
-Maximum size in bytes used by both xdist transport versions. Defaults to
-`67108864` (64 MB). The authoritative v1 bulk payload keeps its existing
-worker-wide behavior: an over-cap payload is dropped and the run is incomplete.
-The v2 validation channel applies the value to each private per-item shadow
-envelope, retaining a deterministic fitting prefix and recording oversized
-Results as drops. V2 drops also make the run incomplete, but never replace or
-supplement v1 report Results. Also configurable via the
-`rampart_xdist_max_bytes` ini option.
+Maximum UTF-8 size of each authoritative per-item Result envelope. Defaults to
+`67108864` (64 MB). RAMPART retains a deterministic fitting prefix, records
+oversized Results as bounded drops, preserves fitting siblings, and marks the
+run incomplete. There is no clean-finish bulk Result fallback. Also
+configurable via the `rampart_xdist_max_bytes` ini option.
 
 ```bash
 pytest -n auto --rampart-xdist-max-bytes=134217728   # 128 MB

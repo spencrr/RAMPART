@@ -61,10 +61,11 @@ Subclasses implement only `_execute_async` and `strategy_name`. They should **no
 
 `pytest_plugin/` integrates RAMPART with pytest:
 
-- `plugin.py` — hook registrations (configure, collection, sessionfinish, terminal summary, optional `pytest_testnodedown`).
+- `plugin.py` — hook registrations (configure, collection, sessionfinish, and terminal summary).
 - `_session.py` — session-scoped state container (`RampartSession`), trial-group aggregates, sink registry, idempotency and incomplete-run flags.
 - `_collection.py` — per-test `ResultCollector` and the `ContextVar`-based handler that captures results from executions.
-- `_xdist.py` — pytest-xdist support: detection helpers, JSON-safe serialization of `Result` objects, controller-side merge, and conftest-scanning sink discovery. Workers serialize their results into `config.workeroutput`; the controller deserializes via `pytest_testnodedown` and emits a single unified report. See [Parallel Execution](../usage/xdist.md) for the data flow, validation, and evidence-fidelity behavior.
+- `_xdist_transport.py` — authoritative per-item xdist Result envelopes, strict validation, incremental controller append, duplicate/conflict handling, and clean-finish manifest reconciliation.
+- `_xdist.py` — shared full-fidelity Result projection, xdist detection/configuration, temporary deprecated clone trial-spec transport, and conftest-scanning sink discovery. See [Parallel Execution](../usage/xdist.md) for the data flow, validation, durability, and evidence-fidelity behavior.
 
 ### PyRIT Bridge
 
