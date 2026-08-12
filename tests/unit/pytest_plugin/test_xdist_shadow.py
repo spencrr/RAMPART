@@ -22,6 +22,7 @@ from rampart.core.types import (
     Response,
     Turn,
 )
+from rampart.pytest_plugin._collection import ResultCollector
 from rampart.pytest_plugin._session import RampartSession
 from rampart.pytest_plugin._xdist import DEFAULT_SIZE_LIMIT_BYTES, SIZE_LIMIT_OPTION
 from rampart.pytest_plugin._xdist_shadow import (
@@ -70,11 +71,12 @@ def _make_result(
     summary: str = "summary",
     metadata: dict[str, Any] | None = None,
 ) -> Result:
+    result_metadata = {"_rampart_result_index": 0, **(metadata or {})}
     return Result(
         status=SafetyStatus.SAFE,
         summary=summary,
         observability_level=ObservabilityLevel.RESPONSE_ONLY,
-        metadata=metadata or {},
+        metadata=result_metadata,
     )
 
 
@@ -204,6 +206,44 @@ class TestEnvelopeBuild:
         ]
         assert envelope.dropped == ()
 
+    def test_later_same_node_attempt_preserves_cumulative_indexes(self) -> None:
+        session = RampartSession()
+        node = MagicMock()
+        node.nodeid = "test.py::test_rerun"
+        node.get_closest_marker.return_value = None
+        first = ResultCollector()
+        first.record(result=_make_result(summary="first-attempt"))
+        second = ResultCollector()
+        second.record(result=_make_result(summary="later-0"))
+        second.record(result=_make_result(summary="later-1"))
+        session.absorb(node=node, collector=first)
+        absorbed = session.absorb(node=node, collector=second)
+
+        built = build_envelope(
+            results=absorbed,
+            nodeid=node.nodeid,
+            sequence=2,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+
+        assert built.encoded is not None
+        raw = json.loads(built.encoded)
+        assert [record["index"] for record in raw["results"]] == [0, 1]
+        assert [
+            record["result"]["metadata"]["_rampart_result_index"]
+            for record in raw["results"]
+        ] == [1, 2]
+        envelope = parse_envelope(
+            encoded=built.encoded,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+            nodeid=node.nodeid,
+        )
+        assert [record.index for record in envelope.results] == [0, 1]
+        assert [
+            record.result.metadata["_rampart_result_index"]
+            for record in envelope.results
+        ] == [1, 2]
+
     def test_individually_oversized_result_keeps_siblings(self) -> None:
         limit = 1000
         built = build_envelope(
@@ -230,6 +270,31 @@ class TestEnvelopeBuild:
             "third",
         ]
         assert [item.index for item in envelope.dropped] == [1]
+
+    def test_drop_size_includes_structural_result_wrapper(self) -> None:
+        result = _make_result(summary="x" * 5000)
+        roomy = build_envelope(
+            results=(result,),
+            nodeid="test.py::test_wrapper_size",
+            sequence=1,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+        assert roomy.encoded is not None
+        roomy_raw = json.loads(roomy.encoded)
+        record = roomy_raw["results"][0]
+
+        constrained = build_envelope(
+            results=(result,),
+            nodeid="test.py::test_wrapper_size",
+            sequence=1,
+            limit=1000,
+        )
+
+        assert constrained.encoded is not None
+        constrained_raw = json.loads(constrained.encoded)
+        [drop] = constrained_raw["dropped"]
+        assert drop["serialized_bytes"] == shadow_module._encoded_size(record)
+        assert drop["serialized_bytes"] > shadow_module._encoded_size(record["result"])
 
     def test_combined_cap_retains_deterministic_prefix(self) -> None:
         results = tuple(_make_result(summary=str(index) * 120) for index in range(4))
@@ -415,13 +480,133 @@ class TestEnvelopeValidation:
         )
         assert built.encoded is not None
         raw = json.loads(built.encoded)
-        raw["results"][1]["metadata"]["_rampart_result_index"] = 0
+        raw["results"][1]["index"] = 0
 
         with pytest.raises(ShadowTransportError, match="partition"):
             parse_envelope(
                 encoded=json.dumps(raw),
                 limit=DEFAULT_SIZE_LIMIT_BYTES,
                 nodeid="test.py::test_indexes",
+            )
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "missing-index",
+            "extra-key",
+            "bool-index",
+            "negative-index",
+            "nondict-result",
+        ],
+    )
+    def test_result_record_shape_is_strict(self, mutation: str) -> None:
+        built = build_envelope(
+            results=(_make_result(),),
+            nodeid="test.py::test_record",
+            sequence=1,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+        assert built.encoded is not None
+        raw = json.loads(built.encoded)
+        record = raw["results"][0]
+        if mutation == "missing-index":
+            del record["index"]
+        elif mutation == "extra-key":
+            record["unexpected"] = "value"
+        elif mutation == "bool-index":
+            record["index"] = True
+        elif mutation == "negative-index":
+            record["index"] = -1
+        else:
+            record["result"] = []
+
+        with pytest.raises(ShadowTransportError):
+            parse_envelope(
+                encoded=json.dumps(raw),
+                limit=DEFAULT_SIZE_LIMIT_BYTES,
+                nodeid="test.py::test_record",
+            )
+
+    def test_result_record_indexes_must_be_increasing(self) -> None:
+        built = build_envelope(
+            results=(_make_result(summary="a"), _make_result(summary="b")),
+            nodeid="test.py::test_result_order",
+            sequence=1,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+        assert built.encoded is not None
+        raw = json.loads(built.encoded)
+        raw["results"][0]["index"] = 1
+        raw["results"][1]["index"] = 0
+
+        with pytest.raises(ShadowTransportError, match="increasing"):
+            parse_envelope(
+                encoded=json.dumps(raw),
+                limit=DEFAULT_SIZE_LIMIT_BYTES,
+                nodeid="test.py::test_result_order",
+            )
+
+    def test_result_requires_cumulative_scheduling_index(self) -> None:
+        built = build_envelope(
+            results=(_make_result(),),
+            nodeid="test.py::test_scheduling_index",
+            sequence=1,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+        assert built.encoded is not None
+        raw = json.loads(built.encoded)
+        del raw["results"][0]["result"]["metadata"]["_rampart_result_index"]
+
+        with pytest.raises(ShadowTransportError, match="scheduling index"):
+            parse_envelope(
+                encoded=json.dumps(raw),
+                limit=DEFAULT_SIZE_LIMIT_BYTES,
+                nodeid="test.py::test_scheduling_index",
+            )
+
+    def test_drop_indexes_must_be_increasing(self) -> None:
+        raw = {
+            "schema_version": SHADOW_SCHEMA_VERSION,
+            "sequence": 1,
+            "produced": 2,
+            "results": [],
+            "dropped": [
+                {"index": 1, "reason": "size_limit", "serialized_bytes": 10},
+                {"index": 0, "reason": "size_limit", "serialized_bytes": 10},
+            ],
+        }
+
+        with pytest.raises(ShadowTransportError, match="drop indexes"):
+            parse_envelope(
+                encoded=json.dumps(raw),
+                limit=DEFAULT_SIZE_LIMIT_BYTES,
+                nodeid="test.py::test_drop_order",
+            )
+
+    @pytest.mark.parametrize("drop_index", [0, 2], ids=["duplicate", "gap"])
+    def test_result_and_drop_indexes_must_partition(self, drop_index: int) -> None:
+        built = build_envelope(
+            results=(_make_result(),),
+            nodeid="test.py::test_partition",
+            sequence=1,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+        assert built.encoded is not None
+        raw = json.loads(built.encoded)
+        raw["produced"] = 2
+        raw["dropped"] = [
+            {
+                "index": drop_index,
+                "reason": "size_limit",
+                "serialized_bytes": 10,
+            }
+        ]
+
+        with pytest.raises(ShadowTransportError, match="partition"):
+            parse_envelope(
+                encoded=json.dumps(raw),
+                limit=DEFAULT_SIZE_LIMIT_BYTES,
+                nodeid="test.py::test_partition",
             )
 
     @pytest.mark.parametrize("key", ["_pytest_nodeid", "_rampart_source_worker"])
@@ -434,7 +619,7 @@ class TestEnvelopeValidation:
         )
         assert built.encoded is not None
         raw = json.loads(built.encoded)
-        raw["results"][0]["metadata"][key] = "spoofed"
+        raw["results"][0]["result"]["metadata"][key] = "spoofed"
 
         with pytest.raises(ShadowTransportError, match="route metadata"):
             parse_envelope(
@@ -452,7 +637,7 @@ class TestEnvelopeValidation:
         )
         assert built.encoded is not None
         raw = json.loads(built.encoded)
-        raw["results"][0]["summary"] = 7
+        raw["results"][0]["result"]["summary"] = 7
 
         with pytest.raises(ShadowTransportError, match="summary"):
             parse_envelope(
@@ -470,7 +655,7 @@ class TestEnvelopeValidation:
         )
         assert built.encoded is not None
         raw = json.loads(built.encoded)
-        raw["results"][0]["unexpected"] = "value"
+        raw["results"][0]["result"]["unexpected"] = "value"
 
         with pytest.raises(ShadowTransportError, match="exactly"):
             parse_envelope(
@@ -483,6 +668,7 @@ class TestEnvelopeValidation:
         result = Result(
             status=SafetyStatus.SAFE,
             summary="html",
+            metadata={"_rampart_result_index": 0},
             turns=[
                 Turn(
                     request=Request(
@@ -546,7 +732,7 @@ class TestEnvelopeValidation:
         nested: object = "leaf"
         for _ in range(600):
             nested = [nested]
-        raw["results"][0]["metadata"]["deep"] = nested
+        raw["results"][0]["result"]["metadata"]["deep"] = nested
 
         with pytest.raises(ShadowTransportError, match="depth"):
             parse_envelope(
@@ -782,6 +968,46 @@ class TestControllerRuntime:
         assert session.is_incomplete is True
         assert any("conflicting" in reason for reason in session.incomplete_reasons)
 
+    def test_conflicting_structural_slot_assignment_fails_closed(self) -> None:
+        _, session, runtime = _controller_runtime()
+        first = build_envelope(
+            results=(
+                _make_result(summary="slot-a"),
+                _make_result(summary="slot-b"),
+            ),
+            nodeid="test.py::test_slot_conflict",
+            sequence=1,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+        second = build_envelope(
+            results=(
+                _make_result(summary="slot-b"),
+                _make_result(summary="slot-a"),
+            ),
+            nodeid="test.py::test_slot_conflict",
+            sequence=1,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+        assert first.encoded is not None
+        assert second.encoded is not None
+
+        runtime.pytest_runtest_logreport(
+            _make_report(
+                encoded=first.encoded,
+                nodeid="test.py::test_slot_conflict",
+            )
+        )
+        runtime.pytest_runtest_logreport(
+            _make_report(
+                encoded=second.encoded,
+                nodeid="test.py::test_slot_conflict",
+            )
+        )
+
+        assert len(runtime._controller.deliveries) == 1
+        assert session.is_incomplete is True
+        assert any("conflicting" in reason for reason in session.incomplete_reasons)
+
     @pytest.mark.parametrize("worker_id", [None, "", 7])
     def test_invalid_worker_identity_marks_incomplete(self, worker_id: object) -> None:
         _, session, runtime = _controller_runtime()
@@ -993,6 +1219,46 @@ class TestControllerRuntime:
             "third",
         ]
         assert session.is_incomplete is True
+
+    def test_reconciliation_preserves_cumulative_scheduling_index(self) -> None:
+        config, session, runtime = _controller_runtime()
+        nodeid = "test.py::test_cumulative_index"
+        result = _make_result(
+            summary="same",
+            metadata={"_rampart_result_index": 7},
+        )
+        built = build_envelope(
+            results=(result,),
+            nodeid=nodeid,
+            sequence=1,
+            limit=DEFAULT_SIZE_LIMIT_BYTES,
+        )
+        assert built.encoded is not None
+        runtime.pytest_runtest_logreport(
+            _make_report(encoded=built.encoded, nodeid=nodeid)
+        )
+        runtime.pytest_testnodedown(
+            _make_node(manifest=_make_manifest()),
+            None,
+        )
+        session.merge_worker_results(
+            results_by_nodeid={
+                nodeid: [
+                    _make_result(
+                        summary="same",
+                        metadata={"_rampart_result_index": 7},
+                    )
+                ]
+            }
+        )
+
+        _finish_runtime(runtime=runtime, config=config)
+
+        delivery = next(iter(runtime._controller.deliveries.values()))
+        [validated] = delivery.envelope.results
+        assert validated.index == 0
+        assert validated.result.metadata["_rampart_result_index"] == 7
+        assert session.is_incomplete is False
 
     def test_semantic_divergence_marks_incomplete(self) -> None:
         config, session, runtime = _controller_runtime()

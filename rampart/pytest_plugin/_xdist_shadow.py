@@ -161,13 +161,20 @@ class ShadowResultWire(TypedDict):
     metadata: dict[str, Any]
 
 
+class ShadowResultRecordWire(TypedDict):
+    """One successful Result with its envelope-local slot."""
+
+    index: int
+    result: ShadowResultWire
+
+
 class ShadowEnvelopeWire(TypedDict):
     """Per-item v2 shadow envelope."""
 
     schema_version: int
     sequence: int
     produced: int
-    results: list[ShadowResultWire]
+    results: list[ShadowResultRecordWire]
     dropped: list[ShadowDropWire]
 
 
@@ -192,7 +199,7 @@ class ShadowSizeError(ShadowTransportError):
 @dataclass(frozen=True, kw_only=True)
 class _SerializedResult:
     index: int
-    payload: ShadowResultWire
+    record: ShadowResultRecordWire
     serialized_bytes: int
     drop: ShadowDropWire
     drop_bytes: int
@@ -307,21 +314,21 @@ def _prepare_result(
     nodeid: str,
     index: int,
 ) -> _SerializedResult:
-    """Return one Result projection without authoritative route metadata."""
+    """Return one structural record without authoritative route metadata."""
     raw = _serialize_result(result=result, nodeid=nodeid)
     metadata = dict(cast("dict[str, Any]", raw["metadata"]))
     metadata.pop(_NODEID_METADATA_KEY, None)
     metadata.pop(_SOURCE_WORKER_METADATA_KEY, None)
-    metadata[_RESULT_INDEX_METADATA_KEY] = index
     raw["metadata"] = metadata
     payload = cast("ShadowResultWire", raw)
-    payload_encoded = _encode_json(payload)
-    serialized_bytes = len(payload_encoded.encode("utf-8"))
+    record = ShadowResultRecordWire(index=index, result=payload)
+    record_encoded = _encode_json(record)
+    serialized_bytes = len(record_encoded.encode("utf-8"))
     drop = _drop_wire(index=index, serialized_bytes=serialized_bytes)
     drop_encoded = _encode_json(drop)
     return _SerializedResult(
         index=index,
-        payload=payload,
+        record=record,
         serialized_bytes=serialized_bytes,
         drop=drop,
         drop_bytes=len(drop_encoded.encode("utf-8")),
@@ -348,7 +355,7 @@ def _envelope_wire(
         "schema_version": SHADOW_SCHEMA_VERSION,
         "sequence": sequence,
         "produced": len(records),
-        "results": [record.payload for record in records if record.index in retained],
+        "results": [record.record for record in records if record.index in retained],
         "dropped": [record.drop for record in records if record.index not in retained],
     }
 
@@ -860,7 +867,7 @@ def _freeze_json(  # ruff: ignore[too-many-return-statements]
 def _validate_result(
     *,
     value: object,
-) -> tuple[ValidatedResult, object]:
+) -> tuple[Result, object]:
     """Return one strictly validated existing v1 Result projection.
 
     Raises:
@@ -905,10 +912,10 @@ def _validate_result(
     if _NODEID_METADATA_KEY in metadata or _SOURCE_WORKER_METADATA_KEY in metadata:
         msg = "Shadow Result must not embed authoritative route metadata."
         raise ShadowTransportError(msg)
-    index = _require_int(
+    _require_int(
         value=metadata.get(_RESULT_INDEX_METADATA_KEY),
         minimum=0,
-        context="Shadow Result index",
+        context="Shadow Result scheduling index",
     )
     try:
         result = _deserialize_result(data=typed)
@@ -918,7 +925,29 @@ def _validate_result(
     if result.safe is not typed["safe"]:
         msg = "Shadow Result safe does not match status."
         raise ShadowTransportError(msg)
-    return ValidatedResult(index=index, result=result), _freeze_json(typed)
+    return result, _freeze_json(typed)
+
+
+def _validate_result_record(
+    *,
+    value: object,
+) -> tuple[ValidatedResult, object]:
+    """Return one strictly validated structural Result record."""
+    typed = _require_exact_dict(
+        value=value,
+        keys=frozenset(ShadowResultRecordWire.__required_keys__),
+        context="Shadow Result record",
+    )
+    index = _require_int(
+        value=typed["index"],
+        minimum=0,
+        context="Shadow Result record index",
+    )
+    result, result_key = _validate_result(value=typed["result"])
+    return (
+        ValidatedResult(index=index, result=result),
+        (("index", index), ("result", result_key)),
+    )
 
 
 def _validate_drop(value: object) -> ValidatedDrop:
@@ -1007,8 +1036,8 @@ def parse_envelope(  # ruff: ignore[complex-structure, too-many-locals]
         raise ShadowTransportError(msg)
     validated_results: list[ValidatedResult] = []
     result_keys: list[object] = []
-    for raw_result in raw_results:
-        validated, semantic_key = _validate_result(value=raw_result)
+    for raw_record in raw_results:
+        validated, semantic_key = _validate_result_record(value=raw_record)
         validated_results.append(validated)
         result_keys.append(semantic_key)
     validated_drops = tuple(_validate_drop(value=drop) for drop in raw_drops)
@@ -1017,6 +1046,9 @@ def parse_envelope(  # ruff: ignore[complex-structure, too-many-locals]
     indexes = [*result_indexes, *drop_indexes]
     if result_indexes != sorted(result_indexes):
         msg = "Shadow Result indexes must be increasing."
+        raise ShadowTransportError(msg)
+    if drop_indexes != sorted(drop_indexes):
+        msg = "Shadow drop indexes must be increasing."
         raise ShadowTransportError(msg)
     if len(indexes) != len(set(indexes)) or set(indexes) != set(range(produced)):
         msg = "Shadow Result and drop indexes must partition produced records."
@@ -1263,7 +1295,6 @@ class XdistShadowRuntime:
         for validated in envelope.results:
             validated.result.metadata[_NODEID_METADATA_KEY] = nodeid
             validated.result.metadata[_SOURCE_WORKER_METADATA_KEY] = worker_id
-            validated.result.metadata[_RESULT_INDEX_METADATA_KEY] = validated.index
         self._controller.deliveries[key] = ShadowDelivery(
             worker_id=worker_id,
             nodeid=nodeid,

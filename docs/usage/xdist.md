@@ -59,11 +59,30 @@ Each nonempty item attempt carries one private JSON envelope:
 {
   "schema_version": 2,
   "sequence": 7,
-  "produced": 1,
-  "results": [],
-  "dropped": [
+  "produced": 2,
+  "results": [
     {
       "index": 0,
+      "result": {
+        "safe": true,
+        "status": "safe",
+        "summary": "Agent defended successfully",
+        "turns": [],
+        "duration_seconds": 0.4,
+        "harm_category": "prompt_injection",
+        "strategy": "xpia",
+        "observability_level": "response_only",
+        "injections": [],
+        "metadata": {
+          "_pytest_test_name": "test_injection",
+          "_rampart_result_index": 5
+        }
+      }
+    }
+  ],
+  "dropped": [
+    {
+      "index": 1,
       "reason": "size_limit",
       "serialized_bytes": 73400320
     }
@@ -72,8 +91,12 @@ Each nonempty item attempt carries one private JSON envelope:
 ```
 
 - `sequence` is monotonic and worker-local. The delivery identity is
-  `(worker_id, sequence)`; a Result adds its zero-based index within the
-  attempted tuple.
+  `(worker_id, sequence)`. Each successful or dropped record has a structural,
+  zero-based `index`, so `(worker_id, sequence, index)` identifies one local
+  slot and the two record lists exactly partition `0..produced-1`.
+- The structural slot is independent of Result metadata.
+  `_rampart_result_index` retains the cumulative scheduling index assigned by
+  the authoritative worker session; v2 does not rewrite or alias it.
 - The envelope does not carry a worker ID or node ID. The controller trusts
   the `worker_id` and `nodeid` reconstructed by pytest-xdist.
 - Duplicate delivery of identical content is idempotent. Reusing an identity

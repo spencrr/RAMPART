@@ -152,7 +152,7 @@ def pytest_sessionfinish(session, exitstatus):
         "delivery_count": len(deliveries),
         "faults": sorted(runtime._controller.fault_codes),
         "incomplete": runtime.session.is_incomplete,
-        "result_indexes": [
+        "slot_indexes": [
             [result.index for result in delivery.envelope.results]
             for delivery in deliveries
         ],
@@ -827,7 +827,7 @@ class TestXdistShadowLifecycle:
 
         result.assert_outcomes(passed=1)
         snapshot = _load_shadow_snapshot(configured_pytester)
-        assert snapshot["result_indexes"] == [[0, 1]]
+        assert snapshot["slot_indexes"] == [[0, 1]]
         assert snapshot["summaries"] == ["first", "second"]
         assert snapshot["v1_results"] == snapshot["shadow_results"] == 2
 
