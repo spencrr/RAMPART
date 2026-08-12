@@ -15,19 +15,19 @@ from unittest.mock import MagicMock
 import pytest
 from _pytest.config import PytestPluginManager
 
-from rampart.core import (
+from rampart.core.result import (
+    HarmCategory,
+    InjectionRecord,
+    Result,
+    SafetyStatus,
+)
+from rampart.core.trial import (
     TRIAL_BATCH_COUNT_KEY,
     TRIAL_BATCH_ID_KEY,
     TRIAL_BATCH_INDEX_KEY,
     TRIAL_BATCH_SCHEMA,
     TRIAL_BATCH_SCHEMA_KEY,
     TRIAL_BATCH_THRESHOLD_KEY,
-)
-from rampart.core.result import (
-    HarmCategory,
-    InjectionRecord,
-    Result,
-    SafetyStatus,
 )
 from rampart.core.types import (
     EvalOutcome,

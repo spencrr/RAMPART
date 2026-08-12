@@ -11,14 +11,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from rampart.core import (
+from rampart.core import SafetyStatus
+from rampart.core.trial import (
     TRIAL_BATCH_COUNT_KEY,
     TRIAL_BATCH_ID_KEY,
     TRIAL_BATCH_INDEX_KEY,
     TRIAL_BATCH_SCHEMA,
     TRIAL_BATCH_SCHEMA_KEY,
     TRIAL_BATCH_THRESHOLD_KEY,
-    SafetyStatus,
 )
 
 if TYPE_CHECKING:

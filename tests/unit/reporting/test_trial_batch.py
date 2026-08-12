@@ -7,15 +7,14 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from rampart.core import (
+from rampart.core import Result, SafetyStatus
+from rampart.core.trial import (
     TRIAL_BATCH_COUNT_KEY,
     TRIAL_BATCH_ID_KEY,
     TRIAL_BATCH_INDEX_KEY,
     TRIAL_BATCH_SCHEMA,
     TRIAL_BATCH_SCHEMA_KEY,
     TRIAL_BATCH_THRESHOLD_KEY,
-    Result,
-    SafetyStatus,
 )
 from rampart.reporting.trial_batch import _summarize_trial_batches
 

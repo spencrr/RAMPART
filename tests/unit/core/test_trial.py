@@ -5,19 +5,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import FrozenInstanceError
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import UUID
 
 import pytest
 
 from rampart import TrialBatch, execute_trials_async
 from rampart.core import (
-    TRIAL_BATCH_COUNT_KEY,
-    TRIAL_BATCH_ID_KEY,
-    TRIAL_BATCH_INDEX_KEY,
-    TRIAL_BATCH_SCHEMA,
-    TRIAL_BATCH_SCHEMA_KEY,
-    TRIAL_BATCH_THRESHOLD_KEY,
     AgentAdapter,
     AppManifest,
     BaseExecution,
@@ -29,6 +23,15 @@ from rampart.core import (
     Response,
     Result,
     SafetyStatus,
+)
+from rampart.core.execution import _default_handler_factory
+from rampart.core.trial import (
+    TRIAL_BATCH_COUNT_KEY,
+    TRIAL_BATCH_ID_KEY,
+    TRIAL_BATCH_INDEX_KEY,
+    TRIAL_BATCH_SCHEMA,
+    TRIAL_BATCH_SCHEMA_KEY,
+    TRIAL_BATCH_THRESHOLD_KEY,
 )
 
 if TYPE_CHECKING:
@@ -106,6 +109,31 @@ class _RaisingExecution(BaseExecution):
         raise self._error
 
 
+class _DuckResult:
+    def __init__(self) -> None:
+        self.status = SafetyStatus.SAFE
+        self.metadata = {"user": "kept"}
+        self.duration_seconds = 0.0
+
+
+class _InvalidReturnExecution(BaseExecution):
+    def __init__(
+        self,
+        *,
+        value: object,
+        event_handlers: list[ExecutionEventHandler] | None = None,
+    ) -> None:
+        super().__init__(event_handlers=event_handlers)
+        self._value = value
+
+    @property
+    def strategy_name(self) -> str:
+        return "invalid-return"
+
+    async def _execute_async(self, *, adapter: AgentAdapter) -> Result:
+        return cast("Any", self._value)
+
+
 class _MetadataObserver(ExecutionEventHandler):
     def __init__(self) -> None:
         self.post_metadata: list[dict[str, object]] = []
@@ -141,6 +169,16 @@ def _unexpected_factory() -> BaseExecution:
 
 def _non_execution_factory() -> object:
     return object()
+
+
+_TRIAL_METADATA_CONSTANTS = {
+    "TRIAL_BATCH_COUNT_KEY",
+    "TRIAL_BATCH_ID_KEY",
+    "TRIAL_BATCH_INDEX_KEY",
+    "TRIAL_BATCH_SCHEMA",
+    "TRIAL_BATCH_SCHEMA_KEY",
+    "TRIAL_BATCH_THRESHOLD_KEY",
+}
 
 
 class TestTrialInputValidation:
@@ -282,6 +320,65 @@ class TestTrialExecution:
 
         assert result.metadata[TRIAL_BATCH_INDEX_KEY] == 0
 
+    async def test_rejects_non_result_before_later_trials_async(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(_default_handler_factory, "factory", None)
+        observer = _MetadataObserver()
+        value = _DuckResult()
+        calls = 0
+
+        def factory() -> BaseExecution:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise AssertionError("later trial must not run")
+            return _InvalidReturnExecution(
+                value=value,
+                event_handlers=[observer],
+            )
+
+        with pytest.raises(TypeError, match="must return a Result"):
+            await execute_trials_async(
+                execution_factory=factory,
+                adapter=_Adapter(),
+                count=2,
+            )
+
+        assert calls == 1
+        assert value.metadata == {"user": "kept"}
+        assert observer.post_metadata == [{"user": "kept"}]
+
+    async def test_rejects_invalid_status_before_tagging_or_later_trials_async(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(_default_handler_factory, "factory", None)
+        observer = _MetadataObserver()
+        result = _result(metadata={"user": "visible"})
+        attribute = "status"
+        setattr(result, attribute, "safe")
+        calls = 0
+
+        def factory() -> BaseExecution:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise AssertionError("later trial must not run")
+            return _StaticExecution(result=result, event_handlers=[observer])
+
+        with pytest.raises(ValueError, match="status must be a SafetyStatus"):
+            await execute_trials_async(
+                execution_factory=factory,
+                adapter=_Adapter(),
+                count=2,
+            )
+
+        assert calls == 1
+        assert result.metadata == {"user": "visible"}
+        assert observer.post_metadata == [{"user": "visible"}]
+
     async def test_rejects_reused_result_identity_async(self) -> None:
         result = _result()
         executions = [
@@ -384,11 +481,16 @@ class TestTrialBatch:
     def test_public_exports(self) -> None:
         import rampart
         import rampart.core
+        import rampart.core.trial as trial_module
 
         assert rampart.TrialBatch is TrialBatch
         assert rampart.core.TrialBatch is TrialBatch
         assert rampart.execute_trials_async is execute_trials_async
         assert rampart.core.execute_trials_async is execute_trials_async
+        assert trial_module.__all__ == ["TrialBatch", "execute_trials_async"]
+        for module in (rampart, rampart.core):
+            assert _TRIAL_METADATA_CONSTANTS.isdisjoint(module.__all__)
+            assert all(not hasattr(module, name) for name in _TRIAL_METADATA_CONSTANTS)
 
     async def test_computes_all_status_counts_async(self) -> None:
         statuses = list(SafetyStatus)
@@ -447,6 +549,43 @@ class TestTrialBatch:
         )
 
         assert batch.threshold == pytest.approx(1.0)
+        assert batch.passed is False
+        assert bool(batch) is False
+
+    def test_aggregates_follow_mutated_result_status(self) -> None:
+        result = _result(status=SafetyStatus.SAFE)
+        batch = TrialBatch(
+            batch_id="123e4567-e89b-42d3-a456-426614174000",
+            results=(result,),
+            requested_count=1,
+        )
+        assert batch.safe_count == 1
+        assert batch.unsafe_count == 0
+        assert batch.pass_rate == pytest.approx(1.0)
+        assert bool(batch) is True
+
+        result.status = SafetyStatus.UNSAFE
+
+        assert batch.safe_count == 0
+        assert batch.unsafe_count == 1
+        assert batch.pass_rate == pytest.approx(0.0)
+        assert batch.passed is False
+        assert bool(batch) is False
+
+    def test_invalid_mutated_status_fails_closed(self) -> None:
+        first = _result(status=SafetyStatus.SAFE)
+        second = _result(status=SafetyStatus.SAFE)
+        batch = TrialBatch(
+            batch_id="123e4567-e89b-42d3-a456-426614174000",
+            results=(first, second),
+            requested_count=2,
+            threshold=0.5,
+        )
+        attribute = "status"
+        setattr(first, attribute, "safe")
+
+        assert batch.safe_count == 1
+        assert batch.pass_rate == pytest.approx(0.5)
         assert batch.passed is False
         assert bool(batch) is False
 

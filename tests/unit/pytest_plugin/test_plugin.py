@@ -14,7 +14,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from rampart.core import (
+from rampart.core.result import Result, SafetyStatus
+from rampart.core.trial import (
     TRIAL_BATCH_COUNT_KEY,
     TRIAL_BATCH_ID_KEY,
     TRIAL_BATCH_INDEX_KEY,
@@ -22,7 +23,6 @@ from rampart.core import (
     TRIAL_BATCH_SCHEMA_KEY,
     TRIAL_BATCH_THRESHOLD_KEY,
 )
-from rampart.core.result import Result, SafetyStatus
 from rampart.core.types import ObservabilityLevel
 from rampart.pytest_plugin._collection import (
     ResultCollectionHandler,

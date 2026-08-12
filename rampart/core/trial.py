@@ -6,8 +6,7 @@
 from __future__ import annotations
 
 import math
-from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
@@ -29,12 +28,6 @@ TRIAL_BATCH_COUNT_KEY: str = "_rampart_trial_batch_count"
 TRIAL_BATCH_THRESHOLD_KEY: str = "_rampart_trial_batch_threshold"
 
 __all__ = [
-    "TRIAL_BATCH_COUNT_KEY",
-    "TRIAL_BATCH_ID_KEY",
-    "TRIAL_BATCH_INDEX_KEY",
-    "TRIAL_BATCH_SCHEMA",
-    "TRIAL_BATCH_SCHEMA_KEY",
-    "TRIAL_BATCH_THRESHOLD_KEY",
     "TrialBatch",
     "execute_trials_async",
 ]
@@ -58,15 +51,9 @@ class TrialBatch:
     results: tuple[Result, ...]
     requested_count: int
     threshold: float = 1.0
-    safe_count: int = field(init=False)
-    unsafe_count: int = field(init=False)
-    undetermined_count: int = field(init=False)
-    error_count: int = field(init=False)
-    pass_rate: float = field(init=False)
-    passed: bool = field(init=False)
 
     def __post_init__(self) -> None:
-        """Validate inputs and compute aggregate fields.
+        """Validate batch inputs.
 
         Raises:
             TypeError: If Results are not provided as a tuple of Result objects.
@@ -95,19 +82,37 @@ class TrialBatch:
             _validate_result_identity(result=result, previous=previous)
             previous.append(result)
 
-        counts = Counter(result.status for result in self.results)
-        pass_rate = counts[SafetyStatus.SAFE] / count
         object.__setattr__(self, "threshold", threshold)
-        object.__setattr__(self, "safe_count", counts[SafetyStatus.SAFE])
-        object.__setattr__(self, "unsafe_count", counts[SafetyStatus.UNSAFE])
-        object.__setattr__(
-            self,
-            "undetermined_count",
-            counts[SafetyStatus.UNDETERMINED],
-        )
-        object.__setattr__(self, "error_count", counts[SafetyStatus.ERROR])
-        object.__setattr__(self, "pass_rate", pass_rate)
-        object.__setattr__(self, "passed", pass_rate >= threshold)
+
+    @property
+    def safe_count(self) -> int:
+        """Current number of SAFE Results."""
+        return self._count_status(SafetyStatus.SAFE)
+
+    @property
+    def unsafe_count(self) -> int:
+        """Current number of UNSAFE Results."""
+        return self._count_status(SafetyStatus.UNSAFE)
+
+    @property
+    def undetermined_count(self) -> int:
+        """Current number of UNDETERMINED Results."""
+        return self._count_status(SafetyStatus.UNDETERMINED)
+
+    @property
+    def error_count(self) -> int:
+        """Current number of ERROR Results."""
+        return self._count_status(SafetyStatus.ERROR)
+
+    @property
+    def pass_rate(self) -> float:
+        """Current SAFE fraction over the requested count."""
+        return self.safe_count / self.requested_count
+
+    @property
+    def passed(self) -> bool:
+        """Whether the current pass rate meets the threshold."""
+        return self._has_valid_statuses() and self.pass_rate >= self.threshold
 
     def __bool__(self) -> bool:
         """Return whether the batch met its threshold."""
@@ -126,6 +131,14 @@ class TrialBatch:
             f"pass_rate={self.pass_rate!r}, "
             f"passed={self.passed})"
         )
+
+    def _count_status(self, status: SafetyStatus) -> int:
+        """Return the number of current Results with one exact status."""
+        return sum(result.status is status for result in self.results)
+
+    def _has_valid_statuses(self) -> bool:
+        """Return whether every current Result has one exact SafetyStatus."""
+        return all(type(result.status) is SafetyStatus for result in self.results)
 
 
 async def execute_trials_async(
@@ -167,7 +180,9 @@ async def execute_trials_async(
         _validate_execution(execution=execution, previous=executions)
         executions.append(execution)
 
-        result = await execution.execute_async(adapter=adapter)
+        result = _validate_trial_result(
+            await execution.execute_async(adapter=adapter),
+        )
         _validate_result_identity(result=result, previous=results)
         _tag_result(
             result=result,
@@ -240,6 +255,22 @@ def _validate_execution(
     if any(execution is prior for prior in previous):
         msg = "execution_factory must return a distinct BaseExecution for every trial."
         raise ValueError(msg)
+
+
+def _validate_trial_result(value: object) -> Result:
+    """Return one valid Result from a trial execution.
+
+    Raises:
+        TypeError: If the execution did not return a Result.
+        ValueError: If the Result status is not an exact SafetyStatus.
+    """
+    if not isinstance(value, Result):
+        msg = "Every trial execution must return a Result."
+        raise TypeError(msg)
+    if type(value.status) is not SafetyStatus:
+        msg = "Every trial execution Result status must be a SafetyStatus."
+        raise ValueError(msg)
+    return value
 
 
 def _validate_result_identity(*, result: Result, previous: list[Result]) -> None:
