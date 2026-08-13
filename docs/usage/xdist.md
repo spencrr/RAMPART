@@ -294,9 +294,10 @@ rampart_xdist_max_bytes = 134217728
 The value caps each authoritative per-item envelope. RAMPART measures the
 actual compact JSON encoding in UTF-8 bytes, including structural wrappers. An
 individually oversized Result becomes a bounded drop record while fitting
-siblings remain; when combined Results exceed the cap, RAMPART keeps a
-deterministic prefix and records the remainder as drops. The final attribute
-never exceeds the cap and is never split across multiple report properties.
+siblings remain. When combined Results exceed the cap, RAMPART scans them in
+item order, retains each Result that fits, and records each nonfitting sibling
+as a drop. The final attribute never exceeds the cap and is never split across
+multiple report properties.
 If even an all-drop envelope cannot fit, no attribute is emitted and the clean
 manifest reports the omitted count. Every drop marks the run incomplete and
 forces an otherwise-successful run to exit nonzero.

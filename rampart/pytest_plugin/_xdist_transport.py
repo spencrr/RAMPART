@@ -361,7 +361,7 @@ def build_envelope(
     sequence: int,
     limit: int,
 ) -> EnvelopeBuild:
-    """Return the maximal deterministic Result prefix fitting one attribute."""
+    """Return a deterministic fitting Result subset in one attribute."""
     if not results:
         return EnvelopeBuild(encoded=None, results_sent=0, results_dropped=0)
     records = tuple(
@@ -384,9 +384,8 @@ def build_envelope(
 
     retained_count = 0
     dropped_count = len(records)
-    combined_limit_reached = False
     for record in records:
-        if record.serialized_bytes > limit or combined_limit_reached:
+        if record.serialized_bytes > limit:
             continue
         candidate_size = (
             current_size
@@ -400,8 +399,6 @@ def build_envelope(
             retained_count += 1
             dropped_count -= 1
             current_size = candidate_size
-        else:
-            combined_limit_reached = True
 
     envelope = _envelope_wire(
         sequence=sequence,

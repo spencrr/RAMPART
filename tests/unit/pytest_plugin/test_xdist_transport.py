@@ -360,6 +360,58 @@ class TestEnvelopeBuild:
             range(len(retained), len(results))
         )
 
+    def test_combined_miss_keeps_later_fitting_sibling(self) -> None:
+        nodeid = "test.py::test_combined_sibling"
+        results = (
+            _make_result(summary="x" * 2000),
+            _make_result(summary="small"),
+        )
+        records = tuple(
+            transport_module._prepare_result(
+                result=result,
+                nodeid=nodeid,
+                index=index,
+            )
+            for index, result in enumerate(results)
+        )
+        limit = records[0].serialized_bytes
+        assert (
+            transport_module._encoded_size(
+                transport_module._envelope_wire(
+                    sequence=1,
+                    records=records,
+                    retained=frozenset({0}),
+                )
+            )
+            > limit
+        )
+        assert (
+            transport_module._encoded_size(
+                transport_module._envelope_wire(
+                    sequence=1,
+                    records=records,
+                    retained=frozenset({1}),
+                )
+            )
+            <= limit
+        )
+
+        built = build_envelope(
+            results=results,
+            nodeid=nodeid,
+            sequence=1,
+            limit=limit,
+        )
+
+        assert built.encoded is not None
+        envelope = parse_envelope(
+            encoded=built.encoded,
+            limit=limit,
+            nodeid=nodeid,
+        )
+        assert [item.index for item in envelope.results] == [1]
+        assert [item.index for item in envelope.dropped] == [0]
+
     def test_all_drop_envelope_that_cannot_fit_is_not_attached(self) -> None:
         built = build_envelope(
             results=(_make_result(summary="large"),),

@@ -96,7 +96,7 @@ RAMPART is configured via pytest options and Python (sinks, adapters, payloads).
 ### `--rampart-xdist-max-bytes`
 
 Maximum UTF-8 size of each authoritative per-item Result envelope. Defaults to
-`67108864` (64 MB). RAMPART retains a deterministic fitting prefix, records
+`67108864` (64 MB). RAMPART retains a deterministic fitting subset, records
 oversized Results as bounded drops, preserves fitting siblings, and marks the
 run incomplete. There is no clean-finish bulk Result fallback. Also
 configurable via the `rampart_xdist_max_bytes` ini option.
