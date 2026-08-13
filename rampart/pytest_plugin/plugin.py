@@ -795,17 +795,18 @@ def _warn_trial_marker_deprecated(*, rampart_session: RampartSession) -> None:
     """
     if not rampart_session.trial_specs:
         return
-    # Session-finish warnings must not become exceptions under project filters.
-    with warnings.catch_warnings():
-        warnings.simplefilter("always", pytest.PytestDeprecationWarning)
-        warnings.warn(
-            pytest.PytestDeprecationWarning(
-                "The clone-based @pytest.mark.trial marker is deprecated. "
-                "Migrate to the forthcoming execution-domain trial API when "
-                "it becomes available."
-            ),
-            stacklevel=2,
-        )
+    warning = pytest.PytestDeprecationWarning(
+        "The clone-based @pytest.mark.trial marker is deprecated. "
+        "Migrate to the forthcoming execution-domain trial API when "
+        "it becomes available."
+    )
+    try:
+        warnings.warn(warning, stacklevel=2)
+    except pytest.PytestDeprecationWarning:
+        # Preserve explicit ignores, but contain filters that promote to errors.
+        with warnings.catch_warnings():
+            warnings.simplefilter("always", pytest.PytestDeprecationWarning)
+            warnings.warn(warning, stacklevel=2)
 
 
 def pytest_sessionfinish(

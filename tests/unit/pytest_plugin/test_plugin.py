@@ -1058,6 +1058,16 @@ class TestRampartSessionAddSinks:
         with pytest.raises(TypeError, match="Expected ReportSink"):
             session.add_sinks(sinks=[NotASink()])  # ty: ignore[invalid-argument-type]
 
+    def test_add_sinks_rejects_hostile_type_name_safely(self) -> None:
+        session = RampartSession()
+
+        with pytest.raises(TypeError) as exc_info:
+            session.add_sinks(
+                sinks=[_HostileTypeName()],  # ty: ignore[invalid-argument-type]
+            )
+
+        assert "_HostileTypeName" in str(exc_info.value)
+
     def test_add_sinks_preserves_existing(self) -> None:
         """Config-loaded sinks are not lost when fixture sinks are added."""
         sink_a = MagicMock(spec=["emit_async"])

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from rampart.core.result import Result, SafetyStatus
+from rampart.pytest_plugin._diagnostics import safe_type_name
 from rampart.reporting.sink import ReportSink, TestRunReport
 
 if TYPE_CHECKING:
@@ -171,7 +172,7 @@ class RampartSession:
         for sink in sinks:
             if not isinstance(sink, ReportSink):
                 msg = (
-                    f"Expected ReportSink, got {type(sink).__name__}. "
+                    f"Expected ReportSink, got {safe_type_name(sink)}. "
                     "Sinks must implement: "
                     "async def emit_async(*, report: TestRunReport) -> None"
                 )

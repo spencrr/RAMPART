@@ -691,9 +691,44 @@ class TestTrialMarkerDeprecation:
         result.assert_outcomes(passed=2)
         assert result.ret == pytest.ExitCode.OK
         assert "RAMPART Safety Summary" in "\n".join(result.outlines)
+        warning_lines = [
+            line
+            for line in result.outlines
+            if "clone-based @pytest.mark.trial marker is deprecated" in line
+        ]
+        assert len(warning_lines) == 1
         reports = _load_reports(configured_pytester)
         assert len(reports) == 1
         assert reports[0]["total_runs"] == 2
+
+    def test_warning_ignore_filter_is_honored(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        configured_pytester.makepyfile(
+            test_warning_ignore="""
+            import pytest
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+            @pytest.mark.trial(n=2)
+            def test_warning_ignore():
+                record_result(Result(status=SafetyStatus.SAFE, summary="safe"))
+            """,
+        )
+
+        result = configured_pytester.runpytest_subprocess(
+            "-p",
+            "no:cacheprovider",
+            "-W",
+            "ignore::pytest.PytestDeprecationWarning",
+        )
+
+        result.assert_outcomes(passed=2)
+        assert result.ret == pytest.ExitCode.OK
+        assert "clone-based @pytest.mark.trial marker is deprecated" not in "\n".join(
+            result.outlines
+        )
 
 
 class TestXdistMetadata:
