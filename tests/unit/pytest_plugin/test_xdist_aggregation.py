@@ -656,7 +656,7 @@ class TestTrialMarkerDeprecation:
             *args,
         )
 
-        result.assert_outcomes(passed=2)
+        result.assert_outcomes(passed=2, warnings=2)
         warning_lines = [
             line
             for line in result.outlines
@@ -688,7 +688,7 @@ class TestTrialMarkerDeprecation:
             "error::pytest.PytestDeprecationWarning",
         )
 
-        result.assert_outcomes(passed=2)
+        result.assert_outcomes(passed=2, warnings=2)
         assert result.ret == pytest.ExitCode.OK
         assert "RAMPART Safety Summary" in "\n".join(result.outlines)
         warning_lines = [
@@ -724,7 +724,7 @@ class TestTrialMarkerDeprecation:
             "ignore::pytest.PytestDeprecationWarning",
         )
 
-        result.assert_outcomes(passed=2)
+        result.assert_outcomes(passed=2, warnings=1)
         assert result.ret == pytest.ExitCode.OK
         assert "clone-based @pytest.mark.trial marker is deprecated" not in "\n".join(
             result.outlines

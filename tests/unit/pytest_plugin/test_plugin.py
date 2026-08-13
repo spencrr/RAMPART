@@ -1068,6 +1068,17 @@ class TestRampartSessionAddSinks:
 
         assert "_HostileTypeName" in str(exc_info.value)
 
+    def test_add_sinks_escapes_controlled_type_name(self) -> None:
+        session = RampartSession()
+        controlled_type = type("Sink\r\n\x1b]0;name\x07\x80", (), {})
+
+        with pytest.raises(TypeError) as exc_info:
+            session.add_sinks(
+                sinks=[controlled_type()],  # ty: ignore[invalid-argument-type]
+            )
+
+        _assert_no_terminal_controls(str(exc_info.value))
+
     def test_add_sinks_preserves_existing(self) -> None:
         """Config-loaded sinks are not lost when fixture sinks are added."""
         sink_a = MagicMock(spec=["emit_async"])
