@@ -13,6 +13,7 @@ from typing import Any, Never
 from unittest.mock import MagicMock
 
 import pytest
+from _pytest.config import PytestPluginManager
 
 from rampart.core.result import (
     HarmCategory,
@@ -43,6 +44,7 @@ from rampart.pytest_plugin._xdist import (
     SizeLimitError,
     TrialSpecValidationError,
     WorkerOutputError,
+    _registered_plugin_name,
     _to_json_safe,
     deserialize_trial_specs,
     deserialize_worker_data,
@@ -122,6 +124,21 @@ class _HostilePlugin:
         raise RuntimeError("repr failed")
 
 
+class _StatefulEqPlugin:
+    __hash__ = object.__hash__
+
+    def __init__(self, *, rampart_sinks: list[object]) -> None:
+        self.rampart_sinks = rampart_sinks
+        self.equality_calls = 0
+        self.raise_on_equality = False
+
+    def __eq__(self, other: object) -> bool:
+        self.equality_calls += 1
+        if self.raise_on_equality:
+            raise AssertionError("plugin equality must not be invoked")
+        return self is other
+
+
 class _HostileError(Exception):
     def __str__(self) -> str:
         raise SystemExit("str invoked")
@@ -134,6 +151,12 @@ def _assert_no_terminal_controls(value: str) -> None:
         and not 0x80 <= ord(character) <= 0x9F
         for character in value
     )
+
+
+def _make_plugin_config(*, plugins: list[tuple[object, object]]) -> MagicMock:
+    config = MagicMock()
+    config.pluginmanager.list_name_plugin.return_value = plugins
+    return config
 
 
 def _make_result(
@@ -1743,8 +1766,7 @@ class TestSinkDiscovery:
             rampart_sinks=lambda: [sink],
             __name__="mod",
         )
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
         result = discover_sinks_from_conftest(config=config)
         assert sink in result
 
@@ -1755,17 +1777,55 @@ class TestSinkDiscovery:
             rampart_sinks=[sink],
             __name__="mod",
         )
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
         result = discover_sinks_from_conftest(config=config)
         assert sink in result
+
+    def test_real_manager_does_not_invoke_plugin_equality(self) -> None:
+        sink = MagicMock(spec=ReportSink)
+        plugin = _StatefulEqPlugin(rampart_sinks=[sink])
+        plugin_manager = PytestPluginManager()
+        plugin_manager.register(plugin, name="hostile-eq")
+        plugin.equality_calls = 0
+        plugin.raise_on_equality = True
+        config = MagicMock()
+        config.pluginmanager = plugin_manager
+
+        result = discover_sinks_from_conftest(config=config)
+
+        assert result == [sink]
+        assert plugin.equality_calls == 0
+
+    def test_unmatched_plugin_name_uses_type_fallback_by_identity(self) -> None:
+        plugin = _StatefulEqPlugin(rampart_sinks=[])
+        plugin.raise_on_equality = True
+
+        result = _registered_plugin_name(
+            registered_plugins=[("different", object())],
+            plugin=plugin,
+        )
+
+        assert result == "_StatefulEqPlugin"
+        assert plugin.equality_calls == 0
+
+    def test_non_exact_registered_name_uses_type_fallback(self) -> None:
+        plugin = _StatefulEqPlugin(rampart_sinks=[])
+        plugin.raise_on_equality = True
+
+        result = _registered_plugin_name(
+            registered_plugins=[(_HostileString("hostile"), plugin)],
+            plugin=plugin,
+        )
+
+        assert result == "_StatefulEqPlugin"
+        assert plugin.equality_calls == 0
 
     def test_invalid_candidate_does_not_repr_plugin(
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [_HostilePlugin()]
+        plugin = _HostilePlugin()
+        config = _make_plugin_config(plugins=[("hostile", plugin)])
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
         assert result == []
@@ -1779,8 +1839,7 @@ class TestSinkDiscovery:
     ) -> None:
         plugin = MagicMock()
         plugin.rampart_sinks = _HostileList()
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
         assert result == []
@@ -1794,8 +1853,7 @@ class TestSinkDiscovery:
 
         plugin = MagicMock()
         plugin.rampart_sinks = failing_sinks
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
 
@@ -1806,8 +1864,7 @@ class TestSinkDiscovery:
 
     def test_returns_empty_when_no_rampart_sinks(self) -> None:
         plugin = MagicMock(spec=["__name__"], __name__="mod")
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
         result = discover_sinks_from_conftest(config=config)
         assert result == []
 
@@ -1823,8 +1880,7 @@ class TestSinkDiscovery:
             rampart_sinks=needs_arg,
             __name__="mod",
         )
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
         assert result == []
@@ -1842,8 +1898,7 @@ class TestSinkDiscovery:
             rampart_sinks=rampart_sinks,
             __name__="mod",
         )
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
         result = discover_sinks_from_conftest(config=config)
         assert sink in result
 
@@ -1860,8 +1915,7 @@ class TestSinkDiscovery:
             rampart_sinks=rampart_sinks,
             __name__="mod",
         )
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
         assert result == []
@@ -1883,9 +1937,7 @@ class TestSinkDiscovery:
             rampart_sinks=rampart_sinks,
             __name__="plugin\x1b\n\x9b",
         )
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
-        config.pluginmanager.get_name.return_value = "plugin\x1b\n\x9b"
+        config = _make_plugin_config(plugins=[("plugin\x1b\n\x9b", plugin)])
 
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
@@ -1912,8 +1964,7 @@ class TestSinkDiscovery:
             rampart_sinks=[_HostileRepr()],
             __name__="mod",
         )
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
 
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
@@ -1943,8 +1994,7 @@ class TestSinkDeprecationWarning:
             rampart_sinks=rampart_sinks,
             __name__="mod",
         )
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
         with pytest.warns(
             DeprecationWarning, match="rampart_sinks fixture is deprecated"
         ):
@@ -1961,8 +2011,7 @@ class TestSinkDeprecationWarning:
             rampart_sinks=[sink],
             __name__="mod",
         )
-        config = MagicMock()
-        config.pluginmanager.get_plugins.return_value = [plugin]
+        config = _make_plugin_config(plugins=[("mod", plugin)])
         result = discover_sinks_from_conftest(config=config)
         assert sink in result
         assert not any(

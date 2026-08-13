@@ -55,7 +55,7 @@ from rampart.pytest_plugin._session import TrialSpec
 from rampart.reporting.sink import ReportSink
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     import pytest
     from _typeshed import ConvertibleToInt
@@ -1457,14 +1457,18 @@ def discover_sinks_from_conftest(*, config: pytest.Config) -> list[ReportSink]:
     """
     discovered: list[ReportSink] = []
     seen: set[int] = set()
-    for plugin in config.pluginmanager.get_plugins():
+    registered_plugins = config.pluginmanager.list_name_plugin()
+    for _, plugin in registered_plugins:
         if plugin is None or id(plugin) in seen:
             continue
         seen.add(id(plugin))
         candidate = getattr(plugin, "rampart_sinks", None)
         if candidate is None:
             continue
-        plugin_name = _registered_plugin_name(config=config, plugin=plugin)
+        plugin_name = _registered_plugin_name(
+            registered_plugins=registered_plugins,
+            plugin=plugin,
+        )
         resolved = _resolve_sink_candidate(
             candidate=candidate,
             plugin_name=plugin_name,
@@ -1483,19 +1487,27 @@ def discover_sinks_from_conftest(*, config: pytest.Config) -> list[ReportSink]:
     return discovered
 
 
-def _registered_plugin_name(*, config: pytest.Config, plugin: object) -> str:
+def _registered_plugin_name(
+    *,
+    registered_plugins: Sequence[tuple[object, object]],
+    plugin: object,
+) -> str:
     """Return the bounded name recorded by pytest's plugin manager.
 
     Args:
-        config (pytest.Config): The active pytest configuration.
+        registered_plugins (Sequence[tuple[object, object]]): Registered
+            name/plugin pairs from Pluggy.
         plugin (object): The registered plugin object.
 
     Returns:
         str: The escaped registered name or a safe type-name fallback.
     """
-    registered_name = config.pluginmanager.get_name(plugin)
-    if type(registered_name) is str:
-        return bounded_text(registered_name)
+    for registered_name, registered_plugin in registered_plugins:
+        if registered_plugin is not plugin:
+            continue
+        if type(registered_name) is str:
+            return bounded_text(registered_name)
+        break
     return safe_type_name(plugin)
 
 
