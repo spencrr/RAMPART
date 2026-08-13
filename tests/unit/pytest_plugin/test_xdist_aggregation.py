@@ -1359,6 +1359,67 @@ class TestExecutionDomainTrialBatches:
 
 
 class TestXdistTransportLifecycle:
+    def test_finalizer_results_arrive_once_and_match_serial(
+        self,
+        configured_pytester: Pytester,
+    ) -> None:
+        """Prove teardown delivers Results a call-phase snapshot would miss."""
+        configured_pytester.makepyfile(
+            test_finalizer="""\
+            import pytest
+
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+
+
+            @pytest.fixture
+            def finalizer_result():
+                yield
+                record_result(
+                    Result(status=SafetyStatus.SAFE, summary="finalizer")
+                )
+
+
+            def test_finalizer_result(finalizer_result):
+                del finalizer_result
+                record_result(Result(status=SafetyStatus.SAFE, summary="body"))
+            """,
+        )
+
+        serial = configured_pytester.runpytest("-p", "no:cacheprovider")
+        serial.assert_outcomes(passed=1)
+        [serial_report] = _load_reports(configured_pytester)
+        assert serial_report["total_runs"] == 2
+        assert [item["summary"] for item in _flatten_results(serial_report)] == [
+            "body",
+            "finalizer",
+        ]
+
+        report_dir = Path(
+            (configured_pytester.path / "rampart_report_dir.txt").read_text()
+        )
+        for report_path in report_dir.glob("run_report_*.json"):
+            report_path.unlink()
+        _configure_transport_snapshot(configured_pytester)
+
+        distributed = configured_pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+        )
+        distributed.assert_outcomes(passed=1)
+        [distributed_report] = _load_reports(configured_pytester)
+        assert [item["summary"] for item in _flatten_results(distributed_report)] == [
+            "body",
+            "finalizer",
+        ]
+        snapshot = _load_transport_snapshot(configured_pytester)
+        assert snapshot["delivery_count"] == 1
+        assert snapshot["slot_indexes"] == [[0, 1]]
+        assert snapshot["accepted_results"] == snapshot["reported_results"] == 2
+        assert snapshot["faults"] == []
+
     @pytest.mark.parametrize("dist_mode", ["load", "loadgroup", "each"])
     def test_authoritative_results_reconcile_under_scheduler(
         self,

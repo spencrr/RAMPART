@@ -880,6 +880,25 @@ class TestManifestValidation:
 
 
 class TestWorkerRuntime:
+    def test_call_phase_does_not_allocate_transport_stash(self) -> None:
+        config = _Config(worker=True)
+        runtime = _make_runtime(config=config, session=RampartSession())
+        item = MagicMock()
+        item.nodeid = "test.py::test_call"
+        item.stash = pytest.Stash()
+        report = _make_report(encoded="")
+        report.when = "call"
+        delattr(report, REPORT_ATTRIBUTE)
+
+        wrapper = runtime.pytest_runtest_makereport(item, MagicMock())
+        next(wrapper)
+        with pytest.raises(StopIteration) as stopped:
+            wrapper.send(report)
+
+        assert stopped.value.value is report
+        assert len(item.stash) == 0
+        assert runtime._worker.last_sequence == 0
+
     def test_teardown_attaches_envelope_and_advances_sequence(self) -> None:
         config = _Config(worker=True)
         runtime = _make_runtime(config=config, session=RampartSession())
