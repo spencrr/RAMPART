@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from types import GetSetDescriptorType
 from typing import cast
 
 from rampart.common.text import escape_terminal_controls
@@ -72,11 +73,15 @@ class _DiagnosticRenderer:
         """
         try:
             value_type = type(value)
-            if type(value_type) is not type:
-                return "object"
-            name = type.__getattribute__(  # ruff: ignore[unnecessary-dunder-call]
+            # Bypass custom metaclass attribute hooks with type's built-in descriptor.
+            name_descriptor = cast(
+                "GetSetDescriptorType",
+                type.__dict__["__name__"],
+            )
+            name = GetSetDescriptorType.__get__(
+                name_descriptor,
                 value_type,
-                "__name__",
+                type,
             )
             if type(name) is not str:
                 return "object"

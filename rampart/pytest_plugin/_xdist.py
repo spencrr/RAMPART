@@ -1464,7 +1464,11 @@ def discover_sinks_from_conftest(*, config: pytest.Config) -> list[ReportSink]:
         candidate = getattr(plugin, "rampart_sinks", None)
         if candidate is None:
             continue
-        resolved = _resolve_sink_candidate(candidate=candidate, plugin=plugin)
+        plugin_name = _registered_plugin_name(config=config, plugin=plugin)
+        resolved = _resolve_sink_candidate(
+            candidate=candidate,
+            plugin_name=plugin_name,
+        )
         if resolved is None:
             continue
         for sink in resolved:
@@ -1473,10 +1477,26 @@ def discover_sinks_from_conftest(*, config: pytest.Config) -> list[ReportSink]:
             else:
                 logger.warning(
                     "rampart_sinks in %s yielded a non-ReportSink: %s",
-                    safe_type_name(plugin),
+                    plugin_name,
                     bounded_repr(sink),
                 )
     return discovered
+
+
+def _registered_plugin_name(*, config: pytest.Config, plugin: object) -> str:
+    """Return the bounded name recorded by pytest's plugin manager.
+
+    Args:
+        config (pytest.Config): The active pytest configuration.
+        plugin (object): The registered plugin object.
+
+    Returns:
+        str: The escaped registered name or a safe type-name fallback.
+    """
+    registered_name = config.pluginmanager.get_name(plugin)
+    if type(registered_name) is str:
+        return bounded_text(registered_name)
+    return safe_type_name(plugin)
 
 
 def _unwrap_fixture_function(candidate: object) -> Callable[..., object] | None:
@@ -1508,7 +1528,7 @@ def _unwrap_fixture_function(candidate: object) -> Callable[..., object] | None:
 def _resolve_sink_candidate(
     *,
     candidate: object,
-    plugin: object,
+    plugin_name: str,
 ) -> list[object] | None:
     """Resolve a module-level ``rampart_sinks`` attribute into a list of sinks.
 
@@ -1535,7 +1555,6 @@ def _resolve_sink_candidate(
     """
     import inspect  # ruff: ignore[import-outside-top-level]
 
-    plugin_name = safe_type_name(plugin)
     if type(candidate) is list:
         return cast("list[object]", candidate)
 

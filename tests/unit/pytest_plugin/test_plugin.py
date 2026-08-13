@@ -736,7 +736,7 @@ class TestResolveTrialThreshold:
         marker = pytest.mark.trial(threshold=_DescriptorTypeName()).mark
         with pytest.raises(pytest.UsageError) as exc_info:
             _resolve_trial_threshold(marker)
-        assert "<object>" in str(exc_info.value)
+        assert "<_DescriptorTypeName>" in str(exc_info.value)
 
     def test_value_and_type_name_controls_are_escaped(self) -> None:
         controlled_type = type("Bad\r\n\x1b]0;name\x07\x80", (), {})
@@ -894,6 +894,32 @@ class TestTerminalSummary:
             config=cast("pytest.Config", config),
         )
         reporter.write_sep.assert_not_called()
+
+    def test_writes_no_result_trial_group_without_results(self) -> None:
+        reporter = MagicMock()
+        config = MagicMock()
+        config.stash = _StashStub()
+        from rampart.pytest_plugin.plugin import _rampart_key
+
+        session = RampartSession()
+        session.record_trial_group(
+            base_nodeid="test_file.py::test_missing",
+            clone_nodeids=[
+                "test_file.py::test_missing[trial-0]",
+                "test_file.py::test_missing[trial-1]",
+            ],
+            threshold=1.0,
+        )
+        config.stash[_rampart_key] = session
+
+        pytest_terminal_summary(
+            terminalreporter=cast("TerminalReporter", reporter),
+            exitstatus=pytest.ExitCode.TESTS_FAILED,
+            config=cast("pytest.Config", config),
+        )
+
+        lines = [call.args[0] for call in reporter.write_line.call_args_list]
+        assert any("0/2 safe, 2 no-result" in line for line in lines)
 
     def test_writes_incomplete_warning_even_without_results(self) -> None:
         reporter = MagicMock()
@@ -1308,7 +1334,7 @@ class TestEmitSinks:
         raw_summary = "summary\x1b\t\n\r\x7f\x9b"
         captured: list[str] = []
 
-        class FailingSink:
+        class FailingSink(ReportSink):
             async def emit_async(self, *, report: TestRunReport) -> None:
                 captured.append(report.results[0].summary)
                 raise RuntimeError(raw_error)

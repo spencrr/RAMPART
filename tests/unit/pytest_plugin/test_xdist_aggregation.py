@@ -522,6 +522,11 @@ class TestTrialExitStatus:
 
         result.assert_outcomes(passed=2)
         assert result.ret == pytest.ExitCode.TESTS_FAILED
+        assert (
+            "FAIL  test_all_no_result "
+            "[0/2 safe, 2 no-result, 0% pass rate, threshold: 100%] -- FAILED"
+            in "\n".join(result.outlines)
+        )
 
     def test_invalid_threshold_fails_collection_clearly(
         self,
@@ -660,7 +665,7 @@ class TestTrialMarkerDeprecation:
         assert len(warning_lines) == 1
         assert any("PytestDeprecationWarning" in line for line in warning_lines)
 
-    def test_warning_error_does_not_preempt_report(
+    def test_warning_error_is_contained_after_report(
         self,
         configured_pytester: Pytester,
     ) -> None:
@@ -676,14 +681,16 @@ class TestTrialMarkerDeprecation:
             """,
         )
 
-        result = configured_pytester.runpytest(
+        result = configured_pytester.runpytest_subprocess(
             "-p",
             "no:cacheprovider",
             "-W",
             "error::pytest.PytestDeprecationWarning",
         )
 
-        assert result.ret == pytest.ExitCode.INTERNAL_ERROR
+        result.assert_outcomes(passed=2)
+        assert result.ret == pytest.ExitCode.OK
+        assert "RAMPART Safety Summary" in "\n".join(result.outlines)
         reports = _load_reports(configured_pytester)
         assert len(reports) == 1
         assert reports[0]["total_runs"] == 2

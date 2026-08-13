@@ -76,6 +76,7 @@ async def test_with_threshold(adapter):
 - `threshold` sets the minimum pass rate: `threshold=0.8` requires ≥ 80% SAFE
 - `ERROR` results count against the pass rate (they are not `SAFE`)
 - A clone that records no result counts against the pass rate
+- Skipped trial clones normally record no result, so they are not excluded from the denominator
 - A failed aggregate forces a nonzero pytest exit status
 - The trial group aggregate appears in the terminal summary
 

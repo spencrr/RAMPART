@@ -1885,13 +1885,14 @@ class TestSinkDiscovery:
         )
         config = MagicMock()
         config.pluginmanager.get_plugins.return_value = [plugin]
+        config.pluginmanager.get_name.return_value = "plugin\x1b\n\x9b"
 
         with caplog.at_level(logging.WARNING):
             result = discover_sinks_from_conftest(config=config)
 
         assert result == []
         formatted = _format_record(caplog.records[-1])
-        assert "MagicMock" in formatted
+        assert r"plugin\x1b\x0a\x9b" in formatted
         assert r"RuntimeError: legacy\x1b\x09\x0a\x0d\x7f\x9b" in formatted
         assert "Traceback (most recent call last):" in formatted
         assert "\x1b" not in formatted
