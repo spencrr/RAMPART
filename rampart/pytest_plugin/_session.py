@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from rampart.core.result import Result, SafetyStatus
 from rampart.pytest_plugin._diagnostics import bounded_text, safe_type_name
 from rampart.reporting.sink import ReportSink, TestRunReport
-from rampart.reporting.trial_batch import _summarize_trial_batches
+from rampart.reporting.trial_batch import (
+    _INVALID_METADATA_CONTAINER_KEY,
+    _NONCANONICAL_METADATA_CONTAINER_KEY,
+    _has_trial_metadata,
+    _summarize_trial_batches,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -28,6 +33,22 @@ if TYPE_CHECKING:
     from rampart.pytest_plugin._collection import ResultCollector
 
 logger = logging.getLogger(__name__)
+
+
+def _copy_result_metadata(*, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Copy metadata without dispatching dict-subclass mapping hooks.
+
+    Returns:
+        dict[str, Any]: Exact-dict metadata with parser provenance markers.
+    """
+    if not issubclass(type(metadata), dict):
+        return {_INVALID_METADATA_CONTAINER_KEY: True}
+    copied = {  # ruff: ignore[unnecessary-comprehension]
+        key: value for key, value in dict.items(metadata)
+    }
+    if type(metadata) is not dict and _has_trial_metadata(metadata=metadata):
+        copied[_NONCANONICAL_METADATA_CONTAINER_KEY] = True
+    return copied
 
 
 def _result_sort_key(result: Result) -> tuple[str, int, str]:
@@ -231,12 +252,11 @@ class RampartSession:
             # Shallow copy is sufficient because we reconstruct all
             # mutable fields we modify (currently metadata and harm_category).
             result = copy.copy(original_result)
-            result.metadata = {
-                **result.metadata,
-                "_pytest_test_name": test_name,
-                "_pytest_nodeid": node.nodeid,
-                "_rampart_result_index": result_index_offset + result_index,
-            }
+            metadata = _copy_result_metadata(metadata=result.metadata)
+            metadata["_pytest_test_name"] = test_name
+            metadata["_pytest_nodeid"] = node.nodeid
+            metadata["_rampart_result_index"] = result_index_offset + result_index
+            result.metadata = metadata
             if harm_category is not None and result.harm_category is None:
                 result.harm_category = harm_category
             tagged.append(result)

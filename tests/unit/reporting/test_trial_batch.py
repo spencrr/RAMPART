@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Never, cast
 
 import pytest
 
@@ -19,23 +19,92 @@ from rampart.core.trial import (
 from rampart.reporting.trial_batch import _summarize_trial_batches
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from rampart.reporting import TrialBatchSummary
 
 _BATCH_A = "123e4567-e89b-42d3-a456-426614174000"
 _BATCH_B = "123e4567-e89b-42d3-a456-426614174001"
 
 
-class _HostileValue:
+class _HostileValue:  # ruff: ignore[eq-without-hash]
     def __repr__(self) -> str:
         raise RuntimeError("repr must not run")
 
     def __str__(self) -> str:
         raise RuntimeError("str must not run")
 
+    def __eq__(self, value: object) -> Never:
+        raise RuntimeError("eq must not run")
 
-class _MetadataDict(dict[str, Any]):  # ruff: ignore[subclass-builtin]
+    def __ne__(self, value: object) -> Never:
+        raise RuntimeError("ne must not run")
+
+
+class _SpoofedDict:
+    @property
+    def __class__(self) -> type[dict[Any, Any]]:
+        return dict
+
+
+class _AdversarialMetadata(  # ruff: ignore[eq-without-hash]
+    dict[str, Any],  # ruff: ignore[subclass-builtin]
+):
+    def __init__(self, *, source: dict[str, Any], raises: bool) -> None:
+        dict.__init__(self)
+        for key, value in source.items():
+            dict.__setitem__(self, key, value)
+        self.raises = raises
+        self.accesses: list[str] = []
+
+    def _access(self, *, name: str) -> None:
+        self.accesses.append(name)
+        if self.raises:
+            raise RuntimeError(f"{name} must not run")
+
+    def __iter__(self) -> Iterator[str]:
+        self._access(name="__iter__")
+        return iter(())
+
+    def keys(self) -> Any:
+        self._access(name="keys")
+        return {}.keys()
+
+    def items(self) -> Any:
+        self._access(name="items")
+        return {}.items()
+
+    def get(self, key: object, default: Any = None, /) -> Any:
+        self._access(name="get")
+        return default
+
+    def __getitem__(self, key: str) -> Never:
+        self._access(name="__getitem__")
+        raise KeyError(key)
+
     def __contains__(self, key: object) -> bool:
-        raise RuntimeError("contains must not run")
+        self._access(name="__contains__")
+        return False
+
+    def __len__(self) -> int:
+        self._access(name="__len__")
+        return 0
+
+    def __eq__(self, value: object) -> bool:
+        self._access(name="__eq__")
+        return False
+
+    def __repr__(self) -> str:
+        self._access(name="__repr__")
+        return "<hidden>"
+
+    def __str__(self) -> str:
+        self._access(name="__str__")
+        return "<hidden>"
+
+    def copy(self) -> dict[str, Any]:
+        self._access(name="copy")
+        return {}
 
 
 def _trial_result(
@@ -161,22 +230,69 @@ class TestFailClosedTrialSummaries:
         assert summary.passed is False
         assert "duplicate batch indexes" in diagnostics[0]
 
-    def test_dict_subclass_duplicate_cannot_evade_parsing(self) -> None:
+    @pytest.mark.parametrize(
+        "access_mode",
+        ["hidden", "raising"],
+    )
+    def test_dict_subclass_duplicate_cannot_evade_parsing(
+        self,
+        access_mode: str,
+    ) -> None:
         valid = _trial_result(index=0, count=1)
         duplicate = _trial_result(
             status=SafetyStatus.UNSAFE,
             index=0,
             count=1,
         )
-        duplicate.metadata = _MetadataDict(duplicate.metadata)
+        metadata = _AdversarialMetadata(
+            source=duplicate.metadata,
+            raises=access_mode == "raising",
+        )
+        duplicate.metadata = metadata
 
         summaries, diagnostics = _summaries(valid, duplicate)
 
         [summary] = summaries
+        assert duplicate.metadata is metadata
+        assert metadata.accesses == []
+        assert dict.get(metadata, TRIAL_BATCH_INDEX_KEY) == 0
+        assert dict.get(metadata, TRIAL_BATCH_ID_KEY) == _BATCH_A
         assert summary.complete is False
         assert summary.passed is False
         assert any("noncanonical metadata container" in item for item in diagnostics)
         assert any("duplicate batch indexes" in item for item in diagnostics)
+
+    def test_untagged_dict_subclass_is_not_a_trial_candidate(self) -> None:
+        metadata = _AdversarialMetadata(
+            source={"user": "value"},
+            raises=True,
+        )
+        result = Result(
+            status=SafetyStatus.SAFE,
+            summary="plain",
+            metadata=metadata,
+        )
+
+        summaries, diagnostics = _summaries(result)
+
+        assert summaries == ()
+        assert diagnostics == ()
+        assert result.metadata is metadata
+        assert metadata.accesses == []
+
+    def test_exact_dict_metadata_and_result_remain_unchanged(self) -> None:
+        result = _trial_result()
+        metadata = result.metadata
+        expected = dict(metadata)
+
+        summaries, diagnostics = _summaries(result)
+
+        [summary] = summaries
+        assert diagnostics == ()
+        assert summary.complete is True
+        assert summary.passed is True
+        assert result.metadata is metadata
+        assert metadata == expected
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -295,6 +411,26 @@ class TestFailClosedTrialSummaries:
 
         assert not summaries
         assert any("invalid Result status" in item for item in diagnostics)
+
+    def test_hostile_schema_equality_is_not_dispatched(self) -> None:
+        result = _trial_result()
+        result.metadata[TRIAL_BATCH_SCHEMA_KEY] = _HostileValue()
+
+        summaries, diagnostics = _summaries(result)
+
+        assert summaries == ()
+        assert any("unknown or invalid schema" in item for item in diagnostics)
+
+    def test_spoofed_dict_container_cannot_crash_parser(self) -> None:
+        result = _trial_result()
+        spoofed = _SpoofedDict()
+        assert isinstance(spoofed, dict)
+        result.metadata = cast("Any", spoofed)
+
+        summaries, diagnostics = _summaries(result)
+
+        assert summaries == ()
+        assert any("invalid metadata container" in item for item in diagnostics)
 
     @pytest.mark.parametrize(
         "batch_id",

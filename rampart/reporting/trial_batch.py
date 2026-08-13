@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from rampart.core import Result
 
 _SOURCE_WORKER_KEY = "_rampart_source_worker"
+_INVALID_METADATA_CONTAINER_KEY = "_rampart_trial_batch_invalid_metadata"
+_NONCANONICAL_METADATA_CONTAINER_KEY = "_rampart_trial_batch_noncanonical_metadata"
 _UUID4_VERSION = 4
 _TRIAL_BATCH_KEYS = (
     TRIAL_BATCH_SCHEMA_KEY,
@@ -140,8 +142,20 @@ def _parse_trial(*, result: Result, position: int) -> _ParsedTrial:
     Returns:
         _ParsedTrial: Validated record, diagnostics, and assignment state.
     """
-    metadata, canonical_container = _copy_metadata(metadata=result.metadata)
-    if metadata is None:
+    metadata = result.metadata
+    if not issubclass(type(metadata), dict):
+        return _ParsedTrial(
+            batch_id=None,
+            record=None,
+            diagnostics=(
+                _position_diagnostic(
+                    position=position,
+                    reason="has an invalid metadata container",
+                ),
+            ),
+            has_unassigned_metadata=True,
+        )
+    if _metadata_has_key(metadata=metadata, key=_INVALID_METADATA_CONTAINER_KEY):
         return _ParsedTrial(
             batch_id=None,
             record=None,
@@ -162,7 +176,10 @@ def _parse_trial(*, result: Result, position: int) -> _ParsedTrial:
         )
 
     issues: list[str] = []
-    if not canonical_container:
+    if type(metadata) is not dict or _metadata_has_key(
+        metadata=metadata,
+        key=_NONCANONICAL_METADATA_CONTAINER_KEY,
+    ):
         issues.append(
             _position_diagnostic(
                 position=position,
@@ -213,28 +230,28 @@ def _parse_trial(*, result: Result, position: int) -> _ParsedTrial:
     )
 
 
-def _copy_metadata(*, metadata: object) -> tuple[dict[str, object] | None, bool]:
-    """Safely copy a dict without invoking subclass overrides.
+def _has_trial_metadata(*, metadata: dict[str, object]) -> bool:
+    """Return whether underlying dict storage contains any trial key."""
+    return any(
+        _metadata_has_key(metadata=metadata, key=key) for key in _TRIAL_BATCH_KEYS
+    )
+
+
+def _metadata_has_key(*, metadata: dict[str, object], key: str) -> bool:
+    """Read key presence directly from underlying dict storage.
 
     Returns:
-        tuple[dict[str, object] | None, bool]: The plain copy and whether the
-            source container was an exact dict.
+        bool: Whether the underlying dict storage contains the key.
     """
-    if not isinstance(metadata, dict):
-        return None, False
-    return dict.copy(metadata), type(metadata) is dict
-
-
-def _has_trial_metadata(*, metadata: object) -> bool:
-    """Return whether normalized metadata contains any trial key."""
-    if not isinstance(metadata, dict):
-        return False
-    return any(key in metadata for key in _TRIAL_BATCH_KEYS)
+    return dict.__contains__(  # ruff: ignore[unnecessary-dunder-call]
+        metadata,
+        key,
+    )
 
 
 def _parse_batch_id(*, metadata: dict[str, object]) -> tuple[str | None, bool]:
     """Return a normalized UUID4 batch ID and whether its input was canonical."""
-    value = metadata.get(TRIAL_BATCH_ID_KEY)
+    value = dict.get(metadata, TRIAL_BATCH_ID_KEY)
     if type(value) is not str:
         return None, False
     try:
@@ -259,7 +276,8 @@ def _parse_trial_record(  # ruff: ignore[too-many-return-statements]
     Returns:
         tuple[_TrialRecord | None, str | None]: The record or its diagnostic.
     """
-    if metadata.get(TRIAL_BATCH_SCHEMA_KEY) != TRIAL_BATCH_SCHEMA:
+    schema = dict.get(metadata, TRIAL_BATCH_SCHEMA_KEY)
+    if type(schema) is not str or schema != TRIAL_BATCH_SCHEMA:
         return None, _position_diagnostic(
             position=position,
             reason="has an unknown or invalid schema",
@@ -308,7 +326,7 @@ def _parse_trial_record(  # ruff: ignore[too-many-return-statements]
 
 def _parse_count(*, metadata: dict[str, object]) -> int | None:
     """Return a positive exact integer count."""
-    value = metadata.get(TRIAL_BATCH_COUNT_KEY)
+    value = dict.get(metadata, TRIAL_BATCH_COUNT_KEY)
     if type(value) is not int or value <= 0:
         return None
     return value
@@ -316,7 +334,7 @@ def _parse_count(*, metadata: dict[str, object]) -> int | None:
 
 def _parse_index(*, metadata: dict[str, object], count: int) -> int | None:
     """Return an exact integer index inside the requested range."""
-    value = metadata.get(TRIAL_BATCH_INDEX_KEY)
+    value = dict.get(metadata, TRIAL_BATCH_INDEX_KEY)
     if type(value) is not int or not 0 <= value < count:
         return None
     return value
@@ -324,7 +342,7 @@ def _parse_index(*, metadata: dict[str, object], count: int) -> int | None:
 
 def _parse_threshold(*, metadata: dict[str, object]) -> float | None:
     """Return a finite exact numeric threshold in ``(0, 1]``."""
-    value = metadata.get(TRIAL_BATCH_THRESHOLD_KEY)
+    value = dict.get(metadata, TRIAL_BATCH_THRESHOLD_KEY)
     if type(value) is not int and type(value) is not float:
         return None
     try:
@@ -341,9 +359,9 @@ def _parse_source_worker(
     metadata: dict[str, object],
 ) -> tuple[str | None, bool]:
     """Return an optional valid xdist source-worker identifier."""
-    if _SOURCE_WORKER_KEY not in metadata:
+    if not _metadata_has_key(metadata=metadata, key=_SOURCE_WORKER_KEY):
         return None, True
-    value = metadata[_SOURCE_WORKER_KEY]
+    value = dict.get(metadata, _SOURCE_WORKER_KEY)
     if type(value) is not str or not value:
         return None, False
     return value, True

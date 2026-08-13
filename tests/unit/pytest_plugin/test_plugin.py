@@ -56,6 +56,8 @@ from rampart.pytest_plugin.plugin import (
 from rampart.reporting.sink import ReportSink, TestRunReport
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from _pytest.terminal import TerminalReporter
 
 _EXPECTED_TRIAL_MARKER_DEPRECATION_MESSAGE = (
@@ -84,6 +86,40 @@ class _HostileRepr:
 class _HostileList(list):  # ruff: ignore[subclass-builtin]
     def __iter__(self) -> Never:
         raise RuntimeError("iter failed")
+
+
+class _HidingTrialMetadata(
+    dict[str, Any],  # ruff: ignore[subclass-builtin]
+):
+    def __init__(self, *, source: dict[str, Any]) -> None:
+        dict.__init__(self)
+        for key, value in source.items():
+            dict.__setitem__(self, key, value)
+        self.accesses: list[str] = []
+
+    def __iter__(self) -> Iterator[str]:
+        self.accesses.append("__iter__")
+        return iter(())
+
+    def keys(self) -> Any:
+        self.accesses.append("keys")
+        return {}.keys()
+
+    def items(self) -> Never:
+        self.accesses.append("items")
+        raise RuntimeError("items must not run")
+
+    def get(self, key: object, default: Any = None, /) -> Never:
+        self.accesses.append("get")
+        raise RuntimeError("get must not run")
+
+    def __getitem__(self, key: str) -> Never:
+        self.accesses.append("__getitem__")
+        raise KeyError(key)
+
+    def __contains__(self, key: object) -> Never:
+        self.accesses.append("__contains__")
+        raise RuntimeError("contains must not run")
 
 
 class _HostileMeta(type):
@@ -361,6 +397,50 @@ class TestRampartSession:
         assert summary.safe_count == 2
         assert summary.complete is True
         assert summary.passed is True
+
+    def test_absorb_preserves_hidden_duplicate_trial_failure(self) -> None:
+        batch_id = "123e4567-e89b-42d3-a456-426614174000"
+        metadata = {
+            TRIAL_BATCH_SCHEMA_KEY: TRIAL_BATCH_SCHEMA,
+            TRIAL_BATCH_ID_KEY: batch_id,
+            TRIAL_BATCH_INDEX_KEY: 0,
+            TRIAL_BATCH_COUNT_KEY: 1,
+            TRIAL_BATCH_THRESHOLD_KEY: 1.0,
+        }
+        hidden = _HidingTrialMetadata(source=metadata)
+        safe = Result(
+            status=SafetyStatus.SAFE,
+            summary="safe",
+            metadata=dict(metadata),
+        )
+        unsafe = Result(
+            status=SafetyStatus.UNSAFE,
+            summary="unsafe duplicate",
+            metadata=hidden,
+        )
+        collector = ResultCollector()
+        collector.record(result=safe)
+        collector.record(result=unsafe)
+        node = MagicMock()
+        node.nodeid = "test_file.py::test_hidden_duplicate"
+        node.get_closest_marker.return_value = None
+        session = RampartSession()
+
+        session.absorb(node=node, collector=collector)
+        report = session.build_report()
+
+        [batch] = report.trial_batches
+        assert hidden.accesses == []
+        assert unsafe.metadata is hidden
+        assert len(report.results) == 2
+        assert report.results[1].status is SafetyStatus.UNSAFE
+        assert report.results[1].metadata[TRIAL_BATCH_ID_KEY] == batch_id
+        assert batch.complete is False
+        assert batch.passed is False
+        assert any(
+            "noncanonical metadata container" in item for item in batch.diagnostics
+        )
+        assert any("duplicate batch indexes" in item for item in batch.diagnostics)
 
     def test_build_report_logs_malformed_batch_diagnostic_once(
         self,
