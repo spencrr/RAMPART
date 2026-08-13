@@ -68,6 +68,16 @@ class _TrialRecord:
     source_worker: str | None
 
 
+@dataclass(frozen=True, kw_only=True)
+class _ParsedTrial:
+    """Parsed trial state for one collected Result."""
+
+    batch_id: str | None
+    record: _TrialRecord | None
+    diagnostics: tuple[str, ...]
+    has_unassigned_metadata: bool
+
+
 @dataclass(kw_only=True)
 class _BatchGroup:
     """Mutable parsing state for one canonical batch ID."""
@@ -95,38 +105,18 @@ def _summarize_trial_batches(
     has_unassigned_metadata = False
 
     for position, result in enumerate(results):
-        metadata = result.metadata
-        if not _has_trial_metadata(metadata=metadata):
+        parsed = _parse_trial(result=result, position=position)
+        if parsed.batch_id is None:
+            diagnostics.extend(parsed.diagnostics)
+            has_unassigned_metadata |= parsed.has_unassigned_metadata
             continue
-        batch_id, canonical_id = _parse_batch_id(metadata=metadata)
-        if batch_id is None:
-            diagnostics.append(
-                _position_diagnostic(
-                    position=position,
-                    reason="has an invalid batch ID",
-                ),
-            )
-            has_unassigned_metadata = True
-            continue
-        group = groups.setdefault(batch_id, _BatchGroup(batch_id=batch_id))
-        if not canonical_id:
-            group.diagnostics.append(
-                _position_diagnostic(
-                    position=position,
-                    reason="has a noncanonical batch ID",
-                ),
-            )
-            continue
-        record, issue = _parse_trial_record(
-            result=result,
-            metadata=metadata,
-            batch_id=batch_id,
-            position=position,
+        group = groups.setdefault(
+            parsed.batch_id,
+            _BatchGroup(batch_id=parsed.batch_id),
         )
-        if issue is not None:
-            group.diagnostics.append(issue)
-        elif record is not None:
-            group.records.append(record)
+        group.diagnostics.extend(parsed.diagnostics)
+        if parsed.record is not None:
+            group.records.append(parsed.record)
 
     summaries: list[TrialBatchSummary] = []
     for group in groups.values():
@@ -144,9 +134,100 @@ def _summarize_trial_batches(
     return tuple(summaries), tuple(diagnostics)
 
 
+def _parse_trial(*, result: Result, position: int) -> _ParsedTrial:
+    """Parse trial state without trusting the Result metadata container.
+
+    Returns:
+        _ParsedTrial: Validated record, diagnostics, and assignment state.
+    """
+    metadata, canonical_container = _copy_metadata(metadata=result.metadata)
+    if metadata is None:
+        return _ParsedTrial(
+            batch_id=None,
+            record=None,
+            diagnostics=(
+                _position_diagnostic(
+                    position=position,
+                    reason="has an invalid metadata container",
+                ),
+            ),
+            has_unassigned_metadata=True,
+        )
+    if not _has_trial_metadata(metadata=metadata):
+        return _ParsedTrial(
+            batch_id=None,
+            record=None,
+            diagnostics=(),
+            has_unassigned_metadata=False,
+        )
+
+    issues: list[str] = []
+    if not canonical_container:
+        issues.append(
+            _position_diagnostic(
+                position=position,
+                reason="has a noncanonical metadata container",
+            ),
+        )
+    batch_id, canonical_id = _parse_batch_id(metadata=metadata)
+    if batch_id is None:
+        issues.append(
+            _position_diagnostic(
+                position=position,
+                reason="has an invalid batch ID",
+            ),
+        )
+        return _ParsedTrial(
+            batch_id=None,
+            record=None,
+            diagnostics=tuple(issues),
+            has_unassigned_metadata=True,
+        )
+    if not canonical_id:
+        issues.append(
+            _position_diagnostic(
+                position=position,
+                reason="has a noncanonical batch ID",
+            ),
+        )
+        return _ParsedTrial(
+            batch_id=batch_id,
+            record=None,
+            diagnostics=tuple(issues),
+            has_unassigned_metadata=False,
+        )
+
+    record, issue = _parse_trial_record(
+        result=result,
+        metadata=metadata,
+        batch_id=batch_id,
+        position=position,
+    )
+    if issue is not None:
+        issues.append(issue)
+    return _ParsedTrial(
+        batch_id=batch_id,
+        record=record,
+        diagnostics=tuple(issues),
+        has_unassigned_metadata=False,
+    )
+
+
+def _copy_metadata(*, metadata: object) -> tuple[dict[str, object] | None, bool]:
+    """Safely copy a dict without invoking subclass overrides.
+
+    Returns:
+        tuple[dict[str, object] | None, bool]: The plain copy and whether the
+            source container was an exact dict.
+    """
+    if not isinstance(metadata, dict):
+        return None, False
+    return dict.copy(metadata), type(metadata) is dict
+
+
 def _has_trial_metadata(*, metadata: object) -> bool:
-    """Return whether an exact metadata dict contains any trial key."""
-    if type(metadata) is not dict:
+    """Return whether normalized metadata contains any trial key."""
+    if not isinstance(metadata, dict):
         return False
     return any(key in metadata for key in _TRIAL_BATCH_KEYS)
 

@@ -33,6 +33,11 @@ class _HostileValue:
         raise RuntimeError("str must not run")
 
 
+class _MetadataDict(dict[str, Any]):  # ruff: ignore[subclass-builtin]
+    def __contains__(self, key: object) -> bool:
+        raise RuntimeError("contains must not run")
+
+
 def _trial_result(
     *,
     status: SafetyStatus = SafetyStatus.SAFE,
@@ -155,6 +160,23 @@ class TestFailClosedTrialSummaries:
         assert summary.complete is False
         assert summary.passed is False
         assert "duplicate batch indexes" in diagnostics[0]
+
+    def test_dict_subclass_duplicate_cannot_evade_parsing(self) -> None:
+        valid = _trial_result(index=0, count=1)
+        duplicate = _trial_result(
+            status=SafetyStatus.UNSAFE,
+            index=0,
+            count=1,
+        )
+        duplicate.metadata = _MetadataDict(duplicate.metadata)
+
+        summaries, diagnostics = _summaries(valid, duplicate)
+
+        [summary] = summaries
+        assert summary.complete is False
+        assert summary.passed is False
+        assert any("noncanonical metadata container" in item for item in diagnostics)
+        assert any("duplicate batch indexes" in item for item in diagnostics)
 
     @pytest.mark.parametrize(
         ("field", "value"),
