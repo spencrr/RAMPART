@@ -9,7 +9,7 @@ import logging
 import math
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Never, cast
+from typing import TYPE_CHECKING, Any, Never, Self, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -86,6 +86,35 @@ class _HostileRepr:
 class _HostileList(list):  # ruff: ignore[subclass-builtin]
     def __iter__(self) -> Never:
         raise RuntimeError("iter failed")
+
+
+class _StatefulTrialKey(  # ruff: ignore[no-slots-in-str-subclass]
+    str,  # ruff: ignore[subclass-builtin]
+):
+    armed: bool
+    accesses: list[str]
+
+    def __new__(cls, value: str) -> Self:
+        instance = str.__new__(cls, value)
+        instance.armed = False
+        instance.accesses = []
+        return instance
+
+    def _arm(self) -> None:
+        self.armed = True
+        self.accesses.clear()
+
+    def __hash__(self) -> int:
+        self.accesses.append("__hash__")
+        if self.armed:
+            raise RuntimeError("hash must not run")
+        return str.__hash__(self)
+
+    def __eq__(self, value: object) -> bool:
+        self.accesses.append("__eq__")
+        if self.armed:
+            raise RuntimeError("equality must not run")
+        return str.__eq__(self, value)
 
 
 class _HidingTrialMetadata(
@@ -431,8 +460,64 @@ class TestRampartSession:
 
         [batch] = report.trial_batches
         assert hidden.accesses == []
+        assert dict.get(hidden, TRIAL_BATCH_INDEX_KEY) == 0
+        assert dict.get(hidden, TRIAL_BATCH_ID_KEY) == batch_id
         assert unsafe.metadata is hidden
         assert len(report.results) == 2
+        assert report.failed == 1
+        assert report.results[1].status is SafetyStatus.UNSAFE
+        assert batch.complete is False
+        assert batch.passed is False
+        assert any(
+            "noncanonical metadata container" in item for item in batch.diagnostics
+        )
+        assert any("duplicate batch indexes" in item for item in batch.diagnostics)
+
+    def test_absorb_rejects_nonexact_duplicate_index_key(self) -> None:
+        batch_id = "123e4567-e89b-42d3-a456-426614174000"
+        index_key = _StatefulTrialKey(TRIAL_BATCH_INDEX_KEY)
+        hidden_metadata = {
+            TRIAL_BATCH_SCHEMA_KEY: TRIAL_BATCH_SCHEMA,
+            TRIAL_BATCH_ID_KEY: batch_id,
+            index_key: 0,
+            TRIAL_BATCH_COUNT_KEY: 1,
+            TRIAL_BATCH_THRESHOLD_KEY: 1.0,
+        }
+        hidden = _HidingTrialMetadata(source=hidden_metadata)
+        index_key._arm()
+        safe = Result(
+            status=SafetyStatus.SAFE,
+            summary="safe",
+            metadata={
+                TRIAL_BATCH_SCHEMA_KEY: TRIAL_BATCH_SCHEMA,
+                TRIAL_BATCH_ID_KEY: batch_id,
+                TRIAL_BATCH_INDEX_KEY: 0,
+                TRIAL_BATCH_COUNT_KEY: 1,
+                TRIAL_BATCH_THRESHOLD_KEY: 1.0,
+            },
+        )
+        unsafe = Result(
+            status=SafetyStatus.UNSAFE,
+            summary="unsafe duplicate",
+            metadata=hidden,
+        )
+        collector = ResultCollector()
+        collector.record(result=safe)
+        collector.record(result=unsafe)
+        node = MagicMock()
+        node.nodeid = "test_file.py::test_hidden_duplicate"
+        node.get_closest_marker.return_value = None
+        session = RampartSession()
+
+        session.absorb(node=node, collector=collector)
+        report = session.build_report()
+
+        [batch] = report.trial_batches
+        assert hidden.accesses == []
+        assert index_key.accesses == []
+        assert unsafe.metadata is hidden
+        assert len(report.results) == 2
+        assert report.failed == 1
         assert report.results[1].status is SafetyStatus.UNSAFE
         assert report.results[1].metadata[TRIAL_BATCH_ID_KEY] == batch_id
         assert batch.complete is False
@@ -440,7 +525,8 @@ class TestRampartSession:
         assert any(
             "noncanonical metadata container" in item for item in batch.diagnostics
         )
-        assert any("duplicate batch indexes" in item for item in batch.diagnostics)
+        assert any("noncanonical metadata keys" in item for item in batch.diagnostics)
+        assert any("invalid batch index" in item for item in batch.diagnostics)
 
     def test_build_report_logs_malformed_batch_diagnostic_once(
         self,

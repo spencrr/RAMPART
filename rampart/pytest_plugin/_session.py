@@ -13,7 +13,7 @@ import copy
 import logging
 from collections import Counter
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from rampart.core.result import Result, SafetyStatus
 from rampart.pytest_plugin._diagnostics import bounded_text, safe_type_name
@@ -21,6 +21,8 @@ from rampart.reporting.sink import ReportSink, TestRunReport
 from rampart.reporting.trial_batch import (
     _INVALID_METADATA_CONTAINER_KEY,
     _NONCANONICAL_METADATA_CONTAINER_KEY,
+    _NONCANONICAL_METADATA_KEYS_KEY,
+    _extract_metadata,
     _has_trial_metadata,
     _summarize_trial_batches,
 )
@@ -41,12 +43,14 @@ def _copy_result_metadata(*, metadata: dict[str, Any]) -> dict[str, Any]:
     Returns:
         dict[str, Any]: Exact-dict metadata with parser provenance markers.
     """
-    if not issubclass(type(metadata), dict):
-        return {_INVALID_METADATA_CONTAINER_KEY: True}
-    copied = {  # ruff: ignore[unnecessary-comprehension]
-        key: value for key, value in dict.items(metadata)
-    }
-    if type(metadata) is not dict and _has_trial_metadata(metadata=metadata):
+    extracted = _extract_metadata(metadata=metadata)
+    copied = cast("dict[str, Any]", extracted.values)
+    if extracted.invalid_container:
+        copied[_INVALID_METADATA_CONTAINER_KEY] = True
+        return copied
+    if extracted.has_noncanonical_keys:
+        copied[_NONCANONICAL_METADATA_KEYS_KEY] = True
+    if extracted.noncanonical_container and _has_trial_metadata(metadata=copied):
         copied[_NONCANONICAL_METADATA_CONTAINER_KEY] = True
     return copied
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from rampart.core import SafetyStatus
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 _SOURCE_WORKER_KEY = "_rampart_source_worker"
 _INVALID_METADATA_CONTAINER_KEY = "_rampart_trial_batch_invalid_metadata"
 _NONCANONICAL_METADATA_CONTAINER_KEY = "_rampart_trial_batch_noncanonical_metadata"
+_NONCANONICAL_METADATA_KEYS_KEY = "_rampart_trial_batch_noncanonical_keys"
 _UUID4_VERSION = 4
 _TRIAL_BATCH_KEYS = (
     TRIAL_BATCH_SCHEMA_KEY,
@@ -78,6 +79,16 @@ class _ParsedTrial:
     record: _TrialRecord | None
     diagnostics: tuple[str, ...]
     has_unassigned_metadata: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class _ExtractedMetadata:
+    """Exact-string metadata extracted without invoking stored-key hooks."""
+
+    values: dict[str, object]
+    invalid_container: bool
+    noncanonical_container: bool
+    has_noncanonical_keys: bool
 
 
 @dataclass(kw_only=True)
@@ -142,8 +153,13 @@ def _parse_trial(*, result: Result, position: int) -> _ParsedTrial:
     Returns:
         _ParsedTrial: Validated record, diagnostics, and assignment state.
     """
-    metadata = result.metadata
-    if not issubclass(type(metadata), dict):
+    extracted = _extract_metadata(metadata=result.metadata)
+    metadata = extracted.values
+    invalid_container = extracted.invalid_container or _metadata_has_key(
+        metadata=metadata,
+        key=_INVALID_METADATA_CONTAINER_KEY,
+    )
+    if invalid_container:
         return _ParsedTrial(
             batch_id=None,
             record=None,
@@ -155,35 +171,41 @@ def _parse_trial(*, result: Result, position: int) -> _ParsedTrial:
             ),
             has_unassigned_metadata=True,
         )
-    if _metadata_has_key(metadata=metadata, key=_INVALID_METADATA_CONTAINER_KEY):
-        return _ParsedTrial(
-            batch_id=None,
-            record=None,
-            diagnostics=(
-                _position_diagnostic(
-                    position=position,
-                    reason="has an invalid metadata container",
-                ),
-            ),
-            has_unassigned_metadata=True,
-        )
-    if not _has_trial_metadata(metadata=metadata):
+    has_trial_metadata = _has_trial_metadata(metadata=metadata)
+    container_provenance = _metadata_has_key(
+        metadata=metadata,
+        key=_NONCANONICAL_METADATA_CONTAINER_KEY,
+    )
+    has_noncanonical_keys = extracted.has_noncanonical_keys or _metadata_has_key(
+        metadata=metadata,
+        key=_NONCANONICAL_METADATA_KEYS_KEY,
+    )
+    if (
+        not has_trial_metadata
+        and not container_provenance
+        and not has_noncanonical_keys
+    ):
         return _ParsedTrial(
             batch_id=None,
             record=None,
             diagnostics=(),
             has_unassigned_metadata=False,
         )
-
     issues: list[str] = []
-    if type(metadata) is not dict or _metadata_has_key(
-        metadata=metadata,
-        key=_NONCANONICAL_METADATA_CONTAINER_KEY,
+    if (extracted.noncanonical_container and has_trial_metadata) or (
+        container_provenance
     ):
         issues.append(
             _position_diagnostic(
                 position=position,
                 reason="has a noncanonical metadata container",
+            ),
+        )
+    if has_noncanonical_keys:
+        issues.append(
+            _position_diagnostic(
+                position=position,
+                reason="has noncanonical metadata keys",
             ),
         )
     batch_id, canonical_id = _parse_batch_id(metadata=metadata)
@@ -230,8 +252,38 @@ def _parse_trial(*, result: Result, position: int) -> _ParsedTrial:
     )
 
 
+def _extract_metadata(*, metadata: object) -> _ExtractedMetadata:
+    """Extract exact-string items without hashing or comparing stored keys.
+
+    Returns:
+        _ExtractedMetadata: Safe values and malformed-container/key provenance.
+    """
+    if not issubclass(type(metadata), dict):
+        return _ExtractedMetadata(
+            values={},
+            invalid_container=True,
+            noncanonical_container=False,
+            has_noncanonical_keys=False,
+        )
+
+    values: dict[str, object] = {}
+    has_noncanonical_keys = False
+    typed = cast("dict[object, object]", metadata)
+    for key, value in dict.items(typed):
+        if type(key) is not str:
+            has_noncanonical_keys = True
+            continue
+        values[key] = value
+    return _ExtractedMetadata(
+        values=values,
+        invalid_container=False,
+        noncanonical_container=type(metadata) is not dict,
+        has_noncanonical_keys=has_noncanonical_keys,
+    )
+
+
 def _has_trial_metadata(*, metadata: dict[str, object]) -> bool:
-    """Return whether underlying dict storage contains any trial key."""
+    """Return whether safely extracted metadata contains any trial key."""
     return any(
         _metadata_has_key(metadata=metadata, key=key) for key in _TRIAL_BATCH_KEYS
     )

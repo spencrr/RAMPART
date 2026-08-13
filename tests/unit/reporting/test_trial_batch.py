@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Never, cast
+from typing import TYPE_CHECKING, Any, Never, Self, cast
 
 import pytest
 
@@ -45,6 +45,35 @@ class _SpoofedDict:
     @property
     def __class__(self) -> type[dict[Any, Any]]:
         return dict
+
+
+class _StatefulMetadataKey(  # ruff: ignore[no-slots-in-str-subclass]
+    str,  # ruff: ignore[subclass-builtin]
+):
+    armed: bool
+    accesses: list[str]
+
+    def __new__(cls, value: str) -> Self:
+        instance = str.__new__(cls, value)
+        instance.armed = False
+        instance.accesses = []
+        return instance
+
+    def _arm(self) -> None:
+        self.armed = True
+        self.accesses.clear()
+
+    def __hash__(self) -> int:
+        self.accesses.append("__hash__")
+        if self.armed:
+            raise RuntimeError("hash must not run")
+        return str.__hash__(self)
+
+    def __eq__(self, value: object) -> bool:
+        self.accesses.append("__eq__")
+        if self.armed:
+            raise RuntimeError("equality must not run")
+        return str.__eq__(self, value)
 
 
 class _AdversarialMetadata(  # ruff: ignore[eq-without-hash]
@@ -261,6 +290,67 @@ class TestFailClosedTrialSummaries:
         assert summary.passed is False
         assert any("noncanonical metadata container" in item for item in diagnostics)
         assert any("duplicate batch indexes" in item for item in diagnostics)
+
+    @pytest.mark.parametrize(
+        "access_mode",
+        ["hidden", "raising"],
+    )
+    def test_nonexact_index_key_cannot_evade_parsing(
+        self,
+        access_mode: str,
+    ) -> None:
+        valid = _trial_result(index=0, count=1)
+        duplicate = _trial_result(
+            status=SafetyStatus.UNSAFE,
+            index=0,
+            count=1,
+        )
+        index = duplicate.metadata.pop(TRIAL_BATCH_INDEX_KEY)
+        stateful_key = _StatefulMetadataKey(TRIAL_BATCH_INDEX_KEY)
+        duplicate.metadata[stateful_key] = index
+        metadata = _AdversarialMetadata(
+            source=duplicate.metadata,
+            raises=access_mode == "raising",
+        )
+        duplicate.metadata = metadata
+        stateful_key._arm()
+
+        summaries, diagnostics = _summaries(valid, duplicate)
+
+        [summary] = summaries
+        assert duplicate.metadata is metadata
+        assert metadata.accesses == []
+        assert stateful_key.accesses == []
+        assert summary.complete is False
+        assert summary.passed is False
+        assert any("noncanonical metadata container" in item for item in diagnostics)
+        assert any("noncanonical metadata keys" in item for item in diagnostics)
+        assert any("invalid batch index" in item for item in diagnostics)
+
+    def test_suspicious_untagged_metadata_taints_valid_batch(self) -> None:
+        stateful_key = _StatefulMetadataKey("suspicious")
+        metadata = _AdversarialMetadata(
+            source={stateful_key: "hidden"},
+            raises=True,
+        )
+        suspicious = Result(
+            status=SafetyStatus.UNSAFE,
+            summary="suspicious",
+            metadata=metadata,
+        )
+        stateful_key._arm()
+
+        summaries, diagnostics = _summaries(_trial_result(), suspicious)
+
+        [summary] = summaries
+        assert metadata.accesses == []
+        assert stateful_key.accesses == []
+        assert summary.complete is False
+        assert summary.passed is False
+        assert any("noncanonical metadata keys" in item for item in diagnostics)
+        assert any(
+            "unassigned malformed trial metadata" in item for item in diagnostics
+        )
 
     def test_untagged_dict_subclass_is_not_a_trial_candidate(self) -> None:
         metadata = _AdversarialMetadata(
